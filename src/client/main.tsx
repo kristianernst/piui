@@ -114,7 +114,9 @@ function App() {
       return;
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({ ...message, text: contentToText((event.message as AgentMessage & { content: unknown }).content), streaming: false })));
+      const content = Array.isArray((event.message as AgentMessage & { content?: unknown }).content) ? (event.message as AgentMessage & { content: unknown[] }).content : [];
+      const textBlocks = content.filter((block) => typeof block === "object" && block !== null && "type" in block && block.type === "text");
+      setMessages((prev) => updateLastAssistant(prev, (message) => ({ ...message, text: contentToText(textBlocks), streaming: false })));
       return;
     }
     if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
