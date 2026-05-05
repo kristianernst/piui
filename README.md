@@ -14,7 +14,7 @@ What works natively:
 - default Pi resource discovery for context files, skills, prompts, extensions, settings
 - real OS tools from Pi (`read`, `bash`, `edit`, `write`, etc.) resolved against the selected cwd
 
-The visual direction references `/Users/kristianernst/Downloads/chatui-2`: centered chat column, quiet sidebars, reasoning blocks, tool pills, context/model footer.
+The visual direction uses `chatui-reference/` as non-shipping reference material: centered chat column, quiet sidebars, reasoning blocks, tool pills, context/model footer, and compact workflow sidebars.
 
 ## Run
 
@@ -23,7 +23,7 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5174>.
+Open <http://127.0.0.1:5174>. The server binds to localhost and the browser fetches a startup WebSocket token from `/api/health` before connecting.
 
 By default the daemon registers this repo as the first workspace. Add more workspaces from the sidebar, or seed a different first workspace:
 
@@ -52,8 +52,11 @@ Current daemon capabilities:
 - per-workspace Pi runtime creation
 - open/switch workspace
 - list/switch saved Pi sessions
-- new session / continue recent
-- prompt, abort, model cycling, thinking level changes
+- advisory session-file locking with multi-tab ref counting
+- new session / continue recent / fork / clone / compact / export
+- prompt, abort, explicit steer/follow-up queues, model selection/cycling, thinking level changes
+- resource snapshots for commands, tools, skills, prompts, and context files
+- browser fallback for extension UI select/confirm/input/editor/status requests
 - streaming assistant/tool events
 
 See `docs/feasibility.md` for the Pi docs reviewed and next implementation steps.
