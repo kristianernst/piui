@@ -1,21 +1,22 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import {
   IconArrowUp,
   IconBolt,
-  IconChart,
-  IconCheck,
+  IconChev,
   IconCode,
-  IconDatabase,
+  IconDiff,
   IconFile,
   IconFolder,
+  IconMoon,
   IconPlus,
   IconSearch,
   IconSettings,
   IconSidebarLeft,
   IconSidebarRight,
-  IconSpark,
   IconStop,
+  IconSun,
   IconTerminal,
 } from "./icons";
 import {
@@ -24,11 +25,8 @@ import {
   type AgentEvent,
   type AgentMessage,
   type ExtensionUiRequest,
-  type PiModelSummary,
-  type PiResourceSummary,
   type PiSessionInfo,
   type PiState,
-  type PiTreeEntry,
   type Workspace,
 } from "./piSocket";
 import "./styles.css";
@@ -42,14 +40,22 @@ type UiTool = {
   status: "running" | "done" | "error";
 };
 
+// One ordered, append-only stream of "what happened" inside an assistant turn.
+// We keep the chronological order so the reasoning timeline mirrors what the
+// agent actually did: thought → tool → thought → tool → … → final text.
+type UiBlock =
+  | { kind: "thought"; text: string }
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: UiTool };
+
 type UiMessage = {
   id: string;
-  role: "user" | "assistant" | "system";
-  text: string;
-  thinking?: string;
-  tools?: UiTool[];
+  role: "user" | "assistant";
+  text: string;          // user role only
+  blocks?: UiBlock[];    // assistant role only — chronological
   streaming?: boolean;
-  error?: string;
+  startedAt?: number;    // assistant only — for duration metadata
+  endedAt?: number;
 };
 
 const starters = [
@@ -63,22 +69,17 @@ function uiMessageFromAgent(message: AgentMessage, id: string): UiMessage | null
   if (message.role === "user") return { id, role: "user", text: contentToText(message.content) };
   if (message.role === "assistant") {
     const content = Array.isArray(message.content) ? message.content : [];
-    const toolCalls = content
-      .filter((block) => block.type === "toolCall")
-      .map((block) => ({ id: block.id, name: block.name, args: block.arguments, status: "done" as const }));
-    const thinking = content.filter((block) => block.type === "thinking").map((block) => block.thinking).join("\n");
-    const textBlocks = content.filter((block) => block.type === "text");
-    return { id, role: "assistant", text: contentToText(textBlocks), thinking, tools: toolCalls };
+    const blocks: UiBlock[] = [];
+    for (const block of content) {
+      if (block.type === "thinking" && block.thinking.trim()) blocks.push({ kind: "thought", text: block.thinking });
+      else if (block.type === "text" && block.text.trim()) blocks.push({ kind: "text", text: block.text });
+      else if (block.type === "toolCall") blocks.push({ kind: "tool", tool: { id: block.id, name: block.name, args: block.arguments, status: "done" } });
+    }
+    return { id, role: "assistant", text: "", blocks };
   }
-  if (message.role === "toolResult") {
-    const status = message.isError ? "error" : "result";
-    return { id, role: "system", text: `${message.toolName} ${status}\n${contentToText(message.content)}`.trim() };
-  }
-  if (message.role === "bashExecution") return { id, role: "system", text: `$ ${message.command}\n${message.output}` };
-
-  const unknown = message as { role: string; content?: unknown; text?: unknown; message?: unknown };
-  const text = contentToText(unknown.content ?? unknown.text ?? unknown.message);
-  return { id, role: "system", text: text || `[${unknown.role}] ${JSON.stringify(message)}` };
+  // Tool outputs and bash output are attached to the corresponding tool via
+  // `tool_execution_end` events — don't render them as separate system messages.
+  return null;
 }
 
 function asMessages(messages: AgentMessage[], prefix = "m"): UiMessage[] {
@@ -87,21 +88,49 @@ function asMessages(messages: AgentMessage[], prefix = "m"): UiMessage[] {
     const uiMessage = uiMessageFromAgent(message, `${prefix}-${index}`);
     if (uiMessage) next.push(uiMessage);
   });
-  return next;
+  return coalesceAssistantTurns(next);
 }
 
-function appendDistinctMessages(current: UiMessage[], additions: UiMessage[]) {
-  const next = [...current];
-  for (const addition of additions) {
-    const last = next[next.length - 1];
-    if (last?.role === addition.role && last.text === addition.text) continue;
-    if (addition.role === "user" && last?.role === "assistant" && last.streaming && !last.text && !last.tools?.length) {
-      next.splice(next.length - 1, 0, addition);
+// Pi splits a single agent turn into multiple `assistant` messages (one per
+// think+tool step). For the UI we want one logical turn = one timeline, so we
+// merge consecutive assistants into a single message preserving block order.
+function coalesceAssistantTurns(messages: UiMessage[]): UiMessage[] {
+  const out: UiMessage[] = [];
+  for (const message of messages) {
+    const last = out[out.length - 1];
+    if (message.role === "assistant" && last?.role === "assistant") {
+      last.blocks = [...(last.blocks ?? []), ...(message.blocks ?? [])];
+      last.endedAt = message.endedAt ?? last.endedAt;
       continue;
     }
-    next.push(addition);
+    out.push({ ...message });
   }
-  return next;
+  return out;
+}
+
+// Hydrate tool outputs onto previously-saved messages by matching tool ids
+// against any toolResult sibling messages received in the same payload.
+function hydrateToolOutputs(history: AgentMessage[], ui: UiMessage[]): UiMessage[] {
+  const outputs = new Map<string, { text: string; isError: boolean }>();
+  for (const message of history) {
+    if (message.role === "toolResult") {
+      const id = String((message as { toolCallId?: unknown }).toolCallId ?? "");
+      if (!id) continue;
+      outputs.set(id, { text: contentToText(message.content), isError: !!message.isError });
+    }
+  }
+  if (outputs.size === 0) return ui;
+  return ui.map((message): UiMessage => {
+    if (message.role !== "assistant" || !message.blocks) return message;
+    const blocks: UiBlock[] = message.blocks.map((block) => {
+      if (block.kind !== "tool") return block;
+      const result = outputs.get(block.tool.id);
+      if (!result) return block;
+      const status: UiTool["status"] = result.isError ? "error" : "done";
+      return { kind: "tool", tool: { ...block.tool, output: result.text, status } };
+    });
+    return { ...message, blocks };
+  });
 }
 
 function App() {
@@ -110,9 +139,6 @@ function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PiSessionInfo[]>([]);
-  const [resources, setResources] = useState<PiResourceSummary | null>(null);
-  const [models, setModels] = useState<PiModelSummary[]>([]);
-  const [tree, setTree] = useState<PiTreeEntry[]>([]);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
@@ -120,7 +146,6 @@ function App() {
   const [lastError, setLastError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [notices, setNotices] = useState<Array<{ id: string; message: string; level?: "info" | "warning" | "error" }>>([]);
-  const [extensionStatus, setExtensionStatus] = useState<Record<string, string>>({});
   const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -142,27 +167,9 @@ function App() {
       }
       if (packet.type === "state") setState(packet.data);
       if (packet.type === "sessions") setSessions(packet.data.sessions);
-      if (packet.type === "messages") setMessages(asMessages(packet.data.messages));
-      if (packet.type === "resources") setResources(packet.data);
-      if (packet.type === "models") setModels(packet.data.models);
-      if (packet.type === "tree") setTree(packet.data.entries);
+      if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
       if (packet.type === "extension_ui_request") setUiRequest(packet.request);
       if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
-      if (packet.type === "extension_ui_status") {
-        if (packet.data.text === undefined && packet.data.value === undefined) {
-          setExtensionStatus((prev) => {
-            const next = { ...prev };
-            delete next[packet.data.key];
-            return next;
-          });
-        } else if (typeof packet.data.text === "string") {
-          setExtensionStatus((prev) => ({ ...prev, [packet.data.key]: packet.data.text! }));
-          pushNotice(packet.data.text);
-        } else if (typeof packet.data.value === "string") {
-          const text = packet.data.value;
-          setExtensionStatus((prev) => ({ ...prev, [packet.data.key]: text }));
-        }
-      }
       if (packet.type === "event") applyEvent(packet.event);
       if (packet.type === "response" && !packet.success) {
         setLastError(packet.error ?? "Unknown Pi error");
@@ -184,56 +191,94 @@ function App() {
   }
 
   function applyEvent(event: AgentEvent) {
-    if (event.type === "message_start" && event.message && event.message.role !== "assistant") {
-      setMessages((prev) => appendDistinctMessages(prev, asMessages([event.message!], `e-${Date.now()}`)));
+    if (event.type === "message_start" && event.message && event.message.role === "user") {
+      setMessages((prev) => {
+        const ui = uiMessageFromAgent(event.message!, `e-${Date.now()}`);
+        if (!ui) return prev;
+        // Dedup against any optimistic copy we already pushed locally.
+        if (prev.some((m) => m.role === "user" && m.text === ui.text)) return prev;
+        // `agent_start` may arrive before the server-side user message_start,
+        // leaving a streaming assistant at the tail. Splice the user message in
+        // before it so the chronological order matches reality.
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.streaming) {
+          return [...prev.slice(0, -1), ui, last];
+        }
+        return [...prev, ui];
+      });
       return;
     }
     if (event.type === "agent_start") {
-      setMessages((prev) => [...prev, { id: `a-${Date.now()}`, role: "assistant", text: "", thinking: "", tools: [], streaming: true }]);
+      const now = Date.now();
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        // If the previous turn is still an assistant (e.g. on reconnect) we
+        // continue extending it instead of starting a new visual block.
+        if (last?.role === "assistant") {
+          return prev.map((message, index) =>
+            index === prev.length - 1
+              ? { ...message, streaming: true, startedAt: message.startedAt ?? now, endedAt: undefined }
+              : message,
+          );
+        }
+        return [...prev, { id: `a-${now}`, role: "assistant", text: "", blocks: [], streaming: true, startedAt: now }];
+      });
       setLastError(null);
       return;
     }
     if (event.type === "message_update" && event.assistantMessageEvent) {
       const delta = event.assistantMessageEvent;
-      setMessages((prev) => updateLastAssistant(prev, (message) => {
-        if (delta.type === "text_delta") message.text += delta.delta ?? "";
-        if (delta.type === "thinking_delta") message.thinking = (message.thinking ?? "") + (delta.delta ?? "");
-        return message;
-      }));
-      return;
-    }
-    if (event.type === "message_end" && event.message?.role === "assistant") {
-      const content = Array.isArray((event.message as AgentMessage & { content?: unknown }).content) ? (event.message as AgentMessage & { content: unknown[] }).content : [];
-      const textBlocks = content.filter((block) => typeof block === "object" && block !== null && "type" in block && block.type === "text");
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({ ...message, text: contentToText(textBlocks), streaming: false })));
-      return;
-    }
-    if (event.type === "message_end" && event.message?.role === "user") return;
-    if (event.type === "message_end" && event.message) {
-      setMessages((prev) => appendDistinctMessages(prev, asMessages([event.message!], `e-${Date.now()}`)));
+      const kind = delta.type === "thinking_delta" ? "thought" : delta.type === "text_delta" ? "text" : null;
+      const piece = delta.delta ?? "";
+      if (!kind || !piece) return;
+      setMessages((prev) => updateLastAssistant(prev, (message) => appendChunk(message, kind, piece)));
       return;
     }
     if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
+      const tool: UiTool = { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" };
       setMessages((prev) => updateLastAssistant(prev, (message) => ({
         ...message,
-        tools: [...(message.tools ?? []), { id: event.toolCallId!, name: event.toolName!, args: event.args, status: "running" }],
+        blocks: [...(message.blocks ?? []), { kind: "tool", tool }],
       })));
       return;
     }
     if ((event.type === "tool_execution_update" || event.type === "tool_execution_end") && event.toolCallId) {
       const output = contentToText(event.result?.content ?? event.partialResult?.content ?? "");
+      const status = event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running";
       setMessages((prev) => updateLastAssistant(prev, (message) => ({
         ...message,
-        tools: (message.tools ?? []).map((tool) => tool.id === event.toolCallId ? { ...tool, output, status: event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running" } : tool),
+        blocks: (message.blocks ?? []).map((block) =>
+          block.kind === "tool" && block.tool.id === event.toolCallId
+            ? { ...block, tool: { ...block.tool, output, status } }
+            : block,
+        ),
       })));
       return;
     }
-    if (event.type === "agent_end") {
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({ ...message, streaming: false })));
+    if (event.type === "agent_end" || (event.type === "message_end" && event.message?.role === "assistant")) {
+      setMessages((prev) => updateLastAssistant(prev, (message) => ({
+        ...message,
+        streaming: event.type === "message_end" ? message.streaming : false,
+        endedAt: event.type === "agent_end" ? Date.now() : message.endedAt,
+      })));
     }
   }
 
+  function appendChunk(message: UiMessage, kind: "thought" | "text", piece: string): UiMessage {
+    const blocks = [...(message.blocks ?? [])];
+    const last = blocks[blocks.length - 1];
+    if (last && last.kind === kind) {
+      blocks[blocks.length - 1] = { kind, text: last.text + piece };
+    } else {
+      blocks.push({ kind, text: piece });
+    }
+    return { ...message, blocks };
+  }
+
   function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
+    // Optimistically render the user's turn so it never appears below the
+    // streaming assistant if `agent_start` lands first on the wire.
+    setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: "user", text }]);
     socketRef.current?.send({ type: "prompt", message: text, streamingBehavior });
   }
 
@@ -268,17 +313,8 @@ function App() {
     socketRef.current?.send({ type: "switch_session", sessionPath });
   }
 
-  function continueRecent() {
-    setMessages([]);
-    socketRef.current?.send({ type: "continue_recent" });
-  }
-
-  function invokeCommand(commandName: string) {
-    socketRef.current?.send({ type: "invoke_command", commandName });
-  }
-
-  const artifacts = useMemo(() => messages.flatMap((message) => message.tools ?? []).slice(-8).reverse(), [messages]);
-  const sessionTitle = state?.workspace.name ? `${state.workspace.name} / ${state.sessionId.slice(0, 8)}` : "New Pi session";
+  const sessionTitle = state?.workspace.name ? state.workspace.name : "Pi";
+  const headerTitle = messages[0]?.text.slice(0, 64) || sessionTitle;
 
   return (
     <div className="shell">
@@ -286,32 +322,32 @@ function App() {
         open={leftOpen}
         onToggle={() => setLeftOpen((v) => !v)}
         onNewSession={newSession}
-        onContinueRecent={continueRecent}
         onOpenWorkspace={openWorkspace}
         onSwitchWorkspace={switchWorkspace}
         onSwitchSession={switchSession}
-        onClone={() => socketRef.current?.send({ type: "clone" })}
-        onCompact={() => socketRef.current?.send({ type: "compact" })}
-        onExport={() => socketRef.current?.send({ type: "export_html" })}
-        onRename={() => {
-          const name = window.prompt("Session name", sessions.find((session) => session.id === state?.sessionId)?.name ?? "");
-          if (name !== null) socketRef.current?.send({ type: "set_session_name", name });
-        }}
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
         sessions={sessions}
-        cwd={state?.cwd}
+        activeSessionId={state?.sessionId}
+        dark={dark}
+        onToggleDark={() => setDark((v) => !v)}
       />
       <main className="app">
         <header className="topbar">
-          <button className="ghost mobile" onClick={() => setLeftOpen(true)} title="Show sidebar"><IconSidebarLeft /></button>
-          <div className="titleBlock">
-            <span className="brandMark"><IconSpark size={13} /></span>
-            <span>{messages[0]?.text.slice(0, 64) || sessionTitle}</span>
+          <div className="topbar-side">
+            {!leftOpen && (
+              <button className="ghost" onClick={() => setLeftOpen(true)} title="Show sidebar">
+                <IconSidebarLeft />
+              </button>
+            )}
           </div>
-          <div className="topActions">
-            <button className="ghost" onClick={() => setDark((v) => !v)}>{dark ? "light" : "dark"}</button>
-            <button className="ghost" onClick={() => setRightOpen(true)} title="Show activity"><IconSidebarRight /></button>
+          <div className="titleBlock">{headerTitle}</div>
+          <div className="topbar-side right">
+            {!rightOpen && (
+              <button className="ghost" onClick={() => setRightOpen(true)} title="Show diffs">
+                <IconSidebarRight />
+              </button>
+            )}
           </div>
         </header>
 
@@ -334,21 +370,7 @@ function App() {
           onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })}
         />
       </main>
-      <RightSidebar
-        open={rightOpen}
-        onToggle={() => setRightOpen((v) => !v)}
-        artifacts={artifacts}
-        state={state}
-        resources={resources}
-        models={models}
-        tree={tree}
-        extensionStatus={extensionStatus}
-        onUseResource={(label) => setDraft(`/${label} `)}
-        onReloadResources={() => socketRef.current?.send({ type: "reload_resources" })}
-        onInvokeCommand={invokeCommand}
-        onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
-        onFork={(entryId) => socketRef.current?.send({ type: "fork", entryId })}
-      />
+      <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} />
       {uiRequest && (
         <ExtensionDialog
           request={uiRequest}
@@ -366,7 +388,7 @@ function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage
   const next = [...messages];
   let index = next.length - 1;
   while (index >= 0 && next[index].role !== "assistant") index--;
-  if (index === -1) next.push(updater({ id: `a-${Date.now()}`, role: "assistant", text: "", tools: [], streaming: true }));
+  if (index === -1) next.push(updater({ id: `a-${Date.now()}`, role: "assistant", text: "", blocks: [], streaming: true }));
   else next[index] = updater({ ...next[index] });
   return next;
 }
@@ -386,50 +408,322 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
 
 function MessageView({ message }: { message: UiMessage }) {
   if (message.role === "user") return <div className="msg user fadeUp"><div className="bubble">{message.text}</div></div>;
-  if (message.role === "system") return <pre className="systemMsg">{message.text}</pre>;
+
+  const blocks = message.blocks ?? [];
+  // The final answer is the last `text` block; everything before it (thoughts,
+  // tools, earlier intermediate text) belongs to the reasoning timeline.
+  let answerIndex = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i].kind === "text") { answerIndex = i; break; }
+  }
+  const timeline = answerIndex === -1 ? blocks : blocks.slice(0, answerIndex);
+  const answer = answerIndex === -1 ? null : (blocks[answerIndex] as Extract<UiBlock, { kind: "text" }>).text;
+  const isWorking = !!message.streaming && answerIndex === -1;
+  const toolCount = timeline.reduce((sum, block) => sum + (block.kind === "tool" ? 1 : 0), 0);
+  const durationMs = message.startedAt && message.endedAt ? message.endedAt - message.startedAt : undefined;
+
   return (
     <div className="msg assistant fadeUp">
-      {message.thinking && <Reasoning text={message.thinking} active={message.streaming} />}
-      {message.tools?.map((tool) => <ToolCard key={tool.id} tool={tool} />)}
-      {message.text ? <MarkdownLite text={message.text} /> : message.streaming ? <span className="thinkingInline">Thinking…</span> : null}
+      {(timeline.length > 0 || isWorking) && (
+        <Reasoning
+          blocks={timeline}
+          active={isWorking}
+          toolCount={toolCount}
+          durationMs={durationMs}
+        />
+      )}
+      {answer ? <Markdown text={answer} /> : null}
     </div>
   );
 }
 
-function Reasoning({ text, active }: { text: string; active?: boolean }) {
+function formatDuration(ms?: number): string | null {
+  if (!ms || ms < 250) return null;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function Reasoning({
+  blocks,
+  active,
+  toolCount,
+  durationMs,
+}: {
+  blocks: UiBlock[];
+  active?: boolean;
+  toolCount: number;
+  durationMs?: number;
+}) {
   const [open, setOpen] = useState(true);
+  const duration = formatDuration(durationMs);
+  const label = active ? "Working" : "Worked";
+  const meta = [
+    duration && !active ? `for ${duration}` : null,
+    !active && toolCount > 0 ? `· ${toolCount} ${toolCount === 1 ? "tool" : "tools"}` : null,
+  ].filter(Boolean).join(" ");
   return (
     <div className={`reasoning ${open ? "open" : ""}`}>
       <button onClick={() => setOpen((v) => !v)} className={active ? "thinking" : "done"}>
-        <span className="check">{!active && <IconCheck size={10} />}</span>
-        <span>{active ? "Thinking…" : "Thought"}</span>
+        {active && <span className="spinner" />}
+        <span className="reasoningLabel">{label}{active ? "…" : ""}</span>
+        {meta && <span className="reasoningMeta">{meta}</span>}
       </button>
-      {open && <div className="reasoningBody">{text}</div>}
+      {open && blocks.length > 0 && (
+        <ol className="timeline">
+          {blocks.map((block, index) => {
+            if (block.kind === "tool") return <li key={index} className="tl-step tl-step-tool"><ToolCard tool={block.tool} /></li>;
+            return (
+              <li key={index} className="tl-step tl-step-text">
+                <Markdown text={block.text} compact />
+              </li>
+            );
+          })}
+        </ol>
+      )}
     </div>
   );
 }
 
+function pickToolIcon(name: string) {
+  const n = name.toLowerCase();
+  if (n === "bash" || n.includes("shell") || n.includes("terminal")) return IconTerminal;
+  if (n.includes("read") || n.includes("write") || n.includes("edit") || n.includes("file")) return IconFile;
+  if (n.includes("grep") || n.includes("find") || n.includes("search") || n.includes("web")) return IconSearch;
+  return IconCode;
+}
+
+function summarizeArgs(args?: Record<string, unknown>) {
+  if (!args) return "";
+  const candidates = ["query", "pattern", "path", "file_path", "command", "url", "name"];
+  for (const key of candidates) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value.length > 96 ? value.slice(0, 93) + "…" : value;
+  }
+  return "";
+}
+
 function ToolCard({ tool }: { tool: UiTool }) {
-  const Icon = tool.name === "bash" ? IconTerminal : tool.name.includes("read") || tool.name.includes("write") || tool.name.includes("edit") ? IconFile : tool.name.includes("grep") || tool.name.includes("find") ? IconSearch : IconCode;
+  const Icon = pickToolIcon(tool.name);
+  const hint = summarizeArgs(tool.args);
+  const hasBody = !!(tool.args && Object.keys(tool.args).length) || !!tool.output;
   return (
-    <details className={`tool ${tool.status}`} open={tool.status === "running"}>
-      <summary><Icon size={13} /><span>{tool.name}</span><i>{tool.status}</i></summary>
-      {tool.args && <pre>{JSON.stringify(tool.args, null, 2)}</pre>}
-      {tool.output && <pre>{tool.output}</pre>}
+    <details className={`tool ${tool.status}`}>
+      <summary>
+        <Icon size={12} />
+        <span className="toolName">{tool.name}</span>
+        {hint && <span className="toolHint">{hint}</span>}
+        {tool.status === "running" && <span className="toolPulse" />}
+        {tool.status === "error" && <span className="toolErr">error</span>}
+      </summary>
+      {hasBody && (
+        <div className="toolBody">
+          {tool.args && Object.keys(tool.args).length > 0 && (
+            <div className="toolPanel">
+              <div className="toolPanelHead">arguments</div>
+              <pre>{JSON.stringify(tool.args, null, 2)}</pre>
+            </div>
+          )}
+          {tool.output && (
+            <div className="toolPanel">
+              <div className="toolPanelHead">output</div>
+              <pre>{tool.output}</pre>
+            </div>
+          )}
+        </div>
+      )}
     </details>
   );
 }
 
-function MarkdownLite({ text }: { text: string }) {
-  return <div className="answer">{text.split(/\n\n+/).map((paragraph, index) => <p key={index}>{renderInline(paragraph)}</p>)}</div>;
+// Tiny markdown renderer covering: headings, fenced code blocks, ordered &
+// unordered lists, blockquotes, inline code, bold, italics, links, hard breaks.
+// Compact mode tightens spacing for in-timeline reasoning steps.
+function Markdown({ text, compact }: { text: string; compact?: boolean }) {
+  return <div className={`answer ${compact ? "compact" : ""}`}>{renderBlocks(text)}</div>;
 }
 
-function renderInline(text: string) {
-  return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => {
-    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
-    if (part.startsWith("`") && part.endsWith("`")) return <code key={index}>{part.slice(1, -1)}</code>;
-    return <React.Fragment key={index}>{part}</React.Fragment>;
+function renderBlocks(input: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const lines = input.replace(/\r\n?/g, "\n").split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    const fence = /^```(\w*)\s*$/.exec(line);
+    if (fence) {
+      const lang = fence[1];
+      const buffer: string[] = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        buffer.push(lines[i]);
+        i++;
+      }
+      i++;
+      out.push(<pre key={`code-${out.length}`} className={`md-code${lang ? ` lang-${lang}` : ""}`}><code>{buffer.join("\n")}</code></pre>);
+      continue;
+    }
+
+    // Heading
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      const level = heading[1].length;
+      const tag = `h${Math.min(level + 2, 6)}` as "h3" | "h4" | "h5" | "h6";
+      out.push(React.createElement(tag, { key: `h-${out.length}`, className: "md-heading" }, renderInline(heading[2])));
+      i++;
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
+        i++;
+      }
+      out.push(<ol key={`ol-${out.length}`} className="md-list">{items.map((item, k) => <li key={k}>{renderInline(item)}</li>)}</ol>);
+      continue;
+    }
+
+    // Unordered list
+    if (/^\s*[-*•]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*•]\s+/, ""));
+        i++;
+      }
+      out.push(<ul key={`ul-${out.length}`} className="md-list">{items.map((item, k) => <li key={k}>{renderInline(item)}</li>)}</ul>);
+      continue;
+    }
+
+    // Blockquote
+    if (/^>\s?/.test(line)) {
+      const buffer: string[] = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        buffer.push(lines[i].replace(/^>\s?/, ""));
+        i++;
+      }
+      out.push(<blockquote key={`q-${out.length}`} className="md-quote">{renderInline(buffer.join("\n"))}</blockquote>);
+      continue;
+    }
+
+    // Blank line
+    if (!line.trim()) { i++; continue; }
+
+    // Paragraph: gather adjacent non-blank, non-special lines
+    const buffer: string[] = [line];
+    i++;
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^```/.test(lines[i]) &&
+      !/^#{1,6}\s+/.test(lines[i]) &&
+      !/^\s*\d+\.\s+/.test(lines[i]) &&
+      !/^\s*[-*•]\s+/.test(lines[i]) &&
+      !/^>\s?/.test(lines[i])
+    ) {
+      buffer.push(lines[i]);
+      i++;
+    }
+    const paragraph = buffer.join("\n");
+    out.push(<BalancedP key={`p-${out.length}`} text={plainText(paragraph)}>{renderInline(paragraph)}</BalancedP>);
+  }
+  return out;
+}
+
+// Strip inline markdown markers down to their visible text — used as the
+// measurement-only string fed to pretext.
+function plainText(input: string): string {
+  return input
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/(\*|_)([^*_\n]+)\1/g, "$2")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Pretext-balanced paragraph: measures the natural line count at full width,
+// then binary-searches the tightest max-width that keeps the line count the
+// same. Result: short paragraphs shrink-wrap, no awkward orphan last line.
+function BalancedP({ text, children }: { text: string; children: React.ReactNode }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !text) return;
+    let frame = 0;
+    const compute = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const parent = el.parentElement;
+        if (!parent) return;
+        const containerWidth = parent.getBoundingClientRect().width;
+        if (containerWidth < 80) return;
+        try {
+          const cs = window.getComputedStyle(el);
+          const font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+          const prepared = prepareWithSegments(text, font);
+          const baseStats = measureLineStats(prepared, containerWidth);
+          if (baseStats.lineCount <= 1) {
+            el.style.maxWidth = `${Math.ceil(baseStats.maxLineWidth) + 2}px`;
+            return;
+          }
+          let lo = Math.ceil(baseStats.maxLineWidth) + 1;
+          let hi = Math.floor(containerWidth);
+          for (let i = 0; i < 12 && hi - lo > 2; i++) {
+            const mid = Math.floor((lo + hi) / 2);
+            if (measureLineStats(prepared, mid).lineCount === baseStats.lineCount) hi = mid;
+            else lo = mid;
+          }
+          el.style.maxWidth = `${hi}px`;
+        } catch {
+          // Canvas measurement may fail in headless / non-browser contexts.
+        }
+      });
+    };
+    compute();
+    const observer = new ResizeObserver(compute);
+    if (el.parentElement) observer.observe(el.parentElement);
+    return () => { cancelAnimationFrame(frame); observer.disconnect(); };
+  }, [text]);
+  return <p ref={ref}>{children}</p>;
+}
+
+const INLINE_TOKEN = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]]+\]\([^)]+\)|\bhttps?:\/\/\S+)/g;
+
+function renderInline(input: string): React.ReactNode[] {
+  // Soft breaks: turn lone `\n` inside a paragraph into <br />
+  const segments = input.split(/(\n)/);
+  const out: React.ReactNode[] = [];
+  segments.forEach((segment, segIndex) => {
+    if (segment === "\n") { out.push(<br key={`br-${segIndex}`} />); return; }
+    if (!segment) return;
+    const parts = segment.split(INLINE_TOKEN);
+    parts.forEach((part, idx) => {
+      const key = `${segIndex}-${idx}`;
+      if (!part) return;
+      if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+        out.push(<code key={key}>{part.slice(1, -1)}</code>);
+      } else if ((part.startsWith("**") && part.endsWith("**")) || (part.startsWith("__") && part.endsWith("__"))) {
+        out.push(<strong key={key}>{part.slice(2, -2)}</strong>);
+      } else if ((part.startsWith("*") && part.endsWith("*") && part.length > 2) || (part.startsWith("_") && part.endsWith("_") && part.length > 2)) {
+        out.push(<em key={key}>{part.slice(1, -1)}</em>);
+      } else if (/^\[[^\]]+\]\([^)]+\)$/.test(part)) {
+        const match = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(part);
+        if (match) {
+          out.push(<a key={key} href={match[2]} target="_blank" rel="noreferrer noopener">{match[1]}</a>);
+          return;
+        }
+        out.push(<React.Fragment key={key}>{part}</React.Fragment>);
+      } else if (/^https?:\/\/\S+$/.test(part)) {
+        out.push(<a key={key} href={part} target="_blank" rel="noreferrer noopener">{part}</a>);
+      } else {
+        out.push(<React.Fragment key={key}>{part}</React.Fragment>);
+      }
+    });
   });
+  return out;
 }
 
 function Composer({
@@ -487,9 +781,7 @@ function Composer({
         <select value={state?.thinkingLevel ?? "off"} onChange={(event) => onThinking(event.target.value as PiState["thinkingLevel"])}>
           {(["off", "minimal", "low", "medium", "high", "xhigh"] as const).map((level) => <option key={level} value={level}>{level}</option>)}
         </select>
-        {state?.isCompacting && <span>compacting</span>}
-        {state?.isRetrying && <span>retrying</span>}
-        <span className="ctx"><span style={{ width: `${pct}%` }} />context {pct || 0}%</span>
+        <span className="ctx"><span style={{ width: `${pct}%` }} />{pct || 0}%</span>
       </div>
     </footer>
   );
@@ -499,186 +791,177 @@ function LeftSidebar({
   open,
   onToggle,
   onNewSession,
-  onContinueRecent,
   onOpenWorkspace,
   onSwitchWorkspace,
   onSwitchSession,
-  onClone,
-  onCompact,
-  onExport,
-  onRename,
   workspaces,
   activeWorkspaceId,
   sessions,
-  cwd,
+  activeSessionId,
+  dark,
+  onToggleDark,
 }: {
   open: boolean;
   onToggle: () => void;
   onNewSession: () => void;
-  onContinueRecent: () => void;
   onOpenWorkspace: () => void;
   onSwitchWorkspace: (workspaceId: string) => void;
   onSwitchSession: (sessionPath: string) => void;
-  onClone: () => void;
-  onCompact: () => void;
-  onExport: () => void;
-  onRename: () => void;
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   sessions: PiSessionInfo[];
-  cwd?: string;
+  activeSessionId?: string;
+  dark: boolean;
+  onToggleDark: () => void;
 }) {
-  const [sessionQuery, setSessionQuery] = useState("");
-  const filteredSessions = sessions.filter((session) => `${session.name ?? ""} ${session.firstMessage} ${session.path}`.toLowerCase().includes(sessionQuery.toLowerCase()));
+  const [query, setQuery] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const q = query.trim().toLowerCase();
+  const filteredSessions = q
+    ? sessions.filter((session) => `${session.name ?? ""} ${session.firstMessage} ${session.path}`.toLowerCase().includes(q))
+    : sessions;
+
+  function toggleWorkspace(id: string) {
+    if (id !== activeWorkspaceId) {
+      onSwitchWorkspace(id);
+      setCollapsed((prev) => { const next = new Set(prev); next.delete(id); return next; });
+      return;
+    }
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   return (
     <aside className={`sidebar left ${open ? "open" : "closed"}`}>
       <div className="sideInner">
-        <div className="sideHead"><b><span className="dot" /> piui</b><button onClick={onToggle}><IconSidebarLeft /></button></div>
-        <button className="newChat" onClick={onNewSession}><IconPlus size={13} /> New session</button>
-        <button className="newChat secondary" onClick={onContinueRecent}><IconDatabase size={13} /> Continue recent</button>
-        <button className="newChat secondary" onClick={onOpenWorkspace}><IconFolder size={13} /> Open workspace</button>
-        <div className="sessionActions">
-          <button onClick={onClone}>Clone</button>
-          <button onClick={onCompact}>Compact</button>
-          <button onClick={onRename}>Name</button>
-          <button onClick={onExport}>Export</button>
+        <div className="sideHead">
+          <span className="brand">
+            <span className="dot" />
+            <span>piui</span>
+          </span>
+          <button className="sideHead-btn" onClick={onToggle} title="Hide sidebar">
+            <IconSidebarLeft size={14} />
+          </button>
         </div>
 
-        <div className="section">Workspaces</div>
-        <div className="workspaceList">
-          {workspaces.map((workspace) => (
-            <button
-              key={workspace.id}
-              className={`workspaceRow ${workspace.id === activeWorkspaceId ? "active" : ""}`}
-              onClick={() => workspace.id !== activeWorkspaceId && onSwitchWorkspace(workspace.id)}
-              title={workspace.cwd}
-            >
-              <IconFolder size={13} />
-              <span>{workspace.name}</span>
+        <button className="sb-new" onClick={onNewSession} title="Start a new session">
+          <IconPlus size={12} />
+          <span>New chat</span>
+        </button>
+
+        <label className="sb-search">
+          <IconSearch size={12} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search sessions" />
+        </label>
+
+        <div className="sb-scroll">
+          <div className="sb-section-label">
+            <span>Workspaces</span>
+            <button className="sb-section-label-action" onClick={onOpenWorkspace} title="Open workspace">
+              <IconPlus size={11} />
             </button>
-          ))}
+          </div>
+
+          {workspaces.length === 0 ? (
+            <p className="sb-empty">No workspaces yet.</p>
+          ) : (
+            workspaces.map((workspace) => {
+              const isActive = workspace.id === activeWorkspaceId;
+              const isOpen = isActive && !collapsed.has(workspace.id);
+              const wsSessions = isActive ? filteredSessions : [];
+              return (
+                <div key={workspace.id} className={`sb-ws ${isActive ? "active" : ""} ${isOpen ? "open" : "closed"}`}>
+                  <button className="sb-ws-head" onClick={() => toggleWorkspace(workspace.id)} title={workspace.cwd}>
+                    <IconChev className="sb-chev" size={11} />
+                    <IconFolder className="sb-folder" size={13} />
+                    <span className="sb-ws-name">{workspace.name}</span>
+                    {isActive && wsSessions.length > 0 && <span className="sb-ws-count">{wsSessions.length}</span>}
+                  </button>
+                  <div className="sb-ws-body">
+                    <div className="sb-ws-body-inner">
+                      {isActive && (
+                        <div className="sb-convs">
+                          {wsSessions.length === 0 ? (
+                            <p className="sb-empty">No sessions yet.</p>
+                          ) : (
+                            wsSessions.map((session) => (
+                              <button
+                                key={session.path}
+                                className={`sb-conv ${session.id === activeSessionId ? "active" : ""}`}
+                                onClick={() => onSwitchSession(session.path)}
+                                title={session.path}
+                              >
+                                <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
+                                <span className="sb-conv-time">{relativeTime(session.modified)}</span>
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
         </div>
 
-        <div className="section">Sessions</div>
-        <label className="search"><IconSearch size={13} /><input value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} placeholder="Search sessions" /></label>
-        <div className="sessionList">
-          {filteredSessions.length ? filteredSessions.map((session) => (
-            <button key={session.path} className="sessionRow" onClick={() => onSwitchSession(session.path)} title={session.path}>
-              <span>{session.name || session.firstMessage || "Untitled session"}</span>
-              <small>{session.messageCount} msgs · {new Date(session.modified).toLocaleDateString()}</small>
-            </button>
-          )) : <p className="muted">No saved sessions yet.</p>}
+        <div className="sb-foot">
+          {settingsOpen && (
+            <div className="sb-popover">
+              <button className="sb-popover-row" onClick={onToggleDark}>
+                {dark ? <IconSun size={14} /> : <IconMoon size={14} />}
+                <span>{dark ? "Light mode" : "Dark mode"}</span>
+              </button>
+            </div>
+          )}
+          <button className="sb-foot-btn" onClick={() => setSettingsOpen((v) => !v)}>
+            <IconSettings size={14} />
+            <span>Settings</span>
+          </button>
         </div>
-
-        <div className="section">Native Pi</div>
-        <div className="nativeCard"><IconFolder /><span>{cwd ?? "Loading cwd…"}</span></div>
-        <div className="nativeCard"><IconDatabase /><span>~/.pi/agent sessions + auth</span></div>
-        <div className="nativeCard"><IconCode /><span>read · bash · edit · write tools</span></div>
-        <div className="sideFoot"><button><IconSettings size={14} /> Settings soon</button></div>
       </div>
     </aside>
   );
 }
 
-function RightSidebar({
-  open,
-  onToggle,
-  artifacts,
-  state,
-  resources,
-  models,
-  tree,
-  extensionStatus,
-  onUseResource,
-  onReloadResources,
-  onInvokeCommand,
-  onSetModel,
-  onFork,
-}: {
-  open: boolean;
-  onToggle: () => void;
-  artifacts: UiTool[];
-  state: PiState | null;
-  resources: PiResourceSummary | null;
-  models: PiModelSummary[];
-  tree: PiTreeEntry[];
-  extensionStatus: Record<string, string>;
-  onUseResource: (label: string) => void;
-  onReloadResources: () => void;
-  onInvokeCommand: (commandName: string) => void;
-  onSetModel: (provider: string, modelId: string) => void;
-  onFork: (entryId: string) => void;
-}) {
-  const currentModels = models.filter((model) => model.available || model.current).slice(0, 8);
-  const forkEntries = tree.filter((entry) => entry.forkable).slice(-5).reverse();
-  const extensionCommands = resources?.commands.filter((command) => command.source === "extension") ?? [];
-  const builtinCommands = resources?.commands.filter((command) => command.source === "builtin") ?? [];
-  const promptCommands = resources?.commands.filter((command) => command.source === "prompt" || command.source === "skill") ?? [];
-  const resourceItems = [
-    ...extensionCommands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
-    ...builtinCommands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
-    ...promptCommands.slice(0, 3).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
-    ...(resources?.skills.slice(0, 2).map((skill) => ({ label: `skill:${skill.name}`, detail: skill.description ?? "skill", action: "insert" as const })) ?? []),
-    ...(resources?.prompts.slice(0, 2).map((prompt) => ({ label: prompt.name, detail: prompt.description ?? "prompt", action: "insert" as const })) ?? []),
-  ];
-  const statusItems = Object.entries(extensionStatus).slice(-3).reverse();
-
+function RightSidebar({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   return (
     <aside className={`sidebar right ${open ? "open" : "closed"}`}>
       <div className="sideInner">
-        <div className="sideHead"><b>Activity</b><button onClick={onToggle}><IconSidebarRight /></button></div>
-        <div className="sessionCard">
-          <span>Session</span>
-          <code>{state?.sessionId?.slice(0, 8) ?? "—"}</code>
-          <small>{state?.sessionFile ?? "Pi session file will appear after connect."}</small>
+        <div className="sideHead">
+          <div className="sideHead-tabs">
+            <button className="sideHead-tab active">Diffs</button>
+          </div>
+          <button className="sideHead-btn" onClick={onToggle} title="Hide diffs">
+            <IconSidebarRight size={14} />
+          </button>
         </div>
-        <div className="section">Model</div>
-        <div className="modelList">
-          {currentModels.length ? currentModels.map((model) => (
-            <button key={`${model.provider}/${model.id}`} className={`modelRow ${model.current ? "active" : ""}`} onClick={() => onSetModel(model.provider, model.id)}>
-              <span>{model.name ?? model.id}</span>
-              <small>{model.provider}</small>
-            </button>
-          )) : <p className="muted">Configured models will show here.</p>}
-        </div>
-        <div className="section">Tool calls</div>
-        {artifacts.length ? artifacts.map((tool) => <div className="artifact" key={tool.id}><IconChart size={13} /><span>{tool.name}</span><i>{tool.status}</i></div>) : <p className="muted">Tools Pi runs will show up here.</p>}
-        <div className="section actionSection"><span>Resources</span><button onClick={onReloadResources}>Reload</button></div>
-        <div className="resourceGrid">
-          <div><b>{resources?.commands.length ?? 0}</b><span>commands</span></div>
-          <div><b>{resources?.skills.length ?? 0}</b><span>skills</span></div>
-          <div><b>{resources?.prompts.length ?? 0}</b><span>prompts</span></div>
-          <div><b>{resources?.agentsFiles.length ?? 0}</b><span>context</span></div>
-        </div>
-        <div className="resourceList">
-          {resourceItems.length ? resourceItems.map((item) => (
-            <button key={`${item.detail}-${item.label}`} onClick={() => item.action === "invoke" ? onInvokeCommand(item.label) : onUseResource(item.label)}>
-              <span>/{item.label}</span>
-              <small>{item.detail}</small>
-            </button>
-          )) : <p className="muted">Commands, skills, and prompts will appear after resources load.</p>}
-        </div>
-        {statusItems.length > 0 && (
-          <>
-            <div className="section">Extension status</div>
-            <div className="statusList">
-              {statusItems.map(([key, text]) => <div key={key}><span>{key}</span><small>{text}</small></div>)}
-            </div>
-          </>
-        )}
-        <div className="section">Fork points</div>
-        <div className="forkList">
-          {forkEntries.length ? forkEntries.map((entry) => (
-            <button key={entry.id} onClick={() => onFork(entry.id)} title={entry.text}>
-              <span>{entry.text || entry.id.slice(0, 8)}</span>
-              <small>{new Date(entry.timestamp).toLocaleString()}</small>
-            </button>
-          )) : <p className="muted">User turns that can be forked will show here.</p>}
+        <div className="sb-empty-panel">
+          <span className="sb-empty-panel-glyph"><IconDiff size={16} /></span>
+          <div className="sb-empty-panel-title">No diffs yet</div>
+          <div className="sb-empty-panel-sub">File changes Pi makes during this session will show up here.</div>
         </div>
       </div>
     </aside>
   );
+}
+
+function relativeTime(iso: string) {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return "";
+  const diff = Date.now() - then;
+  if (diff < 60_000) return "now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d`;
+  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function NoticeStack({ notices }: { notices: Array<{ id: string; message: string; level?: "info" | "warning" | "error" }> }) {
