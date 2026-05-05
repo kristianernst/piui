@@ -65,7 +65,7 @@ export type ExtensionUiRequest =
   | { id: string; kind: "select"; title: string; options: string[]; opts?: unknown }
   | { id: string; kind: "confirm"; title: string; message: string; opts?: unknown }
   | { id: string; kind: "input"; title: string; placeholder?: string; opts?: unknown }
-  | { id: string; kind: string; [key: string]: unknown };
+  | { id: string; kind: string; title?: string; message?: string; options?: string[]; placeholder?: string; [key: string]: unknown };
 
 export type PiPacket =
   | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState } }

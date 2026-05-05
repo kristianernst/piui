@@ -18,8 +18,21 @@ import {
   IconStop,
   IconTerminal,
 } from "./icons";
-import { connectPi, contentToText, type AgentEvent, type AgentMessage, type PiSessionInfo, type PiState, type Workspace } from "./piSocket";
+import {
+  connectPi,
+  contentToText,
+  type AgentEvent,
+  type AgentMessage,
+  type ExtensionUiRequest,
+  type PiModelSummary,
+  type PiResourceSummary,
+  type PiSessionInfo,
+  type PiState,
+  type PiTreeEntry,
+  type Workspace,
+} from "./piSocket";
 import "./styles.css";
+import "./stage3.css";
 
 type UiTool = {
   id: string;
@@ -74,11 +87,18 @@ function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PiSessionInfo[]>([]);
+  const [resources, setResources] = useState<PiResourceSummary | null>(null);
+  const [models, setModels] = useState<PiModelSummary[]>([]);
+  const [tree, setTree] = useState<PiTreeEntry[]>([]);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [notices, setNotices] = useState<Array<{ id: string; message: string; level?: "info" | "warning" | "error" }>>([]);
+  const [extensionStatus, setExtensionStatus] = useState<Record<string, string>>({});
+  const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
   const threadRef = useRef<HTMLDivElement>(null);
 
@@ -100,8 +120,31 @@ function App() {
       if (packet.type === "state") setState(packet.data);
       if (packet.type === "sessions") setSessions(packet.data.sessions);
       if (packet.type === "messages") setMessages(asMessages(packet.data.messages));
+      if (packet.type === "resources") setResources(packet.data);
+      if (packet.type === "models") setModels(packet.data.models);
+      if (packet.type === "tree") setTree(packet.data.entries);
+      if (packet.type === "extension_ui_request") setUiRequest(packet.request);
+      if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
+      if (packet.type === "extension_ui_status") {
+        if (packet.data.text === undefined && packet.data.value === undefined) {
+          setExtensionStatus((prev) => {
+            const next = { ...prev };
+            delete next[packet.data.key];
+            return next;
+          });
+        } else if (typeof packet.data.text === "string") {
+          setExtensionStatus((prev) => ({ ...prev, [packet.data.key]: packet.data.text! }));
+          pushNotice(packet.data.text);
+        } else if (typeof packet.data.value === "string") {
+          const text = packet.data.value;
+          setExtensionStatus((prev) => ({ ...prev, [packet.data.key]: text }));
+        }
+      }
       if (packet.type === "event") applyEvent(packet.event);
-      if (packet.type === "response" && !packet.success) setLastError(packet.error ?? "Unknown Pi error");
+      if (packet.type === "response" && !packet.success) {
+        setLastError(packet.error ?? "Unknown Pi error");
+        pushNotice(packet.error ?? "Unknown Pi error", "error");
+      }
     }, setConnection);
     socketRef.current = socket;
     return () => socket.close();
@@ -110,6 +153,12 @@ function App() {
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
+
+  function pushNotice(message: string, level?: "info" | "warning" | "error") {
+    const id = `${Date.now()}-${Math.random()}`;
+    setNotices((prev) => [{ id, message, level }, ...prev].slice(0, 3));
+    window.setTimeout(() => setNotices((prev) => prev.filter((notice) => notice.id !== id)), 6000);
+  }
 
   function applyEvent(event: AgentEvent) {
     if (event.type === "agent_start") {
@@ -152,10 +201,13 @@ function App() {
     }
   }
 
-  function sendPrompt(text: string) {
-    const streamingBehavior = state?.isStreaming ? "followUp" : undefined;
+  function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
     setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: "user", text }]);
     socketRef.current?.send({ type: "prompt", message: text, streamingBehavior });
+  }
+
+  function queuePrompt(text: string, mode: "steer" | "follow_up") {
+    socketRef.current?.send({ type: mode, message: text });
   }
 
   function abort() {
@@ -191,6 +243,7 @@ function App() {
   }
 
   const artifacts = useMemo(() => messages.flatMap((message) => message.tools ?? []).slice(-8).reverse(), [messages]);
+  const sessionTitle = state?.workspace.name ? `${state.workspace.name} / ${state.sessionId.slice(0, 8)}` : "New Pi session";
 
   return (
     <div className="shell">
@@ -202,6 +255,13 @@ function App() {
         onOpenWorkspace={openWorkspace}
         onSwitchWorkspace={switchWorkspace}
         onSwitchSession={switchSession}
+        onClone={() => socketRef.current?.send({ type: "clone" })}
+        onCompact={() => socketRef.current?.send({ type: "compact" })}
+        onExport={() => socketRef.current?.send({ type: "export_html" })}
+        onRename={() => {
+          const name = window.prompt("Session name", sessions.find((session) => session.id === state?.sessionId)?.name ?? "");
+          if (name !== null) socketRef.current?.send({ type: "set_session_name", name });
+        }}
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
         sessions={sessions}
@@ -212,7 +272,7 @@ function App() {
           <button className="ghost mobile" onClick={() => setLeftOpen(true)} title="Show sidebar"><IconSidebarLeft /></button>
           <div className="titleBlock">
             <span className="brandMark"><IconSpark size={13} /></span>
-            <span>{messages[0]?.text.slice(0, 64) || "New Pi session"}</span>
+            <span>{messages[0]?.text.slice(0, 64) || sessionTitle}</span>
           </div>
           <div className="topActions">
             <button className="ghost" onClick={() => setDark((v) => !v)}>{dark ? "light" : "dark"}</button>
@@ -225,9 +285,42 @@ function App() {
         </div>
 
         {lastError && <div className="errorToast">{lastError}</div>}
-        <Composer state={state} connection={connection} onSend={sendPrompt} onAbort={abort} onCycleModel={() => socketRef.current?.send({ type: "cycle_model" })} onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })} />
+        <NoticeStack notices={notices} />
+        <Composer
+          state={state}
+          connection={connection}
+          value={draft}
+          onValueChange={setDraft}
+          onSend={sendPrompt}
+          onSteer={(text) => queuePrompt(text, "steer")}
+          onFollowUp={(text) => queuePrompt(text, "follow_up")}
+          onAbort={abort}
+          onCycleModel={() => socketRef.current?.send({ type: "cycle_model" })}
+          onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })}
+        />
       </main>
-      <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} artifacts={artifacts} state={state} />
+      <RightSidebar
+        open={rightOpen}
+        onToggle={() => setRightOpen((v) => !v)}
+        artifacts={artifacts}
+        state={state}
+        resources={resources}
+        models={models}
+        tree={tree}
+        extensionStatus={extensionStatus}
+        onUseResource={(label) => setDraft(`/${label} `)}
+        onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
+        onFork={(entryId) => socketRef.current?.send({ type: "fork", entryId })}
+      />
+      {uiRequest && (
+        <ExtensionDialog
+          request={uiRequest}
+          onResolve={(value) => {
+            socketRef.current?.send({ type: "extension_ui_response", uiRequestId: uiRequest.id, value });
+            setUiRequest(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -302,31 +395,63 @@ function renderInline(text: string) {
   });
 }
 
-function Composer({ state, connection, onSend, onAbort, onCycleModel, onThinking }: { state: PiState | null; connection: string; onSend: (text: string) => void; onAbort: () => void; onCycleModel: () => void; onThinking: (level: PiState["thinkingLevel"]) => void }) {
-  const [value, setValue] = useState("");
+function Composer({
+  state,
+  connection,
+  value,
+  onValueChange,
+  onSend,
+  onSteer,
+  onFollowUp,
+  onAbort,
+  onCycleModel,
+  onThinking,
+}: {
+  state: PiState | null;
+  connection: string;
+  value: string;
+  onValueChange: (value: string) => void;
+  onSend: (text: string) => void;
+  onSteer: (text: string) => void;
+  onFollowUp: (text: string) => void;
+  onAbort: () => void;
+  onCycleModel: () => void;
+  onThinking: (level: PiState["thinkingLevel"]) => void;
+}) {
   const disabled = connection !== "open";
   const pct = state?.usage?.percent ?? 0;
   const modelName = state?.model?.name ?? state?.model?.id ?? "No model";
 
-  function submit() {
+  function submit(mode: "send" | "steer" | "followUp" = "send") {
     if (!value.trim() || disabled) return;
-    onSend(value.trim());
-    setValue("");
+    if (mode === "steer") onSteer(value.trim());
+    else if (mode === "followUp") onFollowUp(value.trim());
+    else onSend(value.trim());
+    onValueChange("");
   }
 
   return (
     <footer className="composerWrap">
       <div className="composer">
         <button className="add" title="Attach"><IconPlus /></button>
-        <textarea value={value} disabled={disabled} onChange={(event) => setValue(event.target.value)} placeholder={disabled ? "Connecting to Pi…" : "Ask Pi to work in this OS workspace…"} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); } }} />
-        {state?.isStreaming ? <button className="send stop" onClick={onAbort}><IconStop /></button> : <button className="send" onClick={submit}><IconArrowUp /></button>}
+        <textarea value={value} disabled={disabled} onChange={(event) => onValueChange(event.target.value)} placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…"} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(state?.isStreaming ? "followUp" : "send"); } }} />
+        {state?.isStreaming ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button> : <button className="send" onClick={() => submit()} title="Send"><IconArrowUp /></button>}
       </div>
+      {state?.isStreaming && (
+        <div className="queueActions">
+          <button onClick={() => submit("steer")}>Steer now</button>
+          <button onClick={() => submit("followUp")}>Queue after</button>
+          <span>{state.pending.steering.length} steering · {state.pending.followUp.length} follow-up</span>
+        </div>
+      )}
       <div className="metaBar">
         <span className={`status ${connection}`}>{connection}</span>
         <button onClick={onCycleModel}>{modelName}</button>
         <select value={state?.thinkingLevel ?? "off"} onChange={(event) => onThinking(event.target.value as PiState["thinkingLevel"])}>
           {(["off", "minimal", "low", "medium", "high", "xhigh"] as const).map((level) => <option key={level} value={level}>{level}</option>)}
         </select>
+        {state?.isCompacting && <span>compacting</span>}
+        {state?.isRetrying && <span>retrying</span>}
         <span className="ctx"><span style={{ width: `${pct}%` }} />context {pct || 0}%</span>
       </div>
     </footer>
@@ -341,6 +466,10 @@ function LeftSidebar({
   onOpenWorkspace,
   onSwitchWorkspace,
   onSwitchSession,
+  onClone,
+  onCompact,
+  onExport,
+  onRename,
   workspaces,
   activeWorkspaceId,
   sessions,
@@ -353,11 +482,18 @@ function LeftSidebar({
   onOpenWorkspace: () => void;
   onSwitchWorkspace: (workspaceId: string) => void;
   onSwitchSession: (sessionPath: string) => void;
+  onClone: () => void;
+  onCompact: () => void;
+  onExport: () => void;
+  onRename: () => void;
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   sessions: PiSessionInfo[];
   cwd?: string;
 }) {
+  const [sessionQuery, setSessionQuery] = useState("");
+  const filteredSessions = sessions.filter((session) => `${session.name ?? ""} ${session.firstMessage} ${session.path}`.toLowerCase().includes(sessionQuery.toLowerCase()));
+
   return (
     <aside className={`sidebar left ${open ? "open" : "closed"}`}>
       <div className="sideInner">
@@ -365,6 +501,12 @@ function LeftSidebar({
         <button className="newChat" onClick={onNewSession}><IconPlus size={13} /> New session</button>
         <button className="newChat secondary" onClick={onContinueRecent}><IconDatabase size={13} /> Continue recent</button>
         <button className="newChat secondary" onClick={onOpenWorkspace}><IconFolder size={13} /> Open workspace</button>
+        <div className="sessionActions">
+          <button onClick={onClone}>Clone</button>
+          <button onClick={onCompact}>Compact</button>
+          <button onClick={onRename}>Name</button>
+          <button onClick={onExport}>Export</button>
+        </div>
 
         <div className="section">Workspaces</div>
         <div className="workspaceList">
@@ -382,8 +524,9 @@ function LeftSidebar({
         </div>
 
         <div className="section">Sessions</div>
+        <label className="search"><IconSearch size={13} /><input value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} placeholder="Search sessions" /></label>
         <div className="sessionList">
-          {sessions.length ? sessions.map((session) => (
+          {filteredSessions.length ? filteredSessions.map((session) => (
             <button key={session.path} className="sessionRow" onClick={() => onSwitchSession(session.path)} title={session.path}>
               <span>{session.name || session.firstMessage || "Untitled session"}</span>
               <small>{session.messageCount} msgs · {new Date(session.modified).toLocaleDateString()}</small>
@@ -401,7 +544,40 @@ function LeftSidebar({
   );
 }
 
-function RightSidebar({ open, onToggle, artifacts, state }: { open: boolean; onToggle: () => void; artifacts: UiTool[]; state: PiState | null }) {
+function RightSidebar({
+  open,
+  onToggle,
+  artifacts,
+  state,
+  resources,
+  models,
+  tree,
+  extensionStatus,
+  onUseResource,
+  onSetModel,
+  onFork,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  artifacts: UiTool[];
+  state: PiState | null;
+  resources: PiResourceSummary | null;
+  models: PiModelSummary[];
+  tree: PiTreeEntry[];
+  extensionStatus: Record<string, string>;
+  onUseResource: (label: string) => void;
+  onSetModel: (provider: string, modelId: string) => void;
+  onFork: (entryId: string) => void;
+}) {
+  const currentModels = models.filter((model) => model.available || model.current).slice(0, 8);
+  const forkEntries = tree.filter((entry) => entry.forkable).slice(-5).reverse();
+  const resourceItems = [
+    ...(resources?.commands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source })) ?? []),
+    ...(resources?.skills.slice(0, 2).map((skill) => ({ label: `skill:${skill.name}`, detail: skill.description ?? "skill" })) ?? []),
+    ...(resources?.prompts.slice(0, 2).map((prompt) => ({ label: prompt.name, detail: prompt.description ?? "prompt" })) ?? []),
+  ];
+  const statusItems = Object.entries(extensionStatus).slice(-3).reverse();
+
   return (
     <aside className={`sidebar right ${open ? "open" : "closed"}`}>
       <div className="sideInner">
@@ -411,10 +587,93 @@ function RightSidebar({ open, onToggle, artifacts, state }: { open: boolean; onT
           <code>{state?.sessionId?.slice(0, 8) ?? "—"}</code>
           <small>{state?.sessionFile ?? "Pi session file will appear after connect."}</small>
         </div>
+        <div className="section">Model</div>
+        <div className="modelList">
+          {currentModels.length ? currentModels.map((model) => (
+            <button key={`${model.provider}/${model.id}`} className={`modelRow ${model.current ? "active" : ""}`} onClick={() => onSetModel(model.provider, model.id)}>
+              <span>{model.name ?? model.id}</span>
+              <small>{model.provider}</small>
+            </button>
+          )) : <p className="muted">Configured models will show here.</p>}
+        </div>
         <div className="section">Tool calls</div>
         {artifacts.length ? artifacts.map((tool) => <div className="artifact" key={tool.id}><IconChart size={13} /><span>{tool.name}</span><i>{tool.status}</i></div>) : <p className="muted">Tools Pi runs will show up here.</p>}
+        <div className="section">Resources</div>
+        <div className="resourceGrid">
+          <div><b>{resources?.commands.length ?? 0}</b><span>commands</span></div>
+          <div><b>{resources?.skills.length ?? 0}</b><span>skills</span></div>
+          <div><b>{resources?.prompts.length ?? 0}</b><span>prompts</span></div>
+          <div><b>{resources?.agentsFiles.length ?? 0}</b><span>context</span></div>
+        </div>
+        <div className="resourceList">
+          {resourceItems.length ? resourceItems.map((item) => (
+            <button key={`${item.detail}-${item.label}`} onClick={() => onUseResource(item.label)}>
+              <span>/{item.label}</span>
+              <small>{item.detail}</small>
+            </button>
+          )) : <p className="muted">Commands, skills, and prompts will appear after resources load.</p>}
+        </div>
+        {statusItems.length > 0 && (
+          <>
+            <div className="section">Extension status</div>
+            <div className="statusList">
+              {statusItems.map(([key, text]) => <div key={key}><span>{key}</span><small>{text}</small></div>)}
+            </div>
+          </>
+        )}
+        <div className="section">Fork points</div>
+        <div className="forkList">
+          {forkEntries.length ? forkEntries.map((entry) => (
+            <button key={entry.id} onClick={() => onFork(entry.id)} title={entry.text}>
+              <span>{entry.text || entry.id.slice(0, 8)}</span>
+              <small>{new Date(entry.timestamp).toLocaleString()}</small>
+            </button>
+          )) : <p className="muted">User turns that can be forked will show here.</p>}
+        </div>
       </div>
     </aside>
+  );
+}
+
+function NoticeStack({ notices }: { notices: Array<{ id: string; message: string; level?: "info" | "warning" | "error" }> }) {
+  if (!notices.length) return null;
+  return (
+    <div className="noticeStack">
+      {notices.map((notice) => <div key={notice.id} className={`notice ${notice.level ?? "info"}`}>{notice.message}</div>)}
+    </div>
+  );
+}
+
+function ExtensionDialog({ request, onResolve }: { request: ExtensionUiRequest; onResolve: (value: unknown) => void }) {
+  const [value, setValue] = useState("");
+  const fields = request as Record<string, unknown>;
+  const title = typeof fields.title === "string" ? fields.title : "Pi extension";
+  const message = typeof fields.message === "string" ? fields.message : undefined;
+  const options = Array.isArray(fields.options) ? fields.options.filter((option): option is string => typeof option === "string") : [];
+  const placeholder = typeof fields.placeholder === "string" ? fields.placeholder : "";
+  const payload = JSON.stringify(request, null, 2);
+
+  return (
+    <div className="modalShade">
+      <div className="dialog">
+        <h2>{title}</h2>
+        {message && <p>{message}</p>}
+        {request.kind === "select" && (
+          <div className="dialogList">
+            {options.map((option) => <button key={option} onClick={() => onResolve(option)}>{option}</button>)}
+          </div>
+        )}
+        {(request.kind === "input" || request.kind === "editor") && <textarea value={value} onChange={(event) => setValue(event.target.value)} placeholder={placeholder} autoFocus />}
+        {!["confirm", "select", "input", "editor"].includes(request.kind) && <pre>{payload}</pre>}
+        <div className="dialogActions">
+          <button onClick={() => onResolve(undefined)}>Cancel</button>
+          {request.kind === "confirm" && <button onClick={() => onResolve(false)}>No</button>}
+          {request.kind === "confirm" && <button className="primary" onClick={() => onResolve(true)}>Yes</button>}
+          {(request.kind === "input" || request.kind === "editor") && <button className="primary" onClick={() => onResolve(value)}>Done</button>}
+          {!["confirm", "select", "input", "editor"].includes(request.kind) && <button className="primary" onClick={() => onResolve(undefined)}>Close</button>}
+        </div>
+      </div>
+    </div>
   );
 }
 

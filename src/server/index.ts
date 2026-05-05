@@ -9,11 +9,15 @@ import { WebSocketServer, type WebSocket } from "ws";
 import {
   type AgentSession,
   type CreateAgentSessionRuntimeFactory,
+  type ExtensionCommandContextActions,
   type ExtensionUIContext,
   type SessionEntry,
+  type ThemeColor,
+  Theme,
   createAgentSessionFromServices,
   createAgentSessionRuntime,
   createAgentSessionServices,
+  initTheme,
   getAgentDir,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
@@ -26,6 +30,23 @@ const agentDir = getAgentDir();
 const workspaceFile = path.join(agentDir, "piui-workspaces.json");
 const lockFile = path.join(agentDir, "piui-runtime-locks.json");
 const localToken = process.env.PIUI_TOKEN ?? crypto.randomBytes(24).toString("base64url");
+initTheme();
+const themeColors: ThemeColor[] = [
+  "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning", "muted", "dim", "text", "thinkingText", "userMessageText", "customMessageText", "customMessageLabel", "toolTitle", "toolOutput", "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "mdQuote", "mdQuoteBorder", "mdHr", "mdListBullet", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString", "syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation", "thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh", "bashMode",
+];
+const defaultExtensionTheme = new Theme(
+  Object.fromEntries(themeColors.map((color) => [color, color === "error" ? "#dc2626" : color === "success" ? "#16a34a" : color === "warning" ? "#ca8a04" : "#6b7280"])) as Record<ThemeColor, string>,
+  {
+    selectedBg: "#f3f4f6",
+    userMessageBg: "#f9fafb",
+    customMessageBg: "#f9fafb",
+    toolPendingBg: "#f3f4f6",
+    toolSuccessBg: "#ecfdf5",
+    toolErrorBg: "#fef2f2",
+  },
+  "truecolor",
+  { name: "piui-web-fallback" },
+);
 const allowedOrigins = new Set(
   (process.env.PIUI_ORIGINS ?? `http://127.0.0.1:${port},http://localhost:${port}`)
     .split(",")
@@ -210,6 +231,7 @@ type SessionLock = {
 
 class LockStore {
   private locks = new Map<string, SessionLock>();
+  private refCounts = new Map<string, number>();
 
   async load() {
     const data = await readJsonFile<{ locks?: SessionLock[] }>(lockFile, {});
@@ -226,6 +248,12 @@ class LockStore {
     if (existing && existing.pid !== process.pid && existing.token !== localToken) {
       return { owner: "other" as const, lock: existing };
     }
+    if (existing?.token === localToken) {
+      this.refCounts.set(sessionFile, (this.refCounts.get(sessionFile) ?? 0) + 1);
+      existing.updatedAt = new Date().toISOString();
+      await this.save();
+      return { owner: "self" as const, lock: existing };
+    }
     const lock: SessionLock = {
       sessionFile,
       workspaceId: workspace.id,
@@ -235,6 +263,7 @@ class LockStore {
       updatedAt: new Date().toISOString(),
     };
     this.locks.set(sessionFile, lock);
+    this.refCounts.set(sessionFile, 1);
     await this.save();
     return { owner: "self" as const, lock };
   }
@@ -243,6 +272,12 @@ class LockStore {
     if (!sessionFile) return;
     const existing = this.locks.get(sessionFile);
     if (existing?.token === localToken) {
+      const nextCount = (this.refCounts.get(sessionFile) ?? 1) - 1;
+      if (nextCount > 0) {
+        this.refCounts.set(sessionFile, nextCount);
+        return;
+      }
+      this.refCounts.delete(sessionFile);
       this.locks.delete(sessionFile);
       await this.save();
     }
@@ -355,6 +390,11 @@ async function listSessions(cwd: string) {
   }));
 }
 
+async function mostRecentSessionPath(cwd: string) {
+  const sessions = await SessionManager.list(cwd);
+  return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0]?.path;
+}
+
 function publicResources(session: AgentSession) {
   const skills = session.resourceLoader.getSkills();
   const prompts = session.resourceLoader.getPrompts();
@@ -410,22 +450,78 @@ function publicTree(session: AgentSession) {
   }));
 }
 
+function waitForIdle(session: AgentSession) {
+  if (!session.isStreaming && !session.isCompacting && !session.isRetrying) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "agent_end" || event.type === "compaction_end") {
+        if (!session.isStreaming && !session.isCompacting && !session.isRetrying) {
+          unsubscribe();
+          resolve();
+        }
+      }
+    });
+  });
+}
+
+function createCommandActions(handle: RuntimeHandle, locks: LockStore): ExtensionCommandContextActions {
+  return {
+    waitForIdle: () => waitForIdle(handle.runtime.session),
+    newSession: async (options) => {
+      const previousSessionFile = handle.runtime.session.sessionFile;
+      const result = await handle.runtime.newSession(options);
+      if (!result.cancelled) await locks.release(previousSessionFile);
+      return result;
+    },
+    fork: async (entryId, options) => {
+      const previousSessionFile = handle.runtime.session.sessionFile;
+      const result = await handle.runtime.fork(entryId, options);
+      if (!result.cancelled) await locks.release(previousSessionFile);
+      return { cancelled: result.cancelled };
+    },
+    navigateTree: async (targetId, options) => {
+      const result = await handle.runtime.session.navigateTree(targetId, options);
+      return { cancelled: result.cancelled };
+    },
+    switchSession: async (sessionPath, options) => {
+      const previousSessionFile = handle.runtime.session.sessionFile;
+      const result = await handle.runtime.switchSession(sessionPath, options);
+      if (!result.cancelled) await locks.release(previousSessionFile);
+      return result;
+    },
+    reload: async () => {
+      await handle.runtime.session.reload();
+    },
+  };
+}
+
 function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown) => void>): ExtensionUIContext {
-  function request<T>(kind: string, payload: Record<string, unknown>) {
+  function request<T>(kind: string, payload: Record<string, unknown>, opts?: { signal?: AbortSignal; timeout?: number }) {
     const requestId = crypto.randomUUID();
     send(ws, { type: "extension_ui_request", request: { id: requestId, kind, ...payload } });
     return new Promise<T | undefined>((resolve) => {
-      pendingUi.set(requestId, (value) => resolve(value as T | undefined));
-      setTimeout(() => {
-        if (pendingUi.delete(requestId)) resolve(undefined);
-      }, 10 * 60 * 1000).unref();
+      let timer: NodeJS.Timeout | undefined;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        opts?.signal?.removeEventListener("abort", abort);
+        pendingUi.delete(requestId);
+      };
+      const finish = (value: unknown) => {
+        cleanup();
+        resolve(value as T | undefined);
+      };
+      const abort = () => finish(undefined);
+      pendingUi.set(requestId, finish);
+      timer = setTimeout(abort, opts?.timeout ?? 10 * 60 * 1000);
+      timer.unref();
+      opts?.signal?.addEventListener("abort", abort, { once: true });
     });
   }
 
   return {
-    select: (title: string, options: string[], opts?: unknown) => request<string>("select", { title, options, opts }),
-    confirm: async (title: string, message: string, opts?: unknown) => Boolean(await request<boolean>("confirm", { title, message, opts })),
-    input: (title: string, placeholder?: string, opts?: unknown) => request<string>("input", { title, placeholder, opts }),
+    select: (title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("select", { title, options, opts }, opts),
+    confirm: async (title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }) => Boolean(await request<boolean>("confirm", { title, message, opts }, opts)),
+    input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("input", { title, placeholder, opts }, opts),
     notify: (message: string, level?: "info" | "warning" | "error") => send(ws, { type: "notification", data: { message, level } }),
     onTerminalInput: () => () => undefined,
     setStatus: (key: string, text: string | undefined) => send(ws, { type: "extension_ui_status", data: { key, text } }),
@@ -445,7 +541,7 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
     addAutocompleteProvider: () => undefined,
     setEditorComponent: () => undefined,
     getEditorComponent: () => undefined,
-    theme: undefined,
+    theme: defaultExtensionTheme,
     getAllThemes: () => [],
     getTheme: () => undefined,
     setTheme: () => ({ success: false, error: "Themes are managed by the browser UI." }),
@@ -458,7 +554,10 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
   unsubscribe?.();
   const session = handle.runtime.session;
   const lock = await locks.claim(session.sessionFile, handle.workspace);
-  await session.bindExtensions({ uiContext: createExtensionUI(ws, pendingUi) });
+  await session.bindExtensions({
+    uiContext: createExtensionUI(ws, pendingUi),
+    commandContextActions: createCommandActions(handle, locks),
+  });
   const nextUnsubscribe = session.subscribe((event) => {
     send(ws, { type: "event", event });
     if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
@@ -532,6 +631,12 @@ async function main() {
       if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile);
       activeWorkspace = await store.touch(workspace.id);
       handle = options?.mode ? await runtimes.recreate(activeWorkspace, options.mode, options.sessionPath) : await runtimes.get(activeWorkspace);
+      handle.runtime.setRebindSession(async () => {
+        const binding = await bindSession(ws, handle!, pendingUi, locks, unsubscribe);
+        unsubscribe = binding.unsubscribe;
+        readOnly = binding.readOnly;
+        send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
+      });
       const binding = await bindSession(ws, handle, pendingUi, locks, unsubscribe);
       unsubscribe = binding.unsubscribe;
       readOnly = binding.readOnly;
@@ -596,23 +701,34 @@ async function main() {
             break;
           case "switch_session":
             if (!command.sessionPath) throw new Error("Missing sessionPath");
-            await activate(activeWorkspace, { mode: "open", sessionPath: command.sessionPath });
-            send(ws, { type: "response", id, command: command.type, success: true });
+            {
+              const previousSessionFile = handle!.runtime.session.sessionFile;
+              const result = await handle!.runtime.switchSession(command.sessionPath, { cwdOverride: activeWorkspace.cwd });
+              if (!result.cancelled) await locks.release(previousSessionFile);
+              send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+            }
             break;
           case "continue_recent":
-            await activate(activeWorkspace, { mode: "continue" });
-            send(ws, { type: "response", id, command: command.type, success: true });
+            {
+              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              if (sessionPath) {
+                const previousSessionFile = handle!.runtime.session.sessionFile;
+                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
+                if (!result.cancelled) await locks.release(previousSessionFile);
+                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+              } else {
+                const previousSessionFile = handle!.runtime.session.sessionFile;
+                const result = await handle!.runtime.newSession();
+                if (!result.cancelled) await locks.release(previousSessionFile);
+                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "New session cancelled by extension." : undefined });
+              }
+            }
             break;
           case "new_session":
             const previousSessionFile = handle!.runtime.session.sessionFile;
-            await handle!.runtime.newSession();
-            await locks.release(previousSessionFile);
-            {
-              const binding = await bindSession(ws, handle!, pendingUi, locks, unsubscribe);
-              unsubscribe = binding.unsubscribe;
-              readOnly = binding.readOnly;
-            }
-            send(ws, { type: "response", id, command: command.type, success: true });
+            const newSessionResult = await handle!.runtime.newSession();
+            if (!newSessionResult.cancelled) await locks.release(previousSessionFile);
+            send(ws, { type: "response", id, command: command.type, success: !newSessionResult.cancelled, data: newSessionResult, error: newSessionResult.cancelled ? "New session cancelled by extension." : undefined });
             break;
           case "get_state":
             send(ws, { type: "response", id, command: command.type, success: true, data: publicState(activeWorkspace, handle!.runtime.session) });
@@ -659,27 +775,17 @@ async function main() {
           case "fork":
             if (!command.entryId) throw new Error("Missing entryId");
             const previousForkSessionFile = handle!.runtime.session.sessionFile;
-            await handle!.runtime.fork(command.entryId, { position: "before" });
-            await locks.release(previousForkSessionFile);
-            {
-              const binding = await bindSession(ws, handle!, pendingUi, locks, unsubscribe);
-              unsubscribe = binding.unsubscribe;
-              readOnly = binding.readOnly;
-            }
-            send(ws, { type: "response", id, command: command.type, success: true });
+            const forkResult = await handle!.runtime.fork(command.entryId, { position: "before" });
+            if (!forkResult.cancelled) await locks.release(previousForkSessionFile);
+            send(ws, { type: "response", id, command: command.type, success: !forkResult.cancelled, data: { cancelled: forkResult.cancelled, selectedText: forkResult.selectedText }, error: forkResult.cancelled ? "Fork cancelled by extension." : undefined });
             break;
           case "clone": {
             const leafId = handle!.runtime.session.sessionManager.getLeafId();
             if (!leafId) throw new Error("No current session entry to clone");
             const previousCloneSessionFile = handle!.runtime.session.sessionFile;
-            await handle!.runtime.fork(leafId, { position: "at" });
-            await locks.release(previousCloneSessionFile);
-            {
-              const binding = await bindSession(ws, handle!, pendingUi, locks, unsubscribe);
-              unsubscribe = binding.unsubscribe;
-              readOnly = binding.readOnly;
-            }
-            send(ws, { type: "response", id, command: command.type, success: true });
+            const cloneResult = await handle!.runtime.fork(leafId, { position: "at" });
+            if (!cloneResult.cancelled) await locks.release(previousCloneSessionFile);
+            send(ws, { type: "response", id, command: command.type, success: !cloneResult.cancelled, data: cloneResult, error: cloneResult.cancelled ? "Clone cancelled by extension." : undefined });
             break;
           }
           case "compact": {
