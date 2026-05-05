@@ -18,7 +18,7 @@ import {
   IconStop,
   IconTerminal,
 } from "./icons";
-import { connectPi, contentToText, type AgentEvent, type AgentMessage, type PiState } from "./piSocket";
+import { connectPi, contentToText, type AgentEvent, type AgentMessage, type PiSessionInfo, type PiState, type Workspace } from "./piSocket";
 import "./styles.css";
 
 type UiTool = {
@@ -71,6 +71,9 @@ function asMessages(messages: AgentMessage[]): UiMessage[] {
 function App() {
   const [connection, setConnection] = useState<"connecting" | "open" | "closed">("connecting");
   const [state, setState] = useState<PiState | null>(null);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<PiSessionInfo[]>([]);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
@@ -85,7 +88,17 @@ function App() {
 
   useEffect(() => {
     const socket = connectPi((packet) => {
-      if (packet.type === "ready" || packet.type === "state") setState(packet.data);
+      if (packet.type === "ready") {
+        setState(packet.data.state);
+        setWorkspaces(packet.data.workspaces);
+        setActiveWorkspaceId(packet.data.activeWorkspaceId);
+      }
+      if (packet.type === "workspaces") {
+        setWorkspaces(packet.data.workspaces);
+        setActiveWorkspaceId(packet.data.activeWorkspaceId);
+      }
+      if (packet.type === "state") setState(packet.data);
+      if (packet.type === "sessions") setSessions(packet.data.sessions);
       if (packet.type === "messages") setMessages(asMessages(packet.data.messages));
       if (packet.type === "event") applyEvent(packet.event);
       if (packet.type === "response" && !packet.success) setLastError(packet.error ?? "Unknown Pi error");
@@ -154,11 +167,46 @@ function App() {
     socketRef.current?.send({ type: "new_session" });
   }
 
+  function openWorkspace() {
+    const cwd = window.prompt("Absolute path to workspace");
+    if (!cwd?.trim()) return;
+    setMessages([]);
+    socketRef.current?.send({ type: "open_workspace", cwd: cwd.trim() });
+  }
+
+  function switchWorkspace(workspaceId: string) {
+    setMessages([]);
+    setSessions([]);
+    socketRef.current?.send({ type: "switch_workspace", workspaceId });
+  }
+
+  function switchSession(sessionPath: string) {
+    setMessages([]);
+    socketRef.current?.send({ type: "switch_session", sessionPath });
+  }
+
+  function continueRecent() {
+    setMessages([]);
+    socketRef.current?.send({ type: "continue_recent" });
+  }
+
   const artifacts = useMemo(() => messages.flatMap((message) => message.tools ?? []).slice(-8).reverse(), [messages]);
 
   return (
     <div className="shell">
-      <LeftSidebar open={leftOpen} onToggle={() => setLeftOpen((v) => !v)} onNewSession={newSession} cwd={state?.cwd} />
+      <LeftSidebar
+        open={leftOpen}
+        onToggle={() => setLeftOpen((v) => !v)}
+        onNewSession={newSession}
+        onContinueRecent={continueRecent}
+        onOpenWorkspace={openWorkspace}
+        onSwitchWorkspace={switchWorkspace}
+        onSwitchSession={switchSession}
+        workspaces={workspaces}
+        activeWorkspaceId={activeWorkspaceId}
+        sessions={sessions}
+        cwd={state?.cwd}
+      />
       <main className="app">
         <header className="topbar">
           <button className="ghost mobile" onClick={() => setLeftOpen(true)} title="Show sidebar"><IconSidebarLeft /></button>
@@ -285,13 +333,64 @@ function Composer({ state, connection, onSend, onAbort, onCycleModel, onThinking
   );
 }
 
-function LeftSidebar({ open, onToggle, onNewSession, cwd }: { open: boolean; onToggle: () => void; onNewSession: () => void; cwd?: string }) {
+function LeftSidebar({
+  open,
+  onToggle,
+  onNewSession,
+  onContinueRecent,
+  onOpenWorkspace,
+  onSwitchWorkspace,
+  onSwitchSession,
+  workspaces,
+  activeWorkspaceId,
+  sessions,
+  cwd,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  onNewSession: () => void;
+  onContinueRecent: () => void;
+  onOpenWorkspace: () => void;
+  onSwitchWorkspace: (workspaceId: string) => void;
+  onSwitchSession: (sessionPath: string) => void;
+  workspaces: Workspace[];
+  activeWorkspaceId: string | null;
+  sessions: PiSessionInfo[];
+  cwd?: string;
+}) {
   return (
     <aside className={`sidebar left ${open ? "open" : "closed"}`}>
       <div className="sideInner">
         <div className="sideHead"><b><span className="dot" /> piui</b><button onClick={onToggle}><IconSidebarLeft /></button></div>
         <button className="newChat" onClick={onNewSession}><IconPlus size={13} /> New session</button>
-        <div className="search"><IconSearch size={12} /><input placeholder="Search soon" disabled /></div>
+        <button className="newChat secondary" onClick={onContinueRecent}><IconDatabase size={13} /> Continue recent</button>
+        <button className="newChat secondary" onClick={onOpenWorkspace}><IconFolder size={13} /> Open workspace</button>
+
+        <div className="section">Workspaces</div>
+        <div className="workspaceList">
+          {workspaces.map((workspace) => (
+            <button
+              key={workspace.id}
+              className={`workspaceRow ${workspace.id === activeWorkspaceId ? "active" : ""}`}
+              onClick={() => workspace.id !== activeWorkspaceId && onSwitchWorkspace(workspace.id)}
+              title={workspace.cwd}
+            >
+              <IconFolder size={13} />
+              <span>{workspace.name}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="section">Sessions</div>
+        <div className="sessionList">
+          {sessions.length ? sessions.map((session) => (
+            <button key={session.path} className="sessionRow" onClick={() => onSwitchSession(session.path)} title={session.path}>
+              <span>{session.name || session.firstMessage || "Untitled session"}</span>
+              <small>{session.messageCount} msgs · {new Date(session.modified).toLocaleDateString()}</small>
+            </button>
+          )) : <p className="muted">No saved sessions yet.</p>}
+        </div>
+
         <div className="section">Native Pi</div>
         <div className="nativeCard"><IconFolder /><span>{cwd ?? "Loading cwd…"}</span></div>
         <div className="nativeCard"><IconDatabase /><span>~/.pi/agent sessions + auth</span></div>

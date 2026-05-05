@@ -25,11 +25,13 @@ npm run dev
 
 Open <http://localhost:5174>.
 
-By default Pi runs against this repo as cwd. To point Pi at another project:
+By default the daemon registers this repo as the first workspace. Add more workspaces from the sidebar, or seed a different first workspace:
 
 ```bash
 PIUI_CWD=/path/to/your/project npm run dev
 ```
+
+Workspace registry is stored at `~/.pi/agent/piui-workspaces.json`.
 
 ## Scripts
 
@@ -41,7 +43,17 @@ PIUI_CWD=/path/to/your/project npm run dev
 ## Architecture
 
 ```
-React/Vite UI  <-- WebSocket /ws -->  Node server  -->  Pi SDK  -->  local OS
+React/Vite UI  <-- WebSocket /ws -->  local piui daemon  -->  Pi SDK runtimes  -->  local OS
 ```
+
+Current daemon capabilities:
+
+- multi-workspace registry
+- per-workspace Pi runtime creation
+- open/switch workspace
+- list/switch saved Pi sessions
+- new session / continue recent
+- prompt, abort, model cycling, thinking level changes
+- streaming assistant/tool events
 
 See `docs/feasibility.md` for the Pi docs reviewed and next implementation steps.

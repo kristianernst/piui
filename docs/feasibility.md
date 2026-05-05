@@ -30,11 +30,22 @@ Reasoning:
 - `getAgentDir()` so credentials, settings, custom models, and global resources come from `~/.pi/agent`.
 - `session.subscribe()` to stream Pi events into the WebSocket.
 
+## Implemented daemon direction
+
+The backend now acts as a local multi-workspace Pi daemon:
+
+- persistent workspace registry at `~/.pi/agent/piui-workspaces.json`
+- one SDK runtime per opened workspace, created lazily
+- WebSocket commands for opening/switching workspaces, listing/switching sessions, new session, continue recent, prompt, abort, model/thinking changes
+- session listing through `SessionManager.list(cwd)`
+- session opening through `SessionManager.open(path, undefined, cwd)`
+
 ## Follow-up build plan
 
-1. Add session browser using `SessionManager.list(cwd)` and `switchSession()`.
+1. Add a polished session browser and search over `SessionInfo.allMessagesText`.
 2. Add fork/tree UI using Pi's session tree IDs from JSONL entries.
-3. Map extension UI requests to web dialogs if using RPC, or expose extension UI through SDK extension APIs.
+3. Add web implementations for extension UI dialogs.
 4. Add permission/sandbox policy as a Pi extension rather than duplicating it in the browser.
 5. Add file/image attachments and base64 image content handling.
-6. Add production desktop wrapper later if desired; the current web server can be reused.
+6. Add idle runtime disposal and multi-tab broadcast synchronization.
+7. Add production desktop wrapper later if desired; the current web daemon can be reused.

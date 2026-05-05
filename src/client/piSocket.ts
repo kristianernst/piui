@@ -1,4 +1,23 @@
+export type Workspace = {
+  id: string;
+  cwd: string;
+  name: string;
+  lastOpenedAt: string;
+};
+
+export type PiSessionInfo = {
+  path: string;
+  id: string;
+  cwd: string;
+  name?: string;
+  created: string;
+  modified: string;
+  messageCount: number;
+  firstMessage: string;
+};
+
 export type PiState = {
+  workspace: Workspace;
   cwd: string;
   sessionFile?: string;
   sessionId: string;
@@ -10,7 +29,10 @@ export type PiState = {
 };
 
 export type PiPacket =
-  | { type: "ready"; data: PiState }
+  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState } }
+  | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string } }
+  | { type: "workspace"; data: Workspace }
+  | { type: "sessions"; data: { workspaceId: string; sessions: PiSessionInfo[] } }
   | { type: "state"; data: PiState }
   | { type: "messages"; data: { messages: AgentMessage[] } }
   | { type: "event"; event: AgentEvent }
