@@ -28,7 +28,7 @@ const port = Number(process.env.PORT ?? 5174);
 const initialCwd = path.resolve(process.env.PIUI_CWD ?? process.cwd());
 const agentDir = getAgentDir();
 const workspaceFile = path.join(agentDir, "piui-workspaces.json");
-const lockFile = path.join(agentDir, "piui-runtime-locks.json");
+const lockDir = path.join(agentDir, "piui-locks");
 const localToken = process.env.PIUI_TOKEN ?? crypto.randomBytes(24).toString("base64url");
 initTheme();
 const themeColors: ThemeColor[] = [
@@ -54,14 +54,27 @@ const allowedOrigins = new Set(
     .filter(Boolean),
 );
 const writeCommands = new Set<ClientCommand["type"]>([
+  "open_workspace",
+  "switch_workspace",
+  "remove_workspace",
+  "switch_session",
+  "continue_recent",
+  "new_session",
+  "reload_resources",
+  "invoke_command",
   "prompt",
   "steer",
   "follow_up",
+  "abort",
   "compact",
+  "export_html",
+  "fork",
+  "clone",
   "set_session_name",
   "cycle_model",
   "set_model",
   "set_thinking_level",
+  "extension_ui_response",
 ]);
 
 type Workspace = {
@@ -86,6 +99,8 @@ type ClientCommand = {
     | "get_resources"
     | "get_models"
     | "get_tree"
+    | "reload_resources"
+    | "invoke_command"
     | "prompt"
     | "steer"
     | "follow_up"
@@ -106,6 +121,7 @@ type ClientCommand = {
   sessionPath?: string;
   entryId?: string;
   customInstructions?: string;
+  commandName?: string;
   message?: string;
   streamingBehavior?: "steer" | "followUp";
   provider?: string;
@@ -133,6 +149,12 @@ type ServerPacket =
 
 function send(ws: WebSocket, packet: ServerPacket) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(packet));
+}
+
+function isAllowedHttpRequest(req: express.Request) {
+  const host = req.hostname;
+  const origin = req.get("origin");
+  return (host === "127.0.0.1" || host === "localhost") && (!origin || allowedOrigins.has(origin));
 }
 
 function workspaceId(cwd: string) {
@@ -226,66 +248,81 @@ type SessionLock = {
   cwd: string;
   pid: number;
   token: string;
+  ownerId: string;
   updatedAt: string;
 };
 
 class LockStore {
-  private locks = new Map<string, SessionLock>();
-  private refCounts = new Map<string, number>();
-
   async load() {
-    const data = await readJsonFile<{ locks?: SessionLock[] }>(lockFile, {});
-    const now = Date.now();
-    for (const lock of data.locks ?? []) {
-      const ageMs = now - Date.parse(lock.updatedAt);
-      if (Number.isFinite(ageMs) && ageMs < 24 * 60 * 60 * 1000) this.locks.set(lock.sessionFile, lock);
+    await fs.mkdir(lockDir, { recursive: true });
+  }
+
+  private pathFor(sessionFile: string) {
+    return path.join(lockDir, `${crypto.createHash("sha1").update(sessionFile).digest("hex")}.json`);
+  }
+
+  private async readLock(sessionFile: string) {
+    return readJsonFile<SessionLock | null>(this.pathFor(sessionFile), null);
+  }
+
+  private isProcessAlive(pid: number) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
     }
   }
 
-  async claim(sessionFile: string | undefined, workspace: Workspace) {
+  async claim(sessionFile: string | undefined, workspace: Workspace, ownerId: string) {
     if (!sessionFile) return { owner: "none" as const };
-    const existing = this.locks.get(sessionFile);
-    if (existing && existing.pid !== process.pid && existing.token !== localToken) {
-      return { owner: "other" as const, lock: existing };
-    }
-    if (existing?.token === localToken) {
-      this.refCounts.set(sessionFile, (this.refCounts.get(sessionFile) ?? 0) + 1);
-      existing.updatedAt = new Date().toISOString();
-      await this.save();
-      return { owner: "self" as const, lock: existing };
-    }
     const lock: SessionLock = {
       sessionFile,
       workspaceId: workspace.id,
       cwd: workspace.cwd,
       pid: process.pid,
       token: localToken,
+      ownerId,
       updatedAt: new Date().toISOString(),
     };
-    this.locks.set(sessionFile, lock);
-    this.refCounts.set(sessionFile, 1);
-    await this.save();
-    return { owner: "self" as const, lock };
-  }
-
-  async release(sessionFile: string | undefined) {
-    if (!sessionFile) return;
-    const existing = this.locks.get(sessionFile);
-    if (existing?.token === localToken) {
-      const nextCount = (this.refCounts.get(sessionFile) ?? 1) - 1;
-      if (nextCount > 0) {
-        this.refCounts.set(sessionFile, nextCount);
-        return;
+    const lockPath = this.pathFor(sessionFile);
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    for (;;) {
+      try {
+        const file = await fs.open(lockPath, "wx");
+        await file.writeFile(JSON.stringify(lock, null, 2));
+        await file.close();
+        return { owner: "self" as const, lock };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const existing = await this.readLock(sessionFile);
+        if (!existing) continue;
+        if (existing.token === localToken && existing.ownerId === ownerId) {
+          await writeJsonFile(lockPath, { ...lock, updatedAt: new Date().toISOString() });
+          return { owner: "self" as const, lock };
+        }
+        if (!this.isProcessAlive(existing.pid)) {
+          await fs.unlink(lockPath).catch(() => undefined);
+          continue;
+        }
+        return { owner: "other" as const, lock: existing };
       }
-      this.refCounts.delete(sessionFile);
-      this.locks.delete(sessionFile);
-      await this.save();
     }
   }
 
-  private async save() {
-    await writeJsonFile(lockFile, { locks: [...this.locks.values()] });
+  async release(sessionFile: string | undefined, ownerId: string) {
+    if (!sessionFile) return;
+    const lockPath = this.pathFor(sessionFile);
+    const existing = await this.readLock(sessionFile);
+    if (existing?.token === localToken && existing.ownerId === ownerId) {
+      await fs.unlink(lockPath).catch(() => undefined);
+    }
   }
+}
+
+function lockConflictError(sessionFile: string, lock?: SessionLock) {
+  const owner = lock ? ` by PID ${lock.pid}` : "";
+  return new Error(`Session is already owned${owner}: ${sessionFile}. Switch to another session, clone it, or close the other runtime.`);
 }
 
 type RuntimeHandle = {
@@ -311,33 +348,6 @@ async function createRuntimeFor(cwd: string, mode: "new" | "continue" | "open" =
         : SessionManager.create(cwd);
 
   return createAgentSessionRuntime(factory, { cwd, agentDir, sessionManager });
-}
-
-class RuntimeManager {
-  private handles = new Map<string, RuntimeHandle>();
-
-  async get(workspace: Workspace) {
-    let handle = this.handles.get(workspace.id);
-    if (!handle) {
-      handle = { workspace, runtime: await createRuntimeFor(workspace.cwd) };
-      this.handles.set(workspace.id, handle);
-    }
-    return handle;
-  }
-
-  async recreate(workspace: Workspace, mode: "new" | "continue" | "open", sessionPath?: string) {
-    await this.dispose(workspace.id);
-    const handle = { workspace, runtime: await createRuntimeFor(workspace.cwd, mode, sessionPath) };
-    this.handles.set(workspace.id, handle);
-    return handle;
-  }
-
-  async dispose(workspaceId: string) {
-    const existing = this.handles.get(workspaceId);
-    if (!existing) return;
-    await (existing.runtime as unknown as { dispose?: () => Promise<void> | void }).dispose?.();
-    this.handles.delete(workspaceId);
-  }
 }
 
 function publicState(workspace: Workspace, session: AgentSession) {
@@ -398,16 +408,20 @@ async function mostRecentSessionPath(cwd: string) {
 function publicResources(session: AgentSession) {
   const skills = session.resourceLoader.getSkills();
   const prompts = session.resourceLoader.getPrompts();
+  const extensionCommands = session.extensionRunner.getRegisteredCommands().map((command) => ({
+    name: command.invocationName,
+    description: command.description,
+    source: "extension",
+  }));
   return {
     commands: [
       { name: "new", description: "Start a new session", source: "builtin" },
       { name: "resume", description: "Resume or switch sessions", source: "builtin" },
-      { name: "tree", description: "Inspect the session tree", source: "builtin" },
-      { name: "fork", description: "Fork from a previous user message", source: "builtin" },
       { name: "clone", description: "Clone the current branch", source: "builtin" },
       { name: "compact", description: "Summarize older context", source: "builtin" },
-      { name: "model", description: "Change model", source: "builtin" },
-      { name: "settings", description: "Open settings in native Pi", source: "builtin" },
+      { name: "export", description: "Export session to HTML", source: "builtin" },
+      { name: "reload", description: "Reload Pi resources", source: "builtin" },
+      ...extensionCommands,
       ...session.promptTemplates.map((prompt) => ({ name: prompt.name, description: prompt.description, source: "prompt" })),
       ...skills.skills.map((skill) => ({ name: `skill:${skill.name}`, description: skill.description, source: "skill" })),
     ],
@@ -464,19 +478,19 @@ function waitForIdle(session: AgentSession) {
   });
 }
 
-function createCommandActions(handle: RuntimeHandle, locks: LockStore): ExtensionCommandContextActions {
+function createCommandActions(handle: RuntimeHandle, locks: LockStore, ownerId: string): ExtensionCommandContextActions {
   return {
     waitForIdle: () => waitForIdle(handle.runtime.session),
     newSession: async (options) => {
       const previousSessionFile = handle.runtime.session.sessionFile;
       const result = await handle.runtime.newSession(options);
-      if (!result.cancelled) await locks.release(previousSessionFile);
+      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
       return result;
     },
     fork: async (entryId, options) => {
       const previousSessionFile = handle.runtime.session.sessionFile;
       const result = await handle.runtime.fork(entryId, options);
-      if (!result.cancelled) await locks.release(previousSessionFile);
+      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
       return { cancelled: result.cancelled };
     },
     navigateTree: async (targetId, options) => {
@@ -484,9 +498,12 @@ function createCommandActions(handle: RuntimeHandle, locks: LockStore): Extensio
       return { cancelled: result.cancelled };
     },
     switchSession: async (sessionPath, options) => {
+      const lock = await locks.claim(sessionPath, handle.workspace, ownerId);
+      if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
       const previousSessionFile = handle.runtime.session.sessionFile;
       const result = await handle.runtime.switchSession(sessionPath, options);
-      if (!result.cancelled) await locks.release(previousSessionFile);
+      if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
+      else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
       return result;
     },
     reload: async () => {
@@ -550,14 +567,16 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
   } as unknown as ExtensionUIContext;
 }
 
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, locks: LockStore, unsubscribe?: () => void) {
+async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, locks: LockStore, ownerId: string, unsubscribe?: () => void) {
   unsubscribe?.();
   const session = handle.runtime.session;
-  const lock = await locks.claim(session.sessionFile, handle.workspace);
-  await session.bindExtensions({
-    uiContext: createExtensionUI(ws, pendingUi),
-    commandContextActions: createCommandActions(handle, locks),
-  });
+  const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
+  if (lock.owner !== "other") {
+    await session.bindExtensions({
+      uiContext: createExtensionUI(ws, pendingUi),
+      commandContextActions: createCommandActions(handle, locks, ownerId),
+    });
+  }
   const nextUnsubscribe = session.subscribe((event) => {
     send(ws, { type: "event", event });
     if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
@@ -582,10 +601,20 @@ async function main() {
   const locks = new LockStore();
   await store.load();
   await locks.load();
-  const runtimes = new RuntimeManager();
 
   const app = express();
   app.use(express.json());
+  app.use("/api", (req, res, next) => {
+    if (!isAllowedHttpRequest(req)) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    if (req.method !== "GET" && req.get("x-piui-token") !== localToken && req.query.token !== localToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    next();
+  });
   const server = http.createServer(app);
   const wss = new WebSocketServer({
     server,
@@ -625,19 +654,21 @@ async function main() {
     let handle: RuntimeHandle | undefined;
     let unsubscribe: (() => void) | undefined;
     let readOnly = false;
+    const ownerId = crypto.randomUUID();
     const pendingUi = new Map<string, (value: unknown) => void>();
 
     async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
-      if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile);
+      if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile, ownerId);
+      await handle?.runtime.dispose();
       activeWorkspace = await store.touch(workspace.id);
-      handle = options?.mode ? await runtimes.recreate(activeWorkspace, options.mode, options.sessionPath) : await runtimes.get(activeWorkspace);
+      handle = { workspace: activeWorkspace, runtime: await createRuntimeFor(activeWorkspace.cwd, options?.mode, options?.sessionPath) };
       handle.runtime.setRebindSession(async () => {
-        const binding = await bindSession(ws, handle!, pendingUi, locks, unsubscribe);
+        const binding = await bindSession(ws, handle!, pendingUi, locks, ownerId, unsubscribe);
         unsubscribe = binding.unsubscribe;
         readOnly = binding.readOnly;
         send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
       });
-      const binding = await bindSession(ws, handle, pendingUi, locks, unsubscribe);
+      const binding = await bindSession(ws, handle, pendingUi, locks, ownerId, unsubscribe);
       unsubscribe = binding.unsubscribe;
       readOnly = binding.readOnly;
       send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
@@ -664,7 +695,7 @@ async function main() {
       const id = command.id;
       try {
         if (readOnly && writeCommands.has(command.type)) {
-          throw new Error("This session is read-only because another Pi runtime owns its session file. Switch to another session, clone it, or close the other runtime.");
+          throw new Error("This session is read-only because another Pi runtime owns its session file. Close the other runtime before changing this session.");
         }
         switch (command.type) {
           case "list_workspaces":
@@ -688,7 +719,7 @@ async function main() {
           }
           case "remove_workspace": {
             if (!command.workspaceId) throw new Error("Missing workspaceId");
-            await runtimes.dispose(command.workspaceId);
+            if (command.workspaceId === activeWorkspace.id) await handle?.runtime.dispose();
             await store.remove(command.workspaceId);
             const next = store.list()[0] ?? (await store.add(initialCwd));
             await activate(next);
@@ -702,9 +733,12 @@ async function main() {
           case "switch_session":
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             {
+              const lock = await locks.claim(command.sessionPath, activeWorkspace, ownerId);
+              if (lock.owner === "other") throw lockConflictError(command.sessionPath, lock.lock);
               const previousSessionFile = handle!.runtime.session.sessionFile;
               const result = await handle!.runtime.switchSession(command.sessionPath, { cwdOverride: activeWorkspace.cwd });
-              if (!result.cancelled) await locks.release(previousSessionFile);
+              if (!result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(previousSessionFile, ownerId);
+              else if (result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(command.sessionPath, ownerId);
               send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
             }
             break;
@@ -712,14 +746,17 @@ async function main() {
             {
               const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
               if (sessionPath) {
+                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
+                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
                 const previousSessionFile = handle!.runtime.session.sessionFile;
                 const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
-                if (!result.cancelled) await locks.release(previousSessionFile);
+                if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
+                else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
                 send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
               } else {
                 const previousSessionFile = handle!.runtime.session.sessionFile;
                 const result = await handle!.runtime.newSession();
-                if (!result.cancelled) await locks.release(previousSessionFile);
+                if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
                 send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "New session cancelled by extension." : undefined });
               }
             }
@@ -727,7 +764,7 @@ async function main() {
           case "new_session":
             const previousSessionFile = handle!.runtime.session.sessionFile;
             const newSessionResult = await handle!.runtime.newSession();
-            if (!newSessionResult.cancelled) await locks.release(previousSessionFile);
+            if (!newSessionResult.cancelled) await locks.release(previousSessionFile, ownerId);
             send(ws, { type: "response", id, command: command.type, success: !newSessionResult.cancelled, data: newSessionResult, error: newSessionResult.cancelled ? "New session cancelled by extension." : undefined });
             break;
           case "get_state":
@@ -740,6 +777,44 @@ async function main() {
             send(ws, { type: "response", id, command: command.type, success: true, data: publicResources(handle!.runtime.session) });
             send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
             break;
+          case "reload_resources":
+            await handle!.runtime.session.reload();
+            send(ws, { type: "response", id, command: command.type, success: true });
+            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            break;
+          case "invoke_command": {
+            if (!command.commandName) throw new Error("Missing commandName");
+            const name = command.commandName.replace(/^\//, "");
+            if (name === "new") {
+              const previous = handle!.runtime.session.sessionFile;
+              const result = await handle!.runtime.newSession();
+              if (!result.cancelled) await locks.release(previous, ownerId);
+            } else if (name === "resume") {
+              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              if (sessionPath) {
+                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
+                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
+                const previous = handle!.runtime.session.sessionFile;
+                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
+                if (!result.cancelled && previous !== sessionPath) await locks.release(previous, ownerId);
+                else if (result.cancelled && previous !== sessionPath) await locks.release(sessionPath, ownerId);
+              }
+            } else if (name === "clone") {
+              const leafId = handle!.runtime.session.sessionManager.getLeafId();
+              if (leafId) {
+                const previous = handle!.runtime.session.sessionFile;
+                const result = await handle!.runtime.fork(leafId, { position: "at" });
+                if (!result.cancelled) await locks.release(previous, ownerId);
+              }
+            } else if (name === "compact") await handle!.runtime.session.compact();
+            else if (name === "export") await handle!.runtime.session.exportToHtml();
+            else if (name === "reload") await handle!.runtime.session.reload();
+            else await handle!.runtime.session.prompt(`/${name}`);
+            send(ws, { type: "response", id, command: command.type, success: true });
+            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
+            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            break;
+          }
           case "get_models":
             send(ws, { type: "response", id, command: command.type, success: true, data: { models: publicModels(handle!.runtime.session) } });
             send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
@@ -776,7 +851,7 @@ async function main() {
             if (!command.entryId) throw new Error("Missing entryId");
             const previousForkSessionFile = handle!.runtime.session.sessionFile;
             const forkResult = await handle!.runtime.fork(command.entryId, { position: "before" });
-            if (!forkResult.cancelled) await locks.release(previousForkSessionFile);
+            if (!forkResult.cancelled) await locks.release(previousForkSessionFile, ownerId);
             send(ws, { type: "response", id, command: command.type, success: !forkResult.cancelled, data: { cancelled: forkResult.cancelled, selectedText: forkResult.selectedText }, error: forkResult.cancelled ? "Fork cancelled by extension." : undefined });
             break;
           case "clone": {
@@ -784,7 +859,7 @@ async function main() {
             if (!leafId) throw new Error("No current session entry to clone");
             const previousCloneSessionFile = handle!.runtime.session.sessionFile;
             const cloneResult = await handle!.runtime.fork(leafId, { position: "at" });
-            if (!cloneResult.cancelled) await locks.release(previousCloneSessionFile);
+            if (!cloneResult.cancelled) await locks.release(previousCloneSessionFile, ownerId);
             send(ws, { type: "response", id, command: command.type, success: !cloneResult.cancelled, data: cloneResult, error: cloneResult.cancelled ? "Clone cancelled by extension." : undefined });
             break;
           }
@@ -855,7 +930,8 @@ async function main() {
       unsubscribe?.();
       for (const resolve of pendingUi.values()) resolve(undefined);
       pendingUi.clear();
-      await locks.release(handle?.runtime.session.sessionFile);
+      await locks.release(handle?.runtime.session.sessionFile, ownerId);
+      await handle?.runtime.dispose();
     });
   });
 

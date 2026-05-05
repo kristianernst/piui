@@ -49,10 +49,10 @@ React/Vite UI  <-- WebSocket /ws -->  local piui daemon  -->  Pi SDK runtimes  -
 Current daemon capabilities:
 
 - multi-workspace registry
-- per-workspace Pi runtime creation
+- per-browser-connection Pi runtime creation guarded by session-file locks
 - open/switch workspace
 - list/switch saved Pi sessions
-- advisory session-file locking with multi-tab ref counting
+- advisory session-file locking with per-session atomic lock files
 - new session / continue recent / fork / clone / compact / export
 - prompt, abort, explicit steer/follow-up queues, model selection/cycling, thinking level changes
 - resource snapshots for commands, tools, skills, prompts, and context files

@@ -59,25 +59,48 @@ const starters = [
   "Run the test suite and explain failures",
 ];
 
-function asMessages(messages: AgentMessage[]): UiMessage[] {
+function uiMessageFromAgent(message: AgentMessage, id: string): UiMessage | null {
+  if (message.role === "user") return { id, role: "user", text: contentToText(message.content) };
+  if (message.role === "assistant") {
+    const content = Array.isArray(message.content) ? message.content : [];
+    const toolCalls = content
+      .filter((block) => block.type === "toolCall")
+      .map((block) => ({ id: block.id, name: block.name, args: block.arguments, status: "done" as const }));
+    const thinking = content.filter((block) => block.type === "thinking").map((block) => block.thinking).join("\n");
+    const textBlocks = content.filter((block) => block.type === "text");
+    return { id, role: "assistant", text: contentToText(textBlocks), thinking, tools: toolCalls };
+  }
+  if (message.role === "toolResult") {
+    const status = message.isError ? "error" : "result";
+    return { id, role: "system", text: `${message.toolName} ${status}\n${contentToText(message.content)}`.trim() };
+  }
+  if (message.role === "bashExecution") return { id, role: "system", text: `$ ${message.command}\n${message.output}` };
+
+  const unknown = message as { role: string; content?: unknown; text?: unknown; message?: unknown };
+  const text = contentToText(unknown.content ?? unknown.text ?? unknown.message);
+  return { id, role: "system", text: text || `[${unknown.role}] ${JSON.stringify(message)}` };
+}
+
+function asMessages(messages: AgentMessage[], prefix = "m"): UiMessage[] {
   const next: UiMessage[] = [];
   messages.forEach((message, index) => {
-    if (message.role === "user") {
-      next.push({ id: `m-${index}`, role: "user", text: contentToText(message.content) });
-      return;
-    }
-    if (message.role === "assistant") {
-      const content = Array.isArray(message.content) ? message.content : [];
-      const toolCalls = content
-        .filter((block) => block.type === "toolCall")
-        .map((block) => ({ id: block.id, name: block.name, args: block.arguments, status: "done" as const }));
-      const thinking = content.filter((block) => block.type === "thinking").map((block) => block.thinking).join("\n");
-      const textBlocks = content.filter((block) => block.type === "text");
-      next.push({ id: `m-${index}`, role: "assistant", text: contentToText(textBlocks), thinking, tools: toolCalls });
-      return;
-    }
-    if (message.role === "bashExecution") next.push({ id: `m-${index}`, role: "system", text: `$ ${message.command}\n${message.output}` });
+    const uiMessage = uiMessageFromAgent(message, `${prefix}-${index}`);
+    if (uiMessage) next.push(uiMessage);
   });
+  return next;
+}
+
+function appendDistinctMessages(current: UiMessage[], additions: UiMessage[]) {
+  const next = [...current];
+  for (const addition of additions) {
+    const last = next[next.length - 1];
+    if (last?.role === addition.role && last.text === addition.text) continue;
+    if (addition.role === "user" && last?.role === "assistant" && last.streaming && !last.text && !last.tools?.length) {
+      next.splice(next.length - 1, 0, addition);
+      continue;
+    }
+    next.push(addition);
+  }
   return next;
 }
 
@@ -161,6 +184,10 @@ function App() {
   }
 
   function applyEvent(event: AgentEvent) {
+    if (event.type === "message_start" && event.message && event.message.role !== "assistant") {
+      setMessages((prev) => appendDistinctMessages(prev, asMessages([event.message!], `e-${Date.now()}`)));
+      return;
+    }
     if (event.type === "agent_start") {
       setMessages((prev) => [...prev, { id: `a-${Date.now()}`, role: "assistant", text: "", thinking: "", tools: [], streaming: true }]);
       setLastError(null);
@@ -179,6 +206,11 @@ function App() {
       const content = Array.isArray((event.message as AgentMessage & { content?: unknown }).content) ? (event.message as AgentMessage & { content: unknown[] }).content : [];
       const textBlocks = content.filter((block) => typeof block === "object" && block !== null && "type" in block && block.type === "text");
       setMessages((prev) => updateLastAssistant(prev, (message) => ({ ...message, text: contentToText(textBlocks), streaming: false })));
+      return;
+    }
+    if (event.type === "message_end" && event.message?.role === "user") return;
+    if (event.type === "message_end" && event.message) {
+      setMessages((prev) => appendDistinctMessages(prev, asMessages([event.message!], `e-${Date.now()}`)));
       return;
     }
     if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
@@ -202,7 +234,6 @@ function App() {
   }
 
   function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
-    setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: "user", text }]);
     socketRef.current?.send({ type: "prompt", message: text, streamingBehavior });
   }
 
@@ -240,6 +271,10 @@ function App() {
   function continueRecent() {
     setMessages([]);
     socketRef.current?.send({ type: "continue_recent" });
+  }
+
+  function invokeCommand(commandName: string) {
+    socketRef.current?.send({ type: "invoke_command", commandName });
   }
 
   const artifacts = useMemo(() => messages.flatMap((message) => message.tools ?? []).slice(-8).reverse(), [messages]);
@@ -309,6 +344,8 @@ function App() {
         tree={tree}
         extensionStatus={extensionStatus}
         onUseResource={(label) => setDraft(`/${label} `)}
+        onReloadResources={() => socketRef.current?.send({ type: "reload_resources" })}
+        onInvokeCommand={invokeCommand}
         onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
         onFork={(entryId) => socketRef.current?.send({ type: "fork", entryId })}
       />
@@ -554,6 +591,8 @@ function RightSidebar({
   tree,
   extensionStatus,
   onUseResource,
+  onReloadResources,
+  onInvokeCommand,
   onSetModel,
   onFork,
 }: {
@@ -566,15 +605,22 @@ function RightSidebar({
   tree: PiTreeEntry[];
   extensionStatus: Record<string, string>;
   onUseResource: (label: string) => void;
+  onReloadResources: () => void;
+  onInvokeCommand: (commandName: string) => void;
   onSetModel: (provider: string, modelId: string) => void;
   onFork: (entryId: string) => void;
 }) {
   const currentModels = models.filter((model) => model.available || model.current).slice(0, 8);
   const forkEntries = tree.filter((entry) => entry.forkable).slice(-5).reverse();
+  const extensionCommands = resources?.commands.filter((command) => command.source === "extension") ?? [];
+  const builtinCommands = resources?.commands.filter((command) => command.source === "builtin") ?? [];
+  const promptCommands = resources?.commands.filter((command) => command.source === "prompt" || command.source === "skill") ?? [];
   const resourceItems = [
-    ...(resources?.commands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source })) ?? []),
-    ...(resources?.skills.slice(0, 2).map((skill) => ({ label: `skill:${skill.name}`, detail: skill.description ?? "skill" })) ?? []),
-    ...(resources?.prompts.slice(0, 2).map((prompt) => ({ label: prompt.name, detail: prompt.description ?? "prompt" })) ?? []),
+    ...extensionCommands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
+    ...builtinCommands.slice(0, 4).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
+    ...promptCommands.slice(0, 3).map((command) => ({ label: command.name, detail: command.source, action: "invoke" as const })),
+    ...(resources?.skills.slice(0, 2).map((skill) => ({ label: `skill:${skill.name}`, detail: skill.description ?? "skill", action: "insert" as const })) ?? []),
+    ...(resources?.prompts.slice(0, 2).map((prompt) => ({ label: prompt.name, detail: prompt.description ?? "prompt", action: "insert" as const })) ?? []),
   ];
   const statusItems = Object.entries(extensionStatus).slice(-3).reverse();
 
@@ -598,7 +644,7 @@ function RightSidebar({
         </div>
         <div className="section">Tool calls</div>
         {artifacts.length ? artifacts.map((tool) => <div className="artifact" key={tool.id}><IconChart size={13} /><span>{tool.name}</span><i>{tool.status}</i></div>) : <p className="muted">Tools Pi runs will show up here.</p>}
-        <div className="section">Resources</div>
+        <div className="section actionSection"><span>Resources</span><button onClick={onReloadResources}>Reload</button></div>
         <div className="resourceGrid">
           <div><b>{resources?.commands.length ?? 0}</b><span>commands</span></div>
           <div><b>{resources?.skills.length ?? 0}</b><span>skills</span></div>
@@ -607,7 +653,7 @@ function RightSidebar({
         </div>
         <div className="resourceList">
           {resourceItems.length ? resourceItems.map((item) => (
-            <button key={`${item.detail}-${item.label}`} onClick={() => onUseResource(item.label)}>
+            <button key={`${item.detail}-${item.label}`} onClick={() => item.action === "invoke" ? onInvokeCommand(item.label) : onUseResource(item.label)}>
               <span>/{item.label}</span>
               <small>{item.detail}</small>
             </button>
