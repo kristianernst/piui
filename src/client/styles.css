@@ -224,6 +224,17 @@ body.dark {
   letter-spacing: -0.025em;
   color: var(--ink);
 }
+/* Inline Pi logo replaces the literal word "Pi" in the heading. Width is
+   ~1ch so it visually balances the surrounding text; vertical-align keeps
+   it sitting on the cap line rather than the baseline. Fill follows
+   `currentColor` so it adopts the heading's `--ink` (dark in light mode,
+   near-white in dark mode) automatically. */
+.empty-piLogo {
+  width: 1.33em;
+  height: 1.33em;
+  vertical-align: -0.24em;
+  margin-right: 0.06em;
+}
 .empty p {
   max-width: 580px;
   margin: 0 0 22px;
@@ -550,7 +561,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .vizCardHead {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 10px 10px;
   min-width: 0;
   margin-bottom: 8px;
 }
@@ -573,17 +585,26 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border: 1px solid var(--hairline);
   border-radius: 7px;
   background: var(--paper);
+  /* Nine chart-mode pills don't always fit a narrow card. Allow horizontal
+     scroll inside the segmented toggle rather than letting it overflow the
+     header bar; flex-wrap on `.vizCardHead` then drops the whole toggle to
+     its own row before this kicks in. */
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.vizMode::-webkit-scrollbar { display: none; }
 .vizMode button {
   appearance: none;
   border: 0;
   border-radius: 5px;
-  padding: 3px 9px;
+  padding: 3px 8px;
   background: transparent;
   color: var(--muted);
   font: 11px var(--mono);
   letter-spacing: 0.01em;
   cursor: pointer;
+  flex: 0 0 auto;
   transition: color 0.16s var(--ease);
 }
 .vizMode button:hover { color: var(--ink-soft); }
@@ -783,6 +804,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   word-break: break-word;
 }
 .vizTooltipRow strong.accent { color: var(--accent); font-size: 14px; }
+.vizTooltipRow strong.ok { color: var(--ok); font-size: 14px; }
+.vizTooltipRow strong.bad { color: var(--bad); font-size: 14px; }
 .emptyChart {
   border: 1px solid var(--hairline);
   border-radius: 8px;
@@ -928,6 +951,7 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   margin-top: -24px;
 }
 .composer {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 4px;
@@ -937,6 +961,74 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border-radius: 22px;
   padding: 6px;
   transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+}
+
+/* Mention popover — anchored to the composer, sitting just above the textarea
+   so the user's eye stays close to where they're typing. */
+.mention {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 8px;
+  right: 8px;
+  max-width: 460px;
+  background: var(--card);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px oklch(0 0 0 / 0.10);
+  padding: 6px;
+  z-index: 30;
+}
+.mention-head {
+  font: 10px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 4px 8px 6px;
+}
+.mention-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  display: grid;
+  gap: 1px;
+}
+.mention-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.mention-item.active {
+  background: oklch(from var(--ink) l c h / 0.06);
+  color: var(--ink);
+}
+.mention-label {
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mention-desc {
+  grid-column: 1 / -1;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mention-group {
+  font: 10px var(--mono);
+  color: var(--faint);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 .composer:focus-within {
   border-color: var(--hairline-strong);
@@ -996,10 +1088,16 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   background: oklch(from var(--ink) l c h / 0.045);
   color: var(--ink-soft);
 }
-/* Model picker can grow large with long names; cap it so the bar stays tidy
-   and let the underlying native dropdown still expose the full list. */
+/* Model picker shrink-wraps to whatever the *currently selected* option's
+   label is. The element receives `--label-len` inline (set in JSX from the
+   selected option's text length); we convert that to a width in `ch` units
+   plus a fixed allowance for the chevron + horizontal padding. Without this,
+   native <select> sizes to the widest option in the list, leaving an awkward
+   gap before the next pill when the active model has a short name. */
 .metaBar-model {
-  max-width: 200px;
+  width: calc((var(--label-len, 12) + 1) * 1ch + 22px);
+  min-width: 56px;
+  max-width: 220px;
   text-overflow: ellipsis;
   -webkit-appearance: none;
   appearance: none;

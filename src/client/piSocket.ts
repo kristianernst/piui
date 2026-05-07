@@ -91,6 +91,7 @@ export type PiPacket =
   | { type: "resources"; data: PiResourceSummary }
   | { type: "models"; data: { models: PiModelSummary[] } }
   | { type: "settings"; data: PiSettings }
+  | { type: "files"; data: { workspaceId: string; files: string[] } }
   | { type: "tree"; data: { entries: PiTreeEntry[] } }
   | { type: "extension_ui_request"; request: ExtensionUiRequest }
   | { type: "extension_ui_status"; data: { key: string; text?: string; value?: unknown } }
@@ -113,7 +114,19 @@ export type ToolResultDetails =
       kind: "analytics_visualization";
       title?: string;
       sql?: string;
-      chartType: "bar" | "line";
+      // Single-series chart shapes the UI knows how to render. The toggle in
+      // VisualizationResult lets the user swap between them at view time.
+      // - line: smooth filled line (was the original "line")
+      // - area: same shape but a heavier fill, good for cumulative-look
+      // - step: stepAfter line, good for state changes
+      // - bar: vertical bars (was the original "bar")
+      // - horizontalBar: flipped axes — long category names along Y
+      // - scatter: independent points, good for pair correlations
+      // - waterfall: bars with running-total positioning + signed colors,
+      //   approximating a finance-style waterfall from a single delta column
+      // - cumulative: line of the running sum of `y` along `x` order
+      // - pie: arcs over `y` summed per `x` category — best at small N
+      chartType: "bar" | "line" | "area" | "step" | "horizontalBar" | "scatter" | "waterfall" | "cumulative" | "pie";
       x: string;
       y: string;
       xLabel?: string;

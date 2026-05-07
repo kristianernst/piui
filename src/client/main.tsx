@@ -32,6 +32,7 @@ import {
   type AgentMessage,
   type ExtensionUiRequest,
   type PiModelSummary,
+  type PiResourceSummary,
   type PiSessionInfo,
   type PiSettings,
   type PiState,
@@ -185,6 +186,8 @@ function App() {
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [models, setModels] = useState<PiModelSummary[]>([]);
   const [settings, setSettings] = useState<PiSettings | null>(null);
+  const [resources, setResources] = useState<PiResourceSummary | null>(null);
+  const [files, setFiles] = useState<string[]>([]);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
@@ -219,6 +222,8 @@ function App() {
       if (packet.type === "sessions") setSessions(packet.data.sessions);
       if (packet.type === "models") setModels(packet.data.models);
       if (packet.type === "settings") setSettings(packet.data);
+      if (packet.type === "resources") setResources(packet.data);
+      if (packet.type === "files") setFiles(packet.data.files);
       if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
       if (packet.type === "extension_ui_request") setUiRequest(packet.request);
       if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
@@ -238,6 +243,15 @@ function App() {
       el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     }
   }, [messages]);
+
+  // Refresh `@`-mention candidates whenever the active workspace changes.
+  // We send a fresh request rather than caching per-workspace because file
+  // listings drift quickly during active development.
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    setFiles([]);
+    socketRef.current?.send({ type: "list_files" });
+  }, [activeWorkspaceId]);
 
   function handleThreadScroll() {
     const el = threadRef.current;
@@ -455,6 +469,8 @@ function App() {
           onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })}
           models={models}
           onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
+          resources={resources}
+          files={files}
         />
       </main>
       <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} />
@@ -487,10 +503,33 @@ function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage
   return next;
 }
 
+// Pi logo from https://pi.dev/logo.svg, inlined and re-fitted to use
+// `currentColor` so it picks up the heading's color (black in light mode,
+// near-white in dark mode) without a second asset round-trip.
+function PiLogo({ className, title = "Pi" }: { className?: string; title?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 800 800"
+      className={className}
+      role="img"
+      aria-label={title}
+      fill="currentColor"
+    >
+      <title>{title}</title>
+      <path
+        fillRule="evenodd"
+        d="M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z"
+      />
+      <path d="M517.36 400 H634.72 V634.72 H517.36 Z" />
+    </svg>
+  );
+}
+
 function EmptyState() {
   return (
     <section className="empty fadeUp">
-      <h1>Pi, in the browser.</h1>
+      <h1><PiLogo className="empty-piLogo" />, in the browser.</h1>
       <p>This local web app talks to Pi through its Node SDK, so it uses your real Pi config, credentials, sessions, tools, context files, extensions, and working directory.</p>
     </section>
   );
@@ -713,19 +752,66 @@ function SchemaResult({ details }: { details: Extract<ToolResultDetails, { kind:
   );
 }
 
+type VizMode = Extract<ToolResultDetails, { kind: "analytics_visualization" }>["chartType"];
+type VizFamily = "trend" | "categorical" | "flow";
+
+// Group chart modes by intent. Switching is only allowed *within* a family —
+// flipping a trendline to a pie is a category error (different question being
+// asked of the data), so we hide cross-family options rather than letting the
+// user produce a misleading chart by accident. The original `chartType`
+// declared by the visualisation tool decides which family the toggle exposes.
+const VIZ_FAMILY: Record<VizMode, VizFamily> = {
+  line: "trend",
+  area: "trend",
+  step: "trend",
+  scatter: "trend",
+  cumulative: "trend",
+  bar: "categorical",
+  horizontalBar: "categorical",
+  pie: "categorical",
+  waterfall: "flow",
+};
+
+const VIZ_MODES: ReadonlyArray<{ value: VizMode; label: string; family: VizFamily }> = [
+  { value: "line", label: "Line", family: "trend" },
+  { value: "area", label: "Area", family: "trend" },
+  { value: "step", label: "Step", family: "trend" },
+  { value: "scatter", label: "Scatter", family: "trend" },
+  { value: "cumulative", label: "Cumulative", family: "trend" },
+  { value: "bar", label: "Bar", family: "categorical" },
+  { value: "horizontalBar", label: "Horizontal", family: "categorical" },
+  { value: "pie", label: "Pie", family: "categorical" },
+  { value: "waterfall", label: "Waterfall", family: "flow" },
+];
+
 function VisualizationResult({ details }: { details: Extract<ToolResultDetails, { kind: "analytics_visualization" }> }) {
   const rows = safeRows(details.rows);
-  const [mode, setMode] = useState<"line" | "bar">(details.chartType);
+  const [mode, setMode] = useState<VizMode>(details.chartType);
   const [expanded, setExpanded] = useState(false);
+  // Only show alternates that share the original chart's family. The declared
+  // `details.chartType` is treated as the source of truth for intent — we
+  // never enlarge the menu beyond it, only narrow it to peer alternatives.
+  const family = VIZ_FAMILY[details.chartType] ?? "categorical";
+  const familyModes = VIZ_MODES.filter((entry) => entry.family === family);
 
   const card = (onExpandToggle?: () => void, expandIcon?: React.ReactNode) => (
     <div className="toolPanel visualizationPanel">
       <div className="vizCardHead">
         <div className="vizTitle">{details.title || "Visualization"}</div>
-        <div className="vizMode" role="group" aria-label="Chart mode">
-          <button type="button" className={mode === "line" ? "active" : ""} onClick={() => setMode("line")}>Line</button>
-          <button type="button" className={mode === "bar" ? "active" : ""} onClick={() => setMode("bar")}>Bar</button>
-        </div>
+        {familyModes.length > 1 && (
+          <div className="vizMode" role="group" aria-label="Chart mode">
+            {familyModes.map(({ value, label }) => (
+              <button
+                key={value}
+                type="button"
+                className={mode === value ? "active" : ""}
+                onClick={() => setMode(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
         {onExpandToggle && (
           <button type="button" className={expanded ? "vizModalClose" : "vizExpand"} onClick={onExpandToggle} title={expanded ? "Close" : "Expand"} aria-label={expanded ? "Close expanded view" : "Expand"}>
             {expandIcon}
@@ -1228,6 +1314,43 @@ function renderInline(input: string): React.ReactNode[] {
   return out;
 }
 
+type MentionKind = "command" | "skill" | "file";
+type MentionItem = { kind: MentionKind; insert: string; label: string; description?: string; group?: string };
+type MentionState = { trigger: "/" | "$" | "@"; start: number; end: number; query: string };
+
+// Spot a trigger immediately preceded by start-of-text or whitespace, capturing
+// any wordy / dotted / dashed / slashed body that follows. We re-run this
+// against the textarea's value+selection on every change so deleting back
+// past the trigger character cleanly closes the menu.
+const MENTION_RX = /(^|\s)([/$@])([\w./:\-]*)$/;
+
+function detectMention(value: string, caret: number): MentionState | null {
+  const upToCaret = value.slice(0, caret);
+  const match = MENTION_RX.exec(upToCaret);
+  if (!match) return null;
+  const trigger = match[2] as MentionState["trigger"];
+  const query = match[3] ?? "";
+  // start is the index of the trigger character itself (not the leading whitespace/newline).
+  const start = upToCaret.length - (1 + query.length);
+  return { trigger, start, end: caret, query };
+}
+
+function rankSuggestions<T extends { label: string; description?: string }>(items: T[], query: string, max = 8): T[] {
+  if (!query) return items.slice(0, max);
+  const q = query.toLowerCase();
+  // Three-tier ranking: prefix on label > substring on label > substring on
+  // description. Stable within each tier so a sensible order is preserved.
+  const buckets: T[][] = [[], [], []];
+  for (const item of items) {
+    const label = item.label.toLowerCase();
+    const desc = item.description?.toLowerCase();
+    if (label.startsWith(q)) buckets[0].push(item);
+    else if (label.includes(q)) buckets[1].push(item);
+    else if (desc?.includes(q)) buckets[2].push(item);
+  }
+  return [...buckets[0], ...buckets[1], ...buckets[2]].slice(0, max);
+}
+
 function Composer({
   state,
   connection,
@@ -1240,6 +1363,8 @@ function Composer({
   onThinking,
   models,
   onSetModel,
+  resources,
+  files,
 }: {
   state: PiState | null;
   connection: string;
@@ -1252,6 +1377,8 @@ function Composer({
   onThinking: (level: PiState["thinkingLevel"]) => void;
   models: PiModelSummary[];
   onSetModel: (provider: string, modelId: string) => void;
+  resources: PiResourceSummary | null;
+  files: string[];
 }) {
   const disabled = connection !== "open";
   const pct = state?.usage?.percent ?? 0;
@@ -1277,6 +1404,15 @@ function Composer({
         ? [{ provider: state.model.provider, id: state.model.id, name: state.model.name, available: true, current: true } as PiModelSummary]
         : []);
   const currentModelKey = state?.model ? `${state.model.provider}::${state.model.id}` : "";
+  // Native <select> tends to size to the *widest* option in the list (so a
+  // short model like "GPT-5.5" still leaves a gap before the next pill).
+  // Compute the visible label and feed its char count to CSS so the select
+  // shrink-wraps to just what's currently selected.
+  const currentModelLabel =
+    modelOptions.find((model) => `${model.provider}::${model.id}` === currentModelKey)?.name
+    ?? state?.model?.name
+    ?? state?.model?.id
+    ?? "No model";
 
   function submit(mode: "send" | "steer" | "followUp" = "send") {
     if (!value.trim() || disabled) return;
@@ -1286,12 +1422,129 @@ function Composer({
     onValueChange("");
   }
 
+  // Mention popover state — only one is open at a time. `mention` describes
+  // the active trigger token; `mentionIndex` is the keyboard-highlighted item.
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [mention, setMention] = useState<MentionState | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const suggestions: MentionItem[] = (() => {
+    if (!mention) return [];
+    if (mention.trigger === "/") {
+      // Built-in + extension commands + prompt templates. Skills are exposed
+      // via the dollar trigger, so strip the `skill:` items here to keep the
+      // slash menu about commands only.
+      const rawCmds = (resources?.commands ?? []).filter((c) => !c.name.startsWith("skill:"));
+      const items: MentionItem[] = rawCmds.map((c) => ({
+        kind: "command",
+        insert: `/${c.name}`,
+        label: c.name,
+        description: c.description,
+        group: c.source === "builtin" ? "Built-in" : c.source === "prompt" ? "Prompts" : "Extensions",
+      }));
+      return rankSuggestions(items, mention.query, 10);
+    }
+    if (mention.trigger === "$") {
+      const skills = resources?.skills ?? [];
+      const items: MentionItem[] = skills.map((s) => ({
+        kind: "skill",
+        insert: `$${s.name}`,
+        label: s.name,
+        description: s.description,
+        group: "Skills",
+      }));
+      return rankSuggestions(items, mention.query, 10);
+    }
+    // @file — match against full path so users can type a partial directory.
+    const items: MentionItem[] = files.map((p) => ({ kind: "file", insert: `@${p}`, label: p, group: "Files" }));
+    return rankSuggestions(items, mention.query, 10);
+  })();
+
+  // Reset the highlighted index whenever the suggestions list changes shape.
+  useEffect(() => { setMentionIndex(0); }, [mention?.trigger, mention?.query, suggestions.length]);
+
+  function applySuggestion(item: MentionItem) {
+    if (!mention) return;
+    const insert = item.insert + (item.kind === "file" ? " " : " ");
+    const next = value.slice(0, mention.start) + insert + value.slice(mention.end);
+    const caret = mention.start + insert.length;
+    onValueChange(next);
+    setMention(null);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(caret, caret);
+    });
+  }
+
+  function handleChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
+    const next = event.target.value;
+    onValueChange(next);
+    const caret = event.target.selectionStart ?? next.length;
+    setMention(detectMention(next, caret));
+  }
+
+  function handleSelect(event: React.SyntheticEvent<HTMLTextAreaElement>) {
+    // Pure cursor moves (no value change) need to recompute too — clicking
+    // earlier in the input should reopen / close the menu accordingly.
+    const ta = event.currentTarget;
+    setMention(detectMention(ta.value, ta.selectionStart ?? ta.value.length));
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (mention && suggestions.length) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMentionIndex((idx) => (idx + 1) % suggestions.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMentionIndex((idx) => (idx - 1 + suggestions.length) % suggestions.length);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        applySuggestion(suggestions[mentionIndex]);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMention(null);
+        return;
+      }
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submit(state?.isStreaming ? "followUp" : "send");
+    }
+  }
+
   return (
     <footer className="composerWrap">
       <div className="composer">
         <button className="add" title="Attach"><IconPlusSlim size={16} /></button>
-        <textarea value={value} disabled={disabled} onChange={(event) => onValueChange(event.target.value)} placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…"} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(state?.isStreaming ? "followUp" : "send"); } }} />
+        <textarea
+          ref={textareaRef}
+          value={value}
+          disabled={disabled}
+          onChange={handleChange}
+          onSelect={handleSelect}
+          onBlur={() => window.setTimeout(() => setMention(null), 120)}
+          placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…  (try /, $, @)"}
+          rows={1}
+          onKeyDown={handleKeyDown}
+        />
         {state?.isStreaming ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button> : <button className="send" onClick={() => submit()} title="Send"><IconArrowUpSlim size={16} /></button>}
+        {mention && suggestions.length > 0 && (
+          <MentionPopover
+            trigger={mention.trigger}
+            items={suggestions}
+            highlightedIndex={mentionIndex}
+            onHover={setMentionIndex}
+            onPick={applySuggestion}
+          />
+        )}
       </div>
       {state?.isStreaming && (
         <div className="queueActions">
@@ -1311,6 +1564,7 @@ function Composer({
           }}
           disabled={modelOptions.length === 0}
           title="Switch model"
+          style={{ ["--label-len" as string]: currentModelLabel.length } as React.CSSProperties}
         >
           {modelOptions.length === 0 && <option value="">No model</option>}
           {modelOptions.map((model) => (
@@ -1331,6 +1585,45 @@ function Composer({
         </span>
       </div>
     </footer>
+  );
+}
+
+function MentionPopover({
+  trigger,
+  items,
+  highlightedIndex,
+  onHover,
+  onPick,
+}: {
+  trigger: "/" | "$" | "@";
+  items: MentionItem[];
+  highlightedIndex: number;
+  onHover: (index: number) => void;
+  onPick: (item: MentionItem) => void;
+}) {
+  // `onMouseDown` (not click) so we apply *before* the textarea blurs, which
+  // would otherwise dismiss the popover and swallow the click.
+  const heading = trigger === "/" ? "Commands" : trigger === "$" ? "Skills" : "Files";
+  return (
+    <div className="mention" role="listbox" aria-label={heading}>
+      <div className="mention-head">{heading}</div>
+      <ul className="mention-list">
+        {items.map((item, index) => (
+          <li
+            key={`${item.kind}-${item.insert}`}
+            role="option"
+            aria-selected={index === highlightedIndex}
+            className={`mention-item${index === highlightedIndex ? " active" : ""}`}
+            onMouseEnter={() => onHover(index)}
+            onMouseDown={(event) => { event.preventDefault(); onPick(item); }}
+          >
+            <span className="mention-label">{item.label}</span>
+            {item.description && <span className="mention-desc">{item.description}</span>}
+            {item.group && <span className="mention-group">{item.group}</span>}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

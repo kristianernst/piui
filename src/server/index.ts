@@ -161,6 +161,7 @@ type ClientCommand = {
     | "set_thinking_level"
     | "get_settings"
     | "set_settings"
+    | "list_files"
     | "extension_ui_response";
   cwd?: string;
   name?: string;
@@ -205,6 +206,7 @@ type ServerPacket =
   | { type: "resources"; data: unknown }
   | { type: "models"; data: unknown }
   | { type: "settings"; data: unknown }
+  | { type: "files"; data: unknown }
   | { type: "tree"; data: unknown }
   | { type: "extension_ui_request"; request: unknown }
   | { type: "extension_ui_status"; data: unknown }
@@ -487,6 +489,60 @@ async function listSessions(cwd: string) {
 async function mostRecentSessionPath(cwd: string) {
   const sessions = await SessionManager.list(cwd);
   return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0]?.path;
+}
+
+const FILE_LIST_LIMIT = 4000;
+const FILE_WALK_EXCLUDE = new Set([
+  ".git", "node_modules", "dist", "build", "out", ".next", ".vite",
+  ".turbo", ".cache", ".venv", "venv", "__pycache__", ".mypy_cache",
+  ".pytest_cache", ".idea", ".vscode", "coverage", ".nyc_output",
+]);
+
+// List workspace-relative file paths for `@`-mention autocomplete. Fast-path
+// is `git ls-files` (already gitignore-aware); falls back to a bounded
+// recursive walk that skips common heavy directories. Capped at FILE_LIST_LIMIT
+// so a monorepo doesn't ship a giant payload over the wire.
+async function listWorkspaceFiles(cwd: string): Promise<string[]> {
+  // Prefer git when the workspace is a checkout — it respects .gitignore and
+  // is dramatically faster on large repos.
+  try {
+    const out = await new Promise<string>((resolve, reject) => {
+      const child = spawn("git", ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard"], { stdio: ["ignore", "pipe", "pipe"] });
+      let buf = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => { buf += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { err += chunk.toString(); });
+      child.on("error", reject);
+      child.on("close", (code) => code === 0 ? resolve(buf) : reject(new Error(err.trim() || `git ls-files exited ${code}`)));
+    });
+    const files = out.split("\n").filter(Boolean).slice(0, FILE_LIST_LIMIT);
+    if (files.length) return files;
+  } catch {
+    // Not a git repo (or git missing) — fall through to manual walk.
+  }
+  const collected: string[] = [];
+  async function walk(dir: string, depth: number) {
+    if (collected.length >= FILE_LIST_LIMIT || depth > 8) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (collected.length >= FILE_LIST_LIMIT) return;
+      if (entry.name.startsWith(".") && entry.name !== ".env" && entry.name !== ".env.example") continue;
+      if (FILE_WALK_EXCLUDE.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full, depth + 1);
+      } else if (entry.isFile()) {
+        collected.push(path.relative(cwd, full));
+      }
+    }
+  }
+  await walk(cwd, 0);
+  return collected;
 }
 
 // Decorate persisted workspaces with a derived `pinned` flag for the wire so
@@ -1139,6 +1195,12 @@ async function main() {
             send(ws, { type: "response", id, command: command.type, success: true });
             send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
             break;
+          case "list_files": {
+            const files = await listWorkspaceFiles(activeWorkspace.cwd);
+            send(ws, { type: "response", id, command: command.type, success: true, data: { files } });
+            send(ws, { type: "files", data: { workspaceId: activeWorkspace.id, files } });
+            break;
+          }
           case "get_settings":
             send(ws, { type: "response", id, command: command.type, success: true, data: settingsStore.get() });
             send(ws, { type: "settings", data: settingsStore.get() });

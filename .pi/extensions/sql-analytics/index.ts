@@ -23,7 +23,7 @@ type SqlResultDetails = {
 
 type VisualizationDetails = Omit<SqlResultDetails, "kind"> & {
   kind: "analytics_visualization";
-  chartType: "bar" | "line";
+  chartType: "bar" | "line" | "area" | "step" | "horizontalBar" | "scatter" | "waterfall" | "cumulative" | "pie";
   x: string;
   y: string;
   xLabel?: string;
@@ -262,19 +262,31 @@ const visualizeDatabaseTool = defineTool({
   name: "db_visualize",
   label: "Visualize Database",
   description: "Run a read-only aggregate SQL query and return a chart-ready result for the UI.",
-  promptSnippet: "Create a compact bar or line visualization from a read-only SQL aggregate",
+  promptSnippet: "Create a compact visualization from a read-only SQL aggregate",
   promptGuidelines: [
     "Use db_visualize when the user asks for a chart, trend, ranking, comparison, or visual summary.",
     "Return one label column and one numeric value column; use clear aliases matching the x and y parameters.",
     "yLabel must name the metric in 1-3 words (e.g. 'Units shipped', 'On-time %', 'Backlog orders'). xLabel must name the dimension in 1-2 words (e.g. 'Week', 'Facility', 'Carrier'). They render as a small caption above the chart, never as rotated axis labels — keep them short and skimmable.",
     "Prefer 12-40 rows so the visualization has enough shape to inspect. Aggregate to a meaningful grain such as day, week, facility, medicine category, lane, carrier, or status.",
-    "For ordered time-series results, choose chartType=line and order by the x-axis column. For ranked categorical comparisons, choose chartType=bar and order by the metric descending.",
-    "Keep categorical x-axis labels short (under ~14 chars). The UI truncates longer labels and rotates them when there are many bars, so prefer codes or abbreviations for facility/lane/carrier names when possible.",
+    "Choose chartType based on the question: line/area for ordered trends, step for state changes, bar for ranked categories, horizontalBar for long category labels, scatter for independent points, waterfall for signed deltas, cumulative for running totals, pie for small positive category shares.",
+    "Keep categorical labels short (under ~14 chars). The UI truncates/rotates longer labels in dense modes; prefer codes or abbreviations for facility/lane/carrier names when possible.",
+    "Avoid pie when values are negative or there are many categories; avoid waterfall unless the y column represents ordered deltas.",
+    "The user can switch chart modes in the UI, so pick the best initial chartType while still returning one label column and one numeric value column.",
     "Prefer OLAP views and fact/dimension tables for analytics. Avoid a single collapsed value unless the user explicitly asks for a KPI.",
   ],
   parameters: Type.Object({
     sql: Type.String({ description: "Read-only SELECT/WITH SQL for chart data." }),
-    chartType: Type.Union([Type.Literal("bar"), Type.Literal("line")], { description: "Visualization type." }),
+    chartType: Type.Union([
+      Type.Literal("bar"),
+      Type.Literal("line"),
+      Type.Literal("area"),
+      Type.Literal("step"),
+      Type.Literal("horizontalBar"),
+      Type.Literal("scatter"),
+      Type.Literal("waterfall"),
+      Type.Literal("cumulative"),
+      Type.Literal("pie"),
+    ], { description: "Visualization type." }),
     x: Type.String({ description: "Column name to use for x-axis labels." }),
     y: Type.String({ description: "Numeric column name to use for y-axis values." }),
     xLabel: Type.Optional(Type.String({ description: "Short visible x-axis label." })),
