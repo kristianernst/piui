@@ -1,12 +1,17 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { Component, lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
-import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
+import { measureLineStats, prepareWithSegments, type PreparedTextWithSegments } from "@chenglou/pretext";
 import {
   IconArrowUp,
   IconBolt,
   IconChev,
+  IconChart,
+  IconClose,
   IconCode,
+  IconDb,
   IconDiff,
+  IconExpand,
   IconFile,
   IconFolder,
   IconMoon,
@@ -27,16 +32,20 @@ import {
   type ExtensionUiRequest,
   type PiSessionInfo,
   type PiState,
+  type ToolResultDetails,
   type Workspace,
 } from "./piSocket";
 import "./styles.css";
 import "./stage3.css";
+
+const VisualizationChart = lazy(() => import("./VisualizationChart"));
 
 type UiTool = {
   id: string;
   name: string;
   args?: Record<string, unknown>;
   output?: string;
+  details?: ToolResultDetails;
   status: "running" | "done" | "error";
 };
 
@@ -57,6 +66,34 @@ type UiMessage = {
   startedAt?: number;    // assistant only — for duration metadata
   endedAt?: number;
 };
+
+type AppErrorBoundaryState = { error?: Error };
+
+class AppErrorBoundary extends Component<{ children: React.ReactNode }, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = {};
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("Piui render error", error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="fatalView">
+        <div className="fatalPanel">
+          <div className="fatalEyebrow">Render error</div>
+          <h1>Piui hit a UI exception.</h1>
+          <p>{this.state.error.message}</p>
+          <button onClick={() => this.setState({ error: undefined })}>Try again</button>
+        </div>
+      </div>
+    );
+  }
+}
 
 const starters = [
   "Explore this repo and summarize how it works",
@@ -111,12 +148,15 @@ function coalesceAssistantTurns(messages: UiMessage[]): UiMessage[] {
 // Hydrate tool outputs onto previously-saved messages by matching tool ids
 // against any toolResult sibling messages received in the same payload.
 function hydrateToolOutputs(history: AgentMessage[], ui: UiMessage[]): UiMessage[] {
-  const outputs = new Map<string, { text: string; isError: boolean }>();
+  const outputs = new Map<string, { text: string; details?: ToolResultDetails; isError: boolean }>();
   for (const message of history) {
     if (message.role === "toolResult") {
       const id = String((message as { toolCallId?: unknown }).toolCallId ?? "");
       if (!id) continue;
-      outputs.set(id, { text: contentToText(message.content), isError: !!message.isError });
+      const details = isToolResultDetails((message as { details?: unknown }).details)
+        ? (message as { details: ToolResultDetails }).details
+        : undefined;
+      outputs.set(id, { text: contentToText(message.content), details, isError: !!message.isError });
     }
   }
   if (outputs.size === 0) return ui;
@@ -127,10 +167,16 @@ function hydrateToolOutputs(history: AgentMessage[], ui: UiMessage[]): UiMessage
       const result = outputs.get(block.tool.id);
       if (!result) return block;
       const status: UiTool["status"] = result.isError ? "error" : "done";
-      return { kind: "tool", tool: { ...block.tool, output: result.text, status } };
+      return { kind: "tool", tool: { ...block.tool, output: result.text, details: result.details, status } };
     });
     return { ...message, blocks };
   });
+}
+
+function isToolResultDetails(value: unknown): value is ToolResultDetails {
+  if (!value || typeof value !== "object") return false;
+  const kind = (value as { kind?: unknown }).kind;
+  return kind === "sql_result" || kind === "analytics_visualization" || kind === "database_schema";
 }
 
 function App() {
@@ -244,12 +290,13 @@ function App() {
     }
     if ((event.type === "tool_execution_update" || event.type === "tool_execution_end") && event.toolCallId) {
       const output = contentToText(event.result?.content ?? event.partialResult?.content ?? "");
+      const details = event.result?.details;
       const status = event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running";
       setMessages((prev) => updateLastAssistant(prev, (message) => ({
         ...message,
         blocks: (message.blocks ?? []).map((block) =>
           block.kind === "tool" && block.tool.id === event.toolCallId
-            ? { ...block, tool: { ...block.tool, output, status } }
+            ? { ...block, tool: { ...block.tool, output, details: details ?? block.tool.details, status } }
             : block,
         ),
       })));
@@ -486,6 +533,8 @@ function Reasoning({
 
 function pickToolIcon(name: string) {
   const n = name.toLowerCase();
+  if (n.includes("chart") || n.includes("visual")) return IconChart;
+  if (n.includes("sql") || n.includes("db") || n.includes("database")) return IconDb;
   if (n === "bash" || n.includes("shell") || n.includes("terminal")) return IconTerminal;
   if (n.includes("read") || n.includes("write") || n.includes("edit") || n.includes("file")) return IconFile;
   if (n.includes("grep") || n.includes("find") || n.includes("search") || n.includes("web")) return IconSearch;
@@ -494,7 +543,7 @@ function pickToolIcon(name: string) {
 
 function summarizeArgs(args?: Record<string, unknown>) {
   if (!args) return "";
-  const candidates = ["query", "pattern", "path", "file_path", "command", "url", "name"];
+  const candidates = ["query", "sql", "pattern", "path", "file_path", "command", "url", "name"];
   for (const key of candidates) {
     const value = args[key];
     if (typeof value === "string" && value.trim()) return value.length > 96 ? value.slice(0, 93) + "…" : value;
@@ -505,38 +554,187 @@ function summarizeArgs(args?: Record<string, unknown>) {
 function ToolCard({ tool }: { tool: UiTool }) {
   const Icon = pickToolIcon(tool.name);
   const hint = summarizeArgs(tool.args);
-  const hasBody = !!(tool.args && Object.keys(tool.args).length) || !!tool.output;
+  const hasBody = !!tool.output || !!tool.details;
+  const [locked, setLocked] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  // Hover peeks at the body, click locks it open. Locked overrides hover so
+  // the user can drift the cursor away to interact (scroll a chart, click in
+  // a table) without the panel slamming shut.
+  const open = hasBody && (locked || hovered);
   return (
-    <details className={`tool ${tool.status}`}>
-      <summary>
+    <div
+      className={`tool ${tool.status} ${open ? "open" : ""} ${locked ? "locked" : ""}`}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <button
+        type="button"
+        className="toolHead"
+        onClick={() => hasBody && setLocked((v) => !v)}
+        aria-expanded={hasBody ? open : undefined}
+      >
         <Icon size={12} />
         <span className="toolName">{tool.name}</span>
         {hint && <span className="toolHint">{hint}</span>}
         {tool.status === "running" && <span className="toolPulse" />}
         {tool.status === "error" && <span className="toolErr">error</span>}
-      </summary>
+      </button>
       {hasBody && (
-        <div className="toolBody">
-          {tool.args && Object.keys(tool.args).length > 0 && (
-            <div className="toolPanel">
-              <div className="toolPanelHead">arguments</div>
-              <pre>{JSON.stringify(tool.args, null, 2)}</pre>
+        <div className="toolCollapse" data-open={open ? "true" : "false"}>
+          <div className="toolCollapseInner">
+            <div className="toolBody">
+              {tool.details && <StructuredToolResult details={tool.details} />}
+              {tool.output && !tool.details && (
+                <div className="toolPanel">
+                  <div className="toolPanelHead">output</div>
+                  <pre>{tool.output}</pre>
+                </div>
+              )}
             </div>
-          )}
-          {tool.output && (
-            <div className="toolPanel">
-              <div className="toolPanelHead">output</div>
-              <pre>{tool.output}</pre>
-            </div>
-          )}
+          </div>
         </div>
       )}
-    </details>
+    </div>
   );
 }
 
-// Tiny markdown renderer covering: headings, fenced code blocks, ordered &
-// unordered lists, blockquotes, inline code, bold, italics, links, hard breaks.
+function StructuredToolResult({ details }: { details: ToolResultDetails }) {
+  if (details.kind === "database_schema") return <SchemaResult details={details} />;
+  if (details.kind === "analytics_visualization") return <VisualizationResult details={details} />;
+  return <SqlResult details={details} />;
+}
+
+function SqlResult({ details }: { details: Extract<ToolResultDetails, { kind: "sql_result" }> }) {
+  const columns = safeColumns(details.columns);
+  const rows = safeRows(details.rows);
+  return (
+    <div className="toolPanel analyticsPanel">
+      <AnalyticsHeader
+        title={details.title || "SQL result"}
+        meta={`${details.rowCount}${details.truncated ? "+" : ""} rows${details.elapsedMs ? ` · ${details.elapsedMs}ms` : ""}`}
+      />
+      <ResultTable columns={columns} rows={rows} />
+      {details.sql && <pre className="analyticsSql">{details.sql}</pre>}
+    </div>
+  );
+}
+
+function SchemaResult({ details }: { details: Extract<ToolResultDetails, { kind: "database_schema" }> }) {
+  const schemas = Array.isArray(details.schemas) ? details.schemas : [];
+  const tables = Array.isArray(details.tables) ? details.tables : [];
+  const rows = tables.map((table) => ({
+    schema: table.schema,
+    relation: table.name,
+    type: table.type,
+    rows: table.rowEstimate ?? "",
+  }));
+  return (
+    <div className="toolPanel analyticsPanel">
+      <AnalyticsHeader title={details.title || "Database schema"} meta={`${schemas.join(", ")} · ${tables.length} relations`} />
+      <ResultTable columns={["schema", "relation", "type", "rows"]} rows={rows} />
+    </div>
+  );
+}
+
+function VisualizationResult({ details }: { details: Extract<ToolResultDetails, { kind: "analytics_visualization" }> }) {
+  const rows = safeRows(details.rows);
+  const [mode, setMode] = useState<"line" | "bar">(details.chartType);
+  const [expanded, setExpanded] = useState(false);
+
+  const card = (onExpandToggle?: () => void, expandIcon?: React.ReactNode) => (
+    <div className="toolPanel visualizationPanel">
+      <div className="vizCardHead">
+        <div className="vizTitle">{details.title || "Visualization"}</div>
+        <div className="vizMode" role="group" aria-label="Chart mode">
+          <button type="button" className={mode === "line" ? "active" : ""} onClick={() => setMode("line")}>Line</button>
+          <button type="button" className={mode === "bar" ? "active" : ""} onClick={() => setMode("bar")}>Bar</button>
+        </div>
+        {onExpandToggle && (
+          <button type="button" className={expanded ? "vizModalClose" : "vizExpand"} onClick={onExpandToggle} title={expanded ? "Close" : "Expand"} aria-label={expanded ? "Close expanded view" : "Expand"}>
+            {expandIcon}
+          </button>
+        )}
+      </div>
+      <Suspense fallback={<div className="emptyChart">Loading visualization...</div>}>
+        <VisualizationChart details={details} rows={rows} mode={mode} />
+      </Suspense>
+    </div>
+  );
+
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setExpanded(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
+  return (
+    <>
+      {card(() => setExpanded(true), <IconExpand size={12} />)}
+      {expanded && createPortal(
+        <div className="vizModalShade" onClick={() => setExpanded(false)}>
+          <div className="vizModalCard" onClick={(event) => event.stopPropagation()}>
+            {card(() => setExpanded(false), <IconClose size={14} />)}
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
+  );
+}
+
+function AnalyticsHeader({ title, meta }: { title: string; meta: string }) {
+  return (
+    <div className="analyticsHead">
+      <div className="analyticsTitle">{title}</div>
+      <div className="analyticsMeta">{meta}</div>
+    </div>
+  );
+}
+
+function ResultTable({ columns, rows }: { columns: string[]; rows: Array<Record<string, unknown>> }) {
+  const visible = rows.slice(0, 80);
+  if (!columns.length) return <div className="emptyChart">No tabular columns returned.</div>;
+  return (
+    <div className="resultTableWrap">
+      <table className="resultTable">
+        <thead>
+          <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
+        </thead>
+        <tbody>
+          {visible.map((row, index) => (
+            <tr key={index}>{columns.map((column) => <td key={column}>{formatCell(row[column])}</td>)}</tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function safeColumns(columns: Array<{ name: string; dataType?: string }> | undefined) {
+  return Array.isArray(columns) ? columns.map((column) => column.name).filter(Boolean) : [];
+}
+
+function safeRows(rows: Array<Record<string, unknown>> | undefined) {
+  return Array.isArray(rows) ? rows.filter((row): row is Record<string, unknown> => !!row && typeof row === "object") : [];
+}
+
+function formatCell(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number") return formatNumber(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function formatNumber(value: number) {
+  return Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+// Tiny markdown renderer covering: headings, fenced code blocks, tables,
+// ordered & unordered lists, blockquotes, inline code, bold, italics, links,
+// hard breaks.
 // Compact mode tightens spacing for in-timeline reasoning steps.
 function Markdown({ text, compact }: { text: string; compact?: boolean }) {
   return <div className={`answer ${compact ? "compact" : ""}`}>{renderBlocks(text)}</div>;
@@ -572,6 +770,16 @@ function renderBlocks(input: string): React.ReactNode[] {
       out.push(React.createElement(tag, { key: `h-${out.length}`, className: "md-heading" }, renderInline(heading[2])));
       i++;
       continue;
+    }
+
+    // GitHub-style pipe table
+    if (isTableStart(lines, i)) {
+      const parsed = parseMarkdownTable(lines, i);
+      if (parsed) {
+        out.push(<MarkdownTable key={`table-${out.length}`} table={parsed.table} />);
+        i = parsed.nextIndex;
+        continue;
+      }
     }
 
     // Ordered list
@@ -618,6 +826,7 @@ function renderBlocks(input: string): React.ReactNode[] {
       lines[i].trim() &&
       !/^```/.test(lines[i]) &&
       !/^#{1,6}\s+/.test(lines[i]) &&
+      !isTableStart(lines, i) &&
       !/^\s*\d+\.\s+/.test(lines[i]) &&
       !/^\s*[-*•]\s+/.test(lines[i]) &&
       !/^>\s?/.test(lines[i])
@@ -629,6 +838,97 @@ function renderBlocks(input: string): React.ReactNode[] {
     out.push(<BalancedP key={`p-${out.length}`} text={plainText(paragraph)}>{renderInline(paragraph)}</BalancedP>);
   }
   return out;
+}
+
+type MarkdownTableModel = {
+  headers: string[];
+  alignments: Array<"left" | "center" | "right">;
+  rows: string[][];
+};
+
+function isTableStart(lines: string[], index: number) {
+  return isPipeRow(lines[index]) && isTableDivider(lines[index + 1] ?? "");
+}
+
+function isPipeRow(line: string) {
+  const trimmed = line.trim();
+  return trimmed.includes("|") && /^\|?(.+\|)+.+\|?$/.test(trimmed);
+}
+
+function isTableDivider(line: string) {
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function parseMarkdownTable(lines: string[], index: number): { table: MarkdownTableModel; nextIndex: number } | null {
+  const headers = splitTableRow(lines[index]);
+  const divider = splitTableRow(lines[index + 1]);
+  if (!headers.length || headers.length !== divider.length || !isTableDivider(lines[index + 1])) return null;
+  const alignments = divider.map((cell) => {
+    const trimmed = cell.trim();
+    if (trimmed.startsWith(":") && trimmed.endsWith(":")) return "center" as const;
+    if (trimmed.endsWith(":")) return "right" as const;
+    return "left" as const;
+  });
+  const rows: string[][] = [];
+  let nextIndex = index + 2;
+  while (nextIndex < lines.length && isPipeRow(lines[nextIndex]) && !isTableDivider(lines[nextIndex])) {
+    const cells = splitTableRow(lines[nextIndex]);
+    rows.push(headers.map((_, cellIndex) => cells[cellIndex] ?? ""));
+    nextIndex++;
+  }
+  return { table: { headers, alignments, rows }, nextIndex };
+}
+
+function splitTableRow(line: string) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells: string[] = [];
+  let current = "";
+  let escaped = false;
+  for (const char of trimmed) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "|") {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function MarkdownTable({ table }: { table: MarkdownTableModel }) {
+  return (
+    <div className="md-table-wrap">
+      <table className="md-table">
+        <thead>
+          <tr>
+            {table.headers.map((header, index) => (
+              <th key={index} className={`align-${table.alignments[index]}`}>{renderInline(header)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {table.rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {table.headers.map((_, cellIndex) => (
+                <td key={cellIndex} className={`align-${table.alignments[cellIndex]}`}>{renderInline(row[cellIndex] ?? "")}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 // Strip inline markdown markers down to their visible text — used as the
@@ -649,6 +949,7 @@ function plainText(input: string): string {
 // same. Result: short paragraphs shrink-wrap, no awkward orphan last line.
 function BalancedP({ text, children }: { text: string; children: React.ReactNode }) {
   const ref = useRef<HTMLParagraphElement>(null);
+  const preparedRef = useRef<{ key: string; prepared: PreparedTextWithSegments } | null>(null);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el || !text) return;
@@ -662,8 +963,14 @@ function BalancedP({ text, children }: { text: string; children: React.ReactNode
         if (containerWidth < 80) return;
         try {
           const cs = window.getComputedStyle(el);
-          const font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-          const prepared = prepareWithSegments(text, font);
+          const font = `${cs.fontStyle} ${cs.fontVariant} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+          const letterSpacing = parsePixelValue(cs.letterSpacing);
+          const key = `${text}\u0000${font}\u0000${letterSpacing ?? "normal"}`;
+          let prepared = preparedRef.current?.key === key ? preparedRef.current.prepared : undefined;
+          if (!prepared) {
+            prepared = prepareWithSegments(text, font, letterSpacing === undefined ? undefined : { letterSpacing });
+            preparedRef.current = { key, prepared };
+          }
           const baseStats = measureLineStats(prepared, containerWidth);
           if (baseStats.lineCount <= 1) {
             el.style.maxWidth = `${Math.ceil(baseStats.maxLineWidth) + 2}px`;
@@ -688,6 +995,12 @@ function BalancedP({ text, children }: { text: string; children: React.ReactNode
     return () => { cancelAnimationFrame(frame); observer.disconnect(); };
   }, [text]);
   return <p ref={ref}>{children}</p>;
+}
+
+function parsePixelValue(value: string) {
+  if (!value || value === "normal") return undefined;
+  const numeric = Number.parseFloat(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
 }
 
 const INLINE_TOKEN = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]]+\]\([^)]+\)|\bhttps?:\/\/\S+)/g;
@@ -1006,4 +1319,8 @@ function ExtensionDialog({ request, onResolve }: { request: ExtensionUiRequest; 
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+const rootElement = document.getElementById("root");
+if (!rootElement) throw new Error("Missing #root element");
+const rootStore = globalThis as typeof globalThis & { __piuiRoot?: ReturnType<typeof createRoot> };
+rootStore.__piuiRoot ??= createRoot(rootElement);
+rootStore.__piuiRoot.render(<AppErrorBoundary><App /></AppErrorBoundary>);

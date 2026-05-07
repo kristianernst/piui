@@ -83,10 +83,44 @@ export type PiPacket =
   | { type: "event"; event: AgentEvent }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
 
+export type ToolResultDetails =
+  | {
+      kind: "sql_result";
+      title?: string;
+      sql?: string;
+      columns: Array<{ name: string; dataType?: string }>;
+      rows: Array<Record<string, unknown>>;
+      rowCount: number;
+      truncated?: boolean;
+      elapsedMs?: number;
+    }
+  | {
+      kind: "analytics_visualization";
+      title?: string;
+      sql?: string;
+      chartType: "bar" | "line";
+      x: string;
+      y: string;
+      xLabel?: string;
+      yLabel?: string;
+      columns: Array<{ name: string; dataType?: string }>;
+      rows: Array<Record<string, unknown>>;
+      rowCount: number;
+      truncated?: boolean;
+      elapsedMs?: number;
+    }
+  | {
+      kind: "database_schema";
+      title?: string;
+      schemas: string[];
+      tables: Array<{ schema: string; name: string; type: string; rowEstimate?: number | null }>;
+      columns: Array<{ schema: string; table: string; name: string; dataType: string; nullable: boolean }>;
+    };
+
 export type AgentMessage =
   | { role: "user"; content: string | ContentBlock[]; timestamp?: number }
   | { role: "assistant"; content: ContentBlock[]; stopReason?: string; errorMessage?: string; timestamp?: number }
-  | { role: "toolResult"; toolCallId: string; toolName: string; content: ContentBlock[]; isError: boolean; timestamp?: number }
+  | { role: "toolResult"; toolCallId: string; toolName: string; content: ContentBlock[]; details?: ToolResultDetails; isError: boolean; timestamp?: number }
   | { role: "bashExecution"; command: string; output: string; exitCode?: number; cancelled?: boolean; timestamp?: number }
   | { role: string; [key: string]: unknown };
 
@@ -105,7 +139,7 @@ export type AgentEvent = {
   toolName?: string;
   args?: Record<string, unknown>;
   partialResult?: { content?: ContentBlock[] };
-  result?: { content?: ContentBlock[]; details?: unknown };
+  result?: { content?: ContentBlock[]; details?: ToolResultDetails };
   isError?: boolean;
   steering?: string[];
   followUp?: string[];

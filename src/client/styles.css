@@ -30,6 +30,7 @@ button, input, textarea, select { font: inherit; }
   --warn: oklch(0.7 0.16 70);
   --bad: oklch(0.62 0.18 25);
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --shadow-soft: 0 12px 32px rgb(15 23 42 / 0.12);
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 body.dark {
@@ -117,6 +118,46 @@ body.dark {
   flex-direction: column;
   justify-content: center;
   padding-bottom: 8vh;
+}
+.fatalView {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: var(--surface);
+  color: var(--ink);
+}
+.fatalPanel {
+  width: min(520px, 100%);
+  border: 1px solid var(--hairline);
+  background: var(--card);
+  border-radius: 10px;
+  padding: 22px;
+  box-shadow: 0 18px 48px oklch(from var(--ink) l c h / 0.08);
+}
+.fatalEyebrow {
+  color: var(--bad);
+  font: 11px var(--mono);
+  text-transform: lowercase;
+  margin-bottom: 8px;
+}
+.fatalPanel h1 {
+  font-size: 18px;
+  line-height: 1.25;
+  margin-bottom: 8px;
+}
+.fatalPanel p {
+  color: var(--muted);
+  margin-bottom: 16px;
+  word-break: break-word;
+}
+.fatalPanel button {
+  border: 0;
+  background: var(--ink);
+  color: var(--surface);
+  border-radius: 7px;
+  padding: 7px 12px;
+  cursor: pointer;
 }
 .heroDot {
   width: 32px; height: 32px;
@@ -280,12 +321,14 @@ code {
   margin-left: 2px;
 }
 
-/* ------- Tool pill (one bullet per step, expand on click for output) ------- */
+/* ------- Tool pill (hover to peek at output, click to lock open) -------
+   Uses a controlled wrapper rather than <details> so we can animate height
+   smoothly via the grid-template-rows trick and fade the body in on appear. */
 .tool {
   display: block;
   margin: 0;
 }
-.tool > summary {
+.tool .toolHead {
   width: max-content;
   max-width: 100%;
   display: inline-flex;
@@ -296,25 +339,27 @@ code {
   border-radius: 999px;
   padding: 5px 11px 5px 9px;
   color: var(--ink-soft);
+  font: inherit;
   font-size: 12.5px;
   cursor: pointer;
-  list-style: none;
+  text-align: left;
   transition: background 0.2s var(--ease), border-color 0.2s var(--ease), color 0.2s var(--ease);
 }
-.tool > summary::-webkit-details-marker { display: none; }
-.tool > summary:hover {
+.tool .toolHead:hover,
+.tool.open .toolHead {
   background: var(--card);
   border-color: var(--hairline-strong);
   color: var(--ink);
 }
-.tool[open] > summary {
+.tool.locked .toolHead {
   background: oklch(from var(--ink) l c h / 0.05);
   border-color: oklch(from var(--ink) l c h / 0.10);
   color: var(--ink);
 }
-.tool > summary svg { color: var(--muted); flex-shrink: 0; }
-.tool[open] > summary svg,
-.tool > summary:hover svg { color: var(--accent); }
+body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
+.tool .toolHead svg { color: var(--muted); flex-shrink: 0; }
+.tool.open .toolHead svg,
+.tool .toolHead:hover svg { color: var(--accent); }
 .tool .toolName {
   font-family: var(--mono);
   font-size: 12px;
@@ -344,10 +389,30 @@ code {
   animation: pulse-dot 1.4s var(--ease) infinite;
   flex-shrink: 0;
 }
-.tool .toolBody {
+.tool .toolCollapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.42s var(--ease);
+  margin-top: 0;
+}
+.tool.open .toolCollapse {
+  grid-template-rows: 1fr;
   margin-top: 10px;
+}
+.tool .toolCollapseInner {
+  overflow: hidden;
+  min-height: 0;
+}
+.tool.open .toolBody {
+  animation: contentIn 0.42s var(--ease) both;
+}
+.tool .toolBody {
   display: grid;
   gap: 10px;
+}
+@keyframes contentIn {
+  from { opacity: 0; transform: translateY(-4px); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0);   filter: blur(0); }
 }
 .toolPanel {
   background: var(--card);
@@ -377,6 +442,321 @@ code {
   max-height: 320px;
   background: transparent;
   border: 0;
+}
+.analyticsPanel {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+.analyticsHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.analyticsTitle {
+  color: var(--ink);
+  font-weight: 560;
+  font-size: 13px;
+  line-height: 1.25;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.analyticsMeta {
+  color: var(--faint);
+  font: 10.5px var(--mono);
+  white-space: nowrap;
+}
+.resultTableWrap {
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  max-height: 360px;
+}
+.resultTable {
+  width: 100%;
+  border-collapse: collapse;
+  font: 11.5px/1.45 var(--mono);
+  color: var(--ink-soft);
+}
+.resultTable th,
+.resultTable td {
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--hairline);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.resultTable th {
+  position: sticky;
+  top: 0;
+  background: var(--paper);
+  color: var(--muted);
+  font-weight: 600;
+  z-index: 1;
+}
+.resultTable tr:last-child td { border-bottom: 0; }
+.analyticsSql {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--paper);
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre;
+  font: 11.5px/1.55 var(--mono);
+  color: var(--muted);
+}
+.visualizationPanel {
+  padding: 14px 16px 14px;
+  background: var(--card);
+}
+.vizCardHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+.vizTitle {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vizMode {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  background: var(--paper);
+}
+.vizMode button {
+  appearance: none;
+  border: 0;
+  border-radius: 5px;
+  padding: 3px 9px;
+  background: transparent;
+  color: var(--muted);
+  font: 11px var(--mono);
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: color 0.16s var(--ease);
+}
+.vizMode button:hover { color: var(--ink-soft); }
+.vizMode button.active {
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 1px 2px oklch(from var(--ink) l c h / 0.10);
+}
+.vizExpand {
+  width: 26px; height: 26px;
+  border: 1px solid var(--hairline);
+  background: var(--paper);
+  color: var(--muted);
+  border-radius: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: color 0.16s var(--ease), border-color 0.16s var(--ease), background 0.16s var(--ease);
+}
+.vizExpand:hover {
+  color: var(--ink);
+  border-color: var(--hairline-strong);
+  background: var(--card);
+}
+
+/* Expanded modal — same component, just bigger plot area. */
+.vizModalShade {
+  position: fixed;
+  inset: 0;
+  background: oklch(from var(--ink) l c h / 0.32);
+  backdrop-filter: blur(4px);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+  padding: 32px;
+  animation: fadeUp 0.32s var(--ease) both;
+}
+.vizModalCard {
+  width: min(960px, 100%);
+  max-height: calc(100vh - 64px);
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  box-shadow: 0 28px 80px oklch(0 0 0 / 0.22);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.vizModalCard .visualizationPanel {
+  border: 0;
+  padding: 18px 22px 20px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.vizModalCard .vizBody { flex: 1; min-height: 0; }
+.vizModalCard .miniChart { height: clamp(360px, 60vh, 560px); }
+.vizModalCard .vizStats { gap: 28px; }
+.vizModalCard .vizStat b { font-size: 18px; }
+.vizModalCard .vizTitle { font-size: 16px; }
+.vizModalClose {
+  border: 1px solid var(--hairline);
+  background: var(--paper);
+  color: var(--muted);
+  width: 26px; height: 26px;
+  border-radius: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: color 0.16s var(--ease), background 0.16s var(--ease);
+}
+.vizModalClose:hover { color: var(--ink); background: var(--card); }
+.vizBody {
+  display: grid;
+  gap: 8px;
+}
+
+/* Caption row — replaces the awkward vertical Y-axis label.
+   Names the metric (Y) "by" the dimension (X), keeps point count + runtime
+   on the right so the chart is the only thing competing for attention. */
+.vizMetricLine {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 14px;
+}
+.vizMetricName {
+  color: var(--ink-soft);
+  font: 11px var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.vizMetricSep { color: var(--faint); font-size: 11px; }
+.vizMetricDim {
+  color: var(--muted);
+  font: 11px var(--mono);
+  letter-spacing: 0.01em;
+}
+.vizMetricSpacer { flex: 1; }
+.vizMetricMeta {
+  display: inline-flex;
+  gap: 10px;
+  color: var(--faint);
+  font: 10px var(--mono);
+  letter-spacing: 0.02em;
+}
+.vizMetricMeta b {
+  color: var(--ink-soft);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Stat strip — borderless, scan-friendly. The label is the small caps mono
+   that recurs in tooltips and captions; the value is the typographic anchor. */
+.vizStats {
+  display: flex;
+  gap: 18px;
+  align-items: baseline;
+  padding: 2px 0 2px;
+}
+.vizStat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.vizStat em {
+  font: 10.5px var(--mono);
+  font-style: normal;
+  letter-spacing: 0.01em;
+  color: var(--faint);
+}
+.vizStat b {
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.005em;
+  font-variant-numeric: tabular-nums;
+}
+
+.miniChart {
+  position: relative;
+  height: 220px;
+  padding: 0;
+  margin-top: 2px;
+}
+.miniChart .recharts-wrapper { outline: none; }
+.miniChart .recharts-surface { overflow: visible; }
+.miniChart .vizTick,
+.miniChart .recharts-cartesian-axis-tick text {
+  fill: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.miniChart .recharts-cartesian-grid line {
+  stroke: var(--hairline);
+  stroke-opacity: 1;
+}
+.miniChart .recharts-tooltip-cursor { opacity: 1; }
+.miniChart .recharts-bar-rectangle { transition: opacity 0.15s var(--ease); }
+.miniChart:hover .recharts-bar-rectangle { opacity: 0.55; }
+.miniChart .recharts-bar-rectangle:hover { opacity: 1; }
+
+.vizTooltip {
+  z-index: 2;
+  display: grid;
+  gap: 8px;
+  min-width: 140px;
+  max-width: 260px;
+  padding: 9px 11px 10px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--card) 96%, transparent);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+/* Label-above-value tolerates any text length: no truncation, values wrap
+   onto a second line when needed instead of getting clipped. */
+.vizTooltipRow {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.vizTooltipRow span {
+  color: var(--faint);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+}
+.vizTooltipRow strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+.vizTooltipRow strong.accent { color: var(--accent); font-size: 14px; }
+.emptyChart {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 24px;
+  color: var(--muted);
+  background: var(--paper);
 }
 @keyframes pulse-dot {
   0%, 100% { box-shadow: 0 0 0 0 oklch(from var(--accent) l c h / 0.5); }
@@ -426,6 +806,41 @@ code {
   white-space: pre;
 }
 .answer .md-code code { background: transparent; border: 0; padding: 0; font-size: inherit; }
+.answer .md-table-wrap {
+  margin: 0 0 16px;
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--card);
+}
+.answer.compact .md-table-wrap { margin-bottom: 10px; }
+.answer .md-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.answer .md-table th,
+.answer .md-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.answer .md-table th {
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 600;
+}
+.answer .md-table tr:last-child td { border-bottom: 0; }
+.answer .md-table .align-right { text-align: right; }
+.answer .md-table .align-center { text-align: center; }
+.answer .md-table code {
+  font-size: 0.82em;
+  white-space: nowrap;
+}
 .answer a {
   color: var(--accent);
   text-decoration: underline;

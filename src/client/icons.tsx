@@ -5,12 +5,15 @@ import {
   Bolt,
   ChatRoundDots,
   CheckCircle,
+  Chart,
   Code,
   CodeSquare,
   CloseCircle,
+  Database,
   Document,
   Folder,
   Magnifer,
+  MaximizeSquareMinimalistic,
   Moon,
   Pen2,
   RoundArrowUp,
@@ -49,9 +52,12 @@ export const IconSidebarRight = (props: IconProps) => <SidebarMinimalistic weigh
 export const IconCode = bold(Code);
 export const IconTerminal = bold(CodeSquare);
 export const IconFile = bold(Document);
+export const IconDb = bold(Database);
+export const IconChart = bold(Chart);
 export const IconSpark = bold(Stars);
 export const IconBolt = bold(Bolt);
 export const IconDiff = bold(Pen2);
 export const IconSun = bold(Sun);
 export const IconMoon = bold(Moon);
 export const IconClose = bold(CloseCircle);
+export const IconExpand = bold(MaximizeSquareMinimalistic);

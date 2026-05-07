@@ -33,6 +33,29 @@ PIUI_CWD=/path/to/your/project npm run dev
 
 Workspace registry is stored at `~/.pi/agent/piui-workspaces.json`.
 
+## SQL analytics demo
+
+This repo includes a project-local Pi extension at `.pi/extensions/sql-analytics/` that registers:
+
+- `db_describe` — inspect read-only database schemas and columns.
+- `db_query` — run bounded read-only `SELECT`/`WITH` SQL.
+- `db_visualize` — run read-only aggregate SQL and return chart-ready rows.
+
+The extension defaults to the medicine supply-chain demo database:
+
+```text
+postgresql://medicine_agent_ro:medicine_agent_ro_password@localhost:55432/medicine_supply_chain_demo
+```
+
+To seed the demo database:
+
+```bash
+cd /Users/kristianernst/work/datasets/medicine_supply_chain_seed_package
+docker compose up -d
+```
+
+Override the connection with either `PIUI_ANALYTICS_DB_DSN` or `ANALYSIS_DB_MEDICINE_DSN` before starting `piui`.
+
 ## Scripts
 
 - `npm run dev` — local server + Vite middleware
