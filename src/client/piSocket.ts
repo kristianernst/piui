@@ -3,6 +3,9 @@ export type Workspace = {
   cwd: string;
   name: string;
   lastOpenedAt: string;
+  /** True for the launch directory — server refuses to remove it, UI hides the
+   *  delete affordance. Computed server-side; never persisted. */
+  pinned?: boolean;
 };
 
 export type PiSessionInfo = {
@@ -51,6 +54,17 @@ export type PiModelSummary = {
   current: boolean;
 };
 
+export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export type PiModelRef = { provider: string; modelId: string };
+
+export type PiSettings = {
+  defaultModel: PiModelRef | null;
+  defaultThinkingLevel: PiThinkingLevel | null;
+  titleModel: PiModelRef | null;
+  showStarterPrompts: boolean;
+};
+
 export type PiTreeEntry = {
   id: string;
   parentId: string | null;
@@ -68,7 +82,7 @@ export type ExtensionUiRequest =
   | { id: string; kind: string; title?: string; message?: string; options?: string[]; placeholder?: string; [key: string]: unknown };
 
 export type PiPacket =
-  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState } }
+  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState; settings?: PiSettings } }
   | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string } }
   | { type: "workspace"; data: Workspace }
   | { type: "sessions"; data: { workspaceId: string; sessions: PiSessionInfo[] } }
@@ -76,6 +90,7 @@ export type PiPacket =
   | { type: "messages"; data: { messages: AgentMessage[] } }
   | { type: "resources"; data: PiResourceSummary }
   | { type: "models"; data: { models: PiModelSummary[] } }
+  | { type: "settings"; data: PiSettings }
   | { type: "tree"; data: { entries: PiTreeEntry[] } }
   | { type: "extension_ui_request"; request: ExtensionUiRequest }
   | { type: "extension_ui_status"; data: { key: string; text?: string; value?: unknown } }

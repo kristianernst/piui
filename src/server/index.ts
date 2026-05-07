@@ -1,6 +1,7 @@
 import express from "express";
 import http from "node:http";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,15 +22,56 @@ import {
   getAgentDir,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
+import { completeSimple, type Api, type Model } from "@mariozechner/pi-ai";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === "production";
 const port = Number(process.env.PORT ?? 5174);
 const initialCwd = path.resolve(process.env.PIUI_CWD ?? process.cwd());
+// Pi piui re-adds `initialCwd` on every startup, so the launch directory can
+// never truly be removed from the sidebar — pinning it makes that explicit
+// (no × on hover, server rejects remove_workspace for this id).
+const initialWorkspaceId = crypto.createHash("sha1").update(initialCwd).digest("hex").slice(0, 12);
 const agentDir = getAgentDir();
 const workspaceFile = path.join(agentDir, "piui-workspaces.json");
+const settingsFile = path.join(agentDir, "piui-settings.json");
 const lockDir = path.join(agentDir, "piui-locks");
 const localToken = process.env.PIUI_TOKEN ?? crypto.randomBytes(24).toString("base64url");
+
+// Pop a native OS folder picker and resolve to an absolute path. Returns
+// `null` if the user cancels. Currently macOS-only — Linux/Windows fall back
+// to throwing so the client can surface a useful error.
+function pickFolderNative(defaultPath: string): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    if (process.platform !== "darwin") {
+      reject(new Error(`Native folder picker not supported on ${process.platform}; pass cwd explicitly.`));
+      return;
+    }
+    const script = `try
+  set theFolder to choose folder with prompt "Choose workspace folder" default location (POSIX file ${JSON.stringify(defaultPath)})
+  return POSIX path of theFolder
+on error number -128
+  return ""
+end try`;
+    const child = spawn("osascript", ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Folder picker failed (${code}): ${stderr.trim() || "unknown error"}`));
+        return;
+      }
+      const picked = stdout.trim();
+      if (!picked) { resolve(null); return; }
+      // osascript appends a trailing slash; normalize.
+      resolve(path.resolve(picked.replace(/\/$/, "")));
+    });
+  });
+}
+
 initTheme();
 const themeColors: ThemeColor[] = [
   "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning", "muted", "dim", "text", "thinkingText", "userMessageText", "customMessageText", "customMessageLabel", "toolTitle", "toolOutput", "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "mdQuote", "mdQuoteBorder", "mdHr", "mdListBullet", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString", "syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation", "thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh", "bashMode",
@@ -58,6 +100,7 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "switch_workspace",
   "remove_workspace",
   "switch_session",
+  "delete_session",
   "continue_recent",
   "new_session",
   "reload_resources",
@@ -74,6 +117,7 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "cycle_model",
   "set_model",
   "set_thinking_level",
+  "set_settings",
   "extension_ui_response",
 ]);
 
@@ -93,6 +137,7 @@ type ClientCommand = {
     | "remove_workspace"
     | "list_sessions"
     | "switch_session"
+    | "delete_session"
     | "continue_recent"
     | "get_state"
     | "get_messages"
@@ -114,6 +159,8 @@ type ClientCommand = {
     | "cycle_model"
     | "set_model"
     | "set_thinking_level"
+    | "get_settings"
+    | "set_settings"
     | "extension_ui_response";
   cwd?: string;
   name?: string;
@@ -127,8 +174,25 @@ type ClientCommand = {
   provider?: string;
   modelId?: string;
   level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  settings?: Partial<PiSettings>;
   uiRequestId?: string;
   value?: unknown;
+};
+
+type ModelRef = { provider: string; modelId: string };
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type PiSettings = {
+  // null = "use the currently selected chat model".
+  defaultModel: ModelRef | null;
+  defaultThinkingLevel: ThinkingLevel | null;
+  titleModel: ModelRef | null;
+  showStarterPrompts: boolean;
+};
+const DEFAULT_SETTINGS: PiSettings = {
+  defaultModel: null,
+  defaultThinkingLevel: null,
+  titleModel: null,
+  showStarterPrompts: false,
 };
 
 type ServerPacket =
@@ -140,6 +204,7 @@ type ServerPacket =
   | { type: "messages"; data: unknown }
   | { type: "resources"; data: unknown }
   | { type: "models"; data: unknown }
+  | { type: "settings"; data: unknown }
   | { type: "tree"; data: unknown }
   | { type: "extension_ui_request"; request: unknown }
   | { type: "extension_ui_status"; data: unknown }
@@ -239,6 +304,25 @@ class WorkspaceStore {
 
   private async save() {
     await writeJsonFile(workspaceFile, { workspaces: this.list() });
+  }
+}
+
+class SettingsStore {
+  private settings: PiSettings = { ...DEFAULT_SETTINGS };
+
+  async load() {
+    const data = await readJsonFile<Partial<PiSettings>>(settingsFile, {});
+    this.settings = { ...DEFAULT_SETTINGS, ...data };
+  }
+
+  get(): PiSettings {
+    return { ...this.settings };
+  }
+
+  async update(patch: Partial<PiSettings>): Promise<PiSettings> {
+    this.settings = { ...this.settings, ...patch };
+    await writeJsonFile(settingsFile, this.settings);
+    return this.get();
   }
 }
 
@@ -405,6 +489,88 @@ async function mostRecentSessionPath(cwd: string) {
   return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0]?.path;
 }
 
+// Decorate persisted workspaces with a derived `pinned` flag for the wire so
+// the client can hide the remove-X on the launch directory. We don't persist
+// `pinned` because it's a function of `initialCwd` (which is per-process), so
+// it'd go stale if the server is launched from a different cwd next time.
+function publicWorkspaces(store: WorkspaceStore) {
+  return store.list().map((workspace) => ({ ...workspace, pinned: workspace.id === initialWorkspaceId }));
+}
+
+// Pull the plain text out of an agent message's content, ignoring tool calls,
+// thinking blocks, etc. Returns "" for nothing usable.
+function plainTextFromMessage(message: { content: unknown } | undefined): string {
+  if (!message) return "";
+  const content = (message as { content: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is { type: string; text?: string } => !!c && typeof c === "object" && (c as { type: string }).type === "text")
+      .map((c) => c.text ?? "")
+      .join("\n");
+  }
+  return "";
+}
+
+// Generate a short caption for the session by asking a model to summarize the
+// first user prompt + the assistant's reply. Returns null if generation fails
+// or the conversation isn't substantial enough yet.
+async function generateSessionTitle(session: AgentSession, titleModelRef: ModelRef | null): Promise<string | null> {
+  let model: Model<Api> | undefined;
+  if (titleModelRef) model = session.modelRegistry.find(titleModelRef.provider, titleModelRef.modelId);
+  if (!model) model = session.model as Model<Api> | undefined;
+  if (!model) return null;
+
+  const messages = session.messages ?? [];
+  const firstUser = messages.find((m) => m.role === "user");
+  if (!firstUser) return null;
+  const userText = plainTextFromMessage(firstUser as { content: unknown }).trim();
+  if (!userText) return null;
+  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+  const assistantText = plainTextFromMessage(lastAssistant as { content: unknown } | undefined).trim();
+
+  const auth = await session.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) return null;
+
+  const prompt = `Write a short title (3–6 words) summarizing the topic of this conversation. Plain text only — no quotes, no trailing punctuation, no "Title:" prefix.\n\nUser said:\n${userText.slice(0, 1500)}\n\nAssistant replied:\n${assistantText.slice(0, 1200) || "(empty)"}\n\nTitle:`;
+
+  try {
+    const result = await completeSimple(
+      model,
+      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        maxTokens: 32,
+        // Title generation is a tiny labelling task — pay nothing for thinking.
+        // The pi-ai impl accepts "minimal".."xhigh" in the type, but every
+        // provider's implementation also honours "off" by skipping the
+        // reasoning request entirely (see e.g. openai-codex-responses where a
+        // clamped "off" produces undefined effort, and anthropic where any
+        // falsy reasoning short-circuits to thinkingEnabled:false).
+        reasoning: "off" as never,
+      },
+    );
+    if (result.stopReason === "error" || result.stopReason === "aborted") return null;
+    const title = result.content
+      .filter((block): block is { type: "text"; text: string } => block.type === "text")
+      .map((block) => block.text)
+      .join(" ")
+      .trim()
+      // Strip surrounding quotes / asterisks / trailing punctuation that small
+      // models sometimes ignore the instruction about.
+      .replace(/^["'`*\s]+/, "")
+      .replace(/[\s"'`*.,!?]+$/, "")
+      // First line only — protects against models that try to elaborate.
+      .split(/\r?\n/)[0]
+      .trim();
+    return title ? title.slice(0, 80) : null;
+  } catch (error) {
+    console.warn("Title generation failed:", error);
+    return null;
+  }
+}
+
 function publicResources(session: AgentSession) {
   const skills = session.resourceLoader.getSkills();
   const prompts = session.resourceLoader.getPrompts();
@@ -567,7 +733,7 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
   } as unknown as ExtensionUIContext;
 }
 
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, locks: LockStore, ownerId: string, unsubscribe?: () => void) {
+async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void) {
   unsubscribe?.();
   const session = handle.runtime.session;
   const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
@@ -577,10 +743,29 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
       commandContextActions: createCommandActions(handle, locks, ownerId),
     });
   }
+  // Track in-flight title generation per session-file so we don't fire the
+  // model twice if `agent_end` lands while a previous request is still open.
+  let titleInFlight = false;
   const nextUnsubscribe = session.subscribe((event) => {
     send(ws, { type: "event", event });
     if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
       send(ws, { type: "state", data: publicState(handle.workspace, session) });
+    }
+    if (event.type === "agent_end" && !titleInFlight && !session.sessionManager.getSessionName()) {
+      titleInFlight = true;
+      const ownedSessionFile = session.sessionFile;
+      void (async () => {
+        try {
+          const title = await generateSessionTitle(session, settingsStore.get().titleModel);
+          // Bail out if the user has switched away from this session before we got a result.
+          if (!title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
+          session.setSessionName(title);
+          send(ws, { type: "state", data: publicState(handle.workspace, session) });
+          send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd) } });
+        } finally {
+          titleInFlight = false;
+        }
+      })();
     }
   });
   send(ws, { type: "workspace", data: handle.workspace });
@@ -599,8 +784,10 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
 async function main() {
   const store = new WorkspaceStore();
   const locks = new LockStore();
+  const settingsStore = new SettingsStore();
   await store.load();
   await locks.load();
+  await settingsStore.load();
 
   const app = express();
   app.use(express.json());
@@ -630,7 +817,7 @@ async function main() {
     res.json({ ok: true, cwd: initialCwd, mode: isProduction ? "production" : "development", workspaces: store.list().length, wsToken: localToken });
   });
 
-  app.get("/api/workspaces", (_req, res) => res.json({ workspaces: store.list() }));
+  app.get("/api/workspaces", (_req, res) => res.json({ workspaces: publicWorkspaces(store) }));
   app.post("/api/workspaces", async (req, res) => {
     try {
       res.json({ workspace: await store.add(String(req.body?.cwd ?? ""), req.body?.name ? String(req.body.name) : undefined) });
@@ -657,27 +844,46 @@ async function main() {
     const ownerId = crypto.randomUUID();
     const pendingUi = new Map<string, (value: unknown) => void>();
 
+    async function applySessionDefaults(session: AgentSession) {
+      const settings = settingsStore.get();
+      if (settings.defaultModel) {
+        const model = session.modelRegistry.find(settings.defaultModel.provider, settings.defaultModel.modelId);
+        if (model) {
+          try { await session.setModel(model); }
+          catch (err) { console.warn("Failed to apply default model:", err); }
+        }
+      }
+      if (settings.defaultThinkingLevel) {
+        try { session.setThinkingLevel(settings.defaultThinkingLevel); }
+        catch (err) { console.warn("Failed to apply default thinking level:", err); }
+      }
+    }
+
     async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
       if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile, ownerId);
       await handle?.runtime.dispose();
       activeWorkspace = await store.touch(workspace.id);
       handle = { workspace: activeWorkspace, runtime: await createRuntimeFor(activeWorkspace.cwd, options?.mode, options?.sessionPath) };
+      // Apply settings-driven defaults to brand-new sessions only — resuming an
+      // existing session preserves whatever it was last using.
+      if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(handle.runtime.session);
       handle.runtime.setRebindSession(async () => {
-        const binding = await bindSession(ws, handle!, pendingUi, locks, ownerId, unsubscribe);
+        const binding = await bindSession(ws, handle!, pendingUi, locks, ownerId, settingsStore, unsubscribe);
         unsubscribe = binding.unsubscribe;
         readOnly = binding.readOnly;
-        send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
+        send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
       });
-      const binding = await bindSession(ws, handle, pendingUi, locks, ownerId, unsubscribe);
+      const binding = await bindSession(ws, handle, pendingUi, locks, ownerId, settingsStore, unsubscribe);
       unsubscribe = binding.unsubscribe;
       readOnly = binding.readOnly;
-      send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
+      send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
       return handle;
     }
 
     try {
       await activate(activeWorkspace);
-      send(ws, { type: "ready", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session) } });
+      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session), settings: settingsStore.get() } });
+      send(ws, { type: "settings", data: settingsStore.get() });
     } catch (error) {
       send(ws, { type: "response", command: "connect", success: false, error: error instanceof Error ? error.message : String(error) });
       return;
@@ -699,12 +905,21 @@ async function main() {
         }
         switch (command.type) {
           case "list_workspaces":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
-            send(ws, { type: "workspaces", data: { workspaces: store.list(), activeWorkspaceId: activeWorkspace.id } });
+            send(ws, { type: "response", id, command: command.type, success: true, data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
+            send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
             break;
           case "open_workspace": {
-            if (!command.cwd) throw new Error("Missing cwd");
-            const workspace = await store.add(command.cwd, command.name);
+            // No cwd supplied → pop a native folder picker. Cancel = no-op.
+            let cwd = command.cwd;
+            if (!cwd) {
+              const picked = await pickFolderNative(activeWorkspace.cwd ?? initialCwd);
+              if (!picked) {
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: true } });
+                break;
+              }
+              cwd = picked;
+            }
+            const workspace = await store.add(cwd, command.name);
             await activate(workspace);
             send(ws, { type: "response", id, command: command.type, success: true, data: { workspace } });
             break;
@@ -719,6 +934,9 @@ async function main() {
           }
           case "remove_workspace": {
             if (!command.workspaceId) throw new Error("Missing workspaceId");
+            if (command.workspaceId === initialWorkspaceId) {
+              throw new Error("This workspace is the launch directory and is pinned — it can't be removed.");
+            }
             if (command.workspaceId === activeWorkspace.id) await handle?.runtime.dispose();
             await store.remove(command.workspaceId);
             const next = store.list()[0] ?? (await store.add(initialCwd));
@@ -730,6 +948,22 @@ async function main() {
             send(ws, { type: "response", id, command: command.type, success: true, data: { sessions: await listSessions(activeWorkspace.cwd) } });
             send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
             break;
+          case "delete_session": {
+            if (!command.sessionPath) throw new Error("Missing sessionPath");
+            // Refuse to delete the session file we currently hold open.
+            if (handle?.runtime.session.sessionFile === command.sessionPath) {
+              throw new Error("This session is open. Switch to another conversation first, then delete it.");
+            }
+            // Don't allow deletion of files outside the active workspace's session listing.
+            const sessionsForWs = await listSessions(activeWorkspace.cwd);
+            if (!sessionsForWs.some((s) => s.path === command.sessionPath)) {
+              throw new Error("Session not found in this workspace.");
+            }
+            await fs.unlink(command.sessionPath);
+            send(ws, { type: "response", id, command: command.type, success: true });
+            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+            break;
+          }
           case "switch_session":
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             {
@@ -905,6 +1139,16 @@ async function main() {
             send(ws, { type: "response", id, command: command.type, success: true });
             send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
             break;
+          case "get_settings":
+            send(ws, { type: "response", id, command: command.type, success: true, data: settingsStore.get() });
+            send(ws, { type: "settings", data: settingsStore.get() });
+            break;
+          case "set_settings": {
+            const next = await settingsStore.update(command.settings ?? {});
+            send(ws, { type: "response", id, command: command.type, success: true, data: next });
+            send(ws, { type: "settings", data: next });
+            break;
+          }
           case "extension_ui_response":
             if (!command.uiRequestId) throw new Error("Missing uiRequestId");
             pendingUi.get(command.uiRequestId)?.(command.value);

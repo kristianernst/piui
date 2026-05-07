@@ -1,10 +1,11 @@
 import React, { Component, lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
+import { Toaster, toast } from "sonner";
 import { measureLineStats, prepareWithSegments, type PreparedTextWithSegments } from "@chenglou/pretext";
+import hljs from "highlight.js/lib/common";
 import {
-  IconArrowUp,
-  IconBolt,
+  IconArrowUpSlim,
   IconChev,
   IconChart,
   IconClose,
@@ -15,7 +16,7 @@ import {
   IconFile,
   IconFolder,
   IconMoon,
-  IconPlus,
+  IconPlusSlim,
   IconSearch,
   IconSettings,
   IconSidebarLeft,
@@ -30,8 +31,11 @@ import {
   type AgentEvent,
   type AgentMessage,
   type ExtensionUiRequest,
+  type PiModelSummary,
   type PiSessionInfo,
+  type PiSettings,
   type PiState,
+  type PiThinkingLevel,
   type ToolResultDetails,
   type Workspace,
 } from "./piSocket";
@@ -94,13 +98,6 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode }, AppError
     );
   }
 }
-
-const starters = [
-  "Explore this repo and summarize how it works",
-  "What changed recently in git?",
-  "Find TODOs and suggest a cleanup plan",
-  "Run the test suite and explain failures",
-];
 
 function uiMessageFromAgent(message: AgentMessage, id: string): UiMessage | null {
   if (message.role === "user") return { id, role: "user", text: contentToText(message.content) };
@@ -186,15 +183,21 @@ function App() {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PiSessionInfo[]>([]);
   const [messages, setMessages] = useState<UiMessage[]>([]);
+  const [models, setModels] = useState<PiModelSummary[]>([]);
+  const [settings, setSettings] = useState<PiSettings | null>(null);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
-  const [lastError, setLastError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [notices, setNotices] = useState<Array<{ id: string; message: string; level?: "info" | "warning" | "error" }>>([]);
   const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
   const threadRef = useRef<HTMLDivElement>(null);
+  // Autoscroll is "sticky" — we follow new content to the bottom unless the
+  // user has manually scrolled away. Once they scroll back near the bottom we
+  // re-engage. The threshold buffers small layout jitter (image loads, font
+  // metrics settling, code-block reflows) from being mistaken for a scroll-up.
+  const stickToBottomRef = useRef(true);
+  const SCROLL_STICK_THRESHOLD_PX = 80;
 
   useEffect(() => {
     document.body.classList.toggle("dark", dark);
@@ -206,6 +209,7 @@ function App() {
         setState(packet.data.state);
         setWorkspaces(packet.data.workspaces);
         setActiveWorkspaceId(packet.data.activeWorkspaceId);
+        if (packet.data.settings) setSettings(packet.data.settings);
       }
       if (packet.type === "workspaces") {
         setWorkspaces(packet.data.workspaces);
@@ -213,12 +217,13 @@ function App() {
       }
       if (packet.type === "state") setState(packet.data);
       if (packet.type === "sessions") setSessions(packet.data.sessions);
+      if (packet.type === "models") setModels(packet.data.models);
+      if (packet.type === "settings") setSettings(packet.data);
       if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
       if (packet.type === "extension_ui_request") setUiRequest(packet.request);
       if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
       if (packet.type === "event") applyEvent(packet.event);
       if (packet.type === "response" && !packet.success) {
-        setLastError(packet.error ?? "Unknown Pi error");
         pushNotice(packet.error ?? "Unknown Pi error", "error");
       }
     }, setConnection);
@@ -227,13 +232,24 @@ function App() {
   }, []);
 
   useEffect(() => {
-    threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
+    const el = threadRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }
   }, [messages]);
 
+  function handleThreadScroll() {
+    const el = threadRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= SCROLL_STICK_THRESHOLD_PX;
+  }
+
   function pushNotice(message: string, level?: "info" | "warning" | "error") {
-    const id = `${Date.now()}-${Math.random()}`;
-    setNotices((prev) => [{ id, message, level }, ...prev].slice(0, 3));
-    window.setTimeout(() => setNotices((prev) => prev.filter((notice) => notice.id !== id)), 6000);
+    if (level === "error") toast.error(message);
+    else if (level === "warning") toast.warning(message);
+    else toast(message);
   }
 
   function applyEvent(event: AgentEvent) {
@@ -269,7 +285,8 @@ function App() {
         }
         return [...prev, { id: `a-${now}`, role: "assistant", text: "", blocks: [], streaming: true, startedAt: now }];
       });
-      setLastError(null);
+      // Dismiss any lingering error toasts when a new turn starts.
+      toast.dismiss();
       return;
     }
     if (event.type === "message_update" && event.assistantMessageEvent) {
@@ -323,6 +340,9 @@ function App() {
   }
 
   function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
+    // The user is engaging with the conversation again — re-engage autoscroll
+    // even if they had scrolled up to read earlier content.
+    stickToBottomRef.current = true;
     // Optimistically render the user's turn so it never appears below the
     // streaming assistant if `agent_start` lands first on the wire.
     setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: "user", text }]);
@@ -343,10 +363,9 @@ function App() {
   }
 
   function openWorkspace() {
-    const cwd = window.prompt("Absolute path to workspace");
-    if (!cwd?.trim()) return;
+    // Ask the server to pop a native folder picker; cwd is filled in there.
     setMessages([]);
-    socketRef.current?.send({ type: "open_workspace", cwd: cwd.trim() });
+    socketRef.current?.send({ type: "open_workspace" });
   }
 
   function switchWorkspace(workspaceId: string) {
@@ -355,10 +374,26 @@ function App() {
     socketRef.current?.send({ type: "switch_workspace", workspaceId });
   }
 
+  function removeWorkspace(workspaceId: string) {
+    socketRef.current?.send({ type: "remove_workspace", workspaceId });
+  }
+
   function switchSession(sessionPath: string) {
     setMessages([]);
     socketRef.current?.send({ type: "switch_session", sessionPath });
   }
+
+  function deleteSession(sessionPath: string) {
+    socketRef.current?.send({ type: "delete_session", sessionPath });
+  }
+
+  function updateSettings(patch: Partial<PiSettings>) {
+    // Optimistic update so the dialog feels snappy; the server will broadcast
+    // a settings packet that supersedes this.
+    setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
+    socketRef.current?.send({ type: "set_settings", settings: patch });
+  }
+
 
   const sessionTitle = state?.workspace.name ? state.workspace.name : "Pi";
   const headerTitle = messages[0]?.text.slice(0, 64) || sessionTitle;
@@ -371,13 +406,19 @@ function App() {
         onNewSession={newSession}
         onOpenWorkspace={openWorkspace}
         onSwitchWorkspace={switchWorkspace}
+        onRemoveWorkspace={removeWorkspace}
         onSwitchSession={switchSession}
+        onDeleteSession={deleteSession}
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
         sessions={sessions}
         activeSessionId={state?.sessionId}
         dark={dark}
         onToggleDark={() => setDark((v) => !v)}
+        models={models}
+        currentModel={state?.model ?? null}
+        settings={settings}
+        onUpdateSettings={updateSettings}
       />
       <main className="app">
         <header className="topbar">
@@ -398,12 +439,10 @@ function App() {
           </div>
         </header>
 
-        <div className="thread" ref={threadRef}>
-          {messages.length === 0 ? <EmptyState onPick={sendPrompt} /> : messages.map((message) => <MessageView key={message.id} message={message} />)}
+        <div className="thread" ref={threadRef} onScroll={handleThreadScroll}>
+          {messages.length === 0 ? <EmptyState /> : messages.map((message) => <MessageView key={message.id} message={message} />)}
         </div>
 
-        {lastError && <div className="errorToast">{lastError}</div>}
-        <NoticeStack notices={notices} />
         <Composer
           state={state}
           connection={connection}
@@ -413,8 +452,9 @@ function App() {
           onSteer={(text) => queuePrompt(text, "steer")}
           onFollowUp={(text) => queuePrompt(text, "follow_up")}
           onAbort={abort}
-          onCycleModel={() => socketRef.current?.send({ type: "cycle_model" })}
           onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })}
+          models={models}
+          onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
         />
       </main>
       <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} />
@@ -427,6 +467,13 @@ function App() {
           }}
         />
       )}
+      <Toaster
+        theme={dark ? "dark" : "light"}
+        position="bottom-right"
+        richColors
+        closeButton
+        toastOptions={{ duration: 5000 }}
+      />
     </div>
   );
 }
@@ -440,15 +487,11 @@ function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage
   return next;
 }
 
-function EmptyState({ onPick }: { onPick: (text: string) => void }) {
+function EmptyState() {
   return (
     <section className="empty fadeUp">
-      <div className="heroDot"><IconBolt /></div>
       <h1>Pi, in the browser.</h1>
       <p>This local web app talks to Pi through its Node SDK, so it uses your real Pi config, credentials, sessions, tools, context files, extensions, and working directory.</p>
-      <div className="suggestions">
-        {starters.map((starter) => <button key={starter} onClick={() => onPick(starter)}>{starter}</button>)}
-      </div>
     </section>
   );
 }
@@ -551,12 +594,40 @@ function summarizeArgs(args?: Record<string, unknown>) {
   return "";
 }
 
+// Delay before a hover counts as "the user wants to peek." Short enough to
+// feel snappy when intentional, long enough to ignore cursor flyovers when
+// moving across a stack of tool cards.
+const TOOL_HOVER_OPEN_DELAY_MS = 450;
+
 function ToolCard({ tool }: { tool: UiTool }) {
   const Icon = pickToolIcon(tool.name);
   const hint = summarizeArgs(tool.args);
   const hasBody = !!tool.output || !!tool.details;
   const [locked, setLocked] = useState(false);
   const [hovered, setHovered] = useState(false);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  function cancelHoverTimer() {
+    if (hoverTimerRef.current != null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  }
+  // Cleanup on unmount so a pending timer doesn't fire after we're gone.
+  useEffect(() => () => cancelHoverTimer(), []);
+
+  function handleMouseEnter() {
+    cancelHoverTimer();
+    hoverTimerRef.current = window.setTimeout(() => {
+      setHovered(true);
+      hoverTimerRef.current = null;
+    }, TOOL_HOVER_OPEN_DELAY_MS);
+  }
+  function handleMouseLeave() {
+    cancelHoverTimer();
+    setHovered(false);
+  }
+
   // Hover peeks at the body, click locks it open. Locked overrides hover so
   // the user can drift the cursor away to interact (scroll a chart, click in
   // a table) without the panel slamming shut.
@@ -564,13 +635,19 @@ function ToolCard({ tool }: { tool: UiTool }) {
   return (
     <div
       className={`tool ${tool.status} ${open ? "open" : ""} ${locked ? "locked" : ""}`}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
       <button
         type="button"
         className="toolHead"
-        onClick={() => hasBody && setLocked((v) => !v)}
+        onClick={() => {
+          if (!hasBody) return;
+          // Click should pop the panel open instantly — don't make the user
+          // wait through the hover delay just because they clicked early.
+          cancelHoverTimer();
+          setLocked((v) => !v);
+        }}
         aria-expanded={hasBody ? open : undefined}
       >
         <Icon size={12} />
@@ -747,18 +824,23 @@ function renderBlocks(input: string): React.ReactNode[] {
   while (i < lines.length) {
     const line = lines[i];
 
-    // Fenced code block
-    const fence = /^```(\w*)\s*$/.exec(line);
+    // Fenced code block. Allow leading whitespace so fences inside list items
+    // (where the model indents the fence under a `- ` bullet) still register.
+    // We track the opening indent and strip up to that many leading spaces
+    // from each body line, so the content doesn't render with stray indent.
+    const fence = /^(\s*)```(\w*)\s*$/.exec(line);
     if (fence) {
-      const lang = fence[1];
+      const indent = fence[1].length;
+      const lang = fence[2];
+      const closing = new RegExp(`^\\s{0,${indent}}\`\`\`\\s*$`);
       const buffer: string[] = [];
       i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
-        buffer.push(lines[i]);
+      while (i < lines.length && !closing.test(lines[i])) {
+        buffer.push(indent ? lines[i].replace(new RegExp(`^\\s{0,${indent}}`), "") : lines[i]);
         i++;
       }
       i++;
-      out.push(<pre key={`code-${out.length}`} className={`md-code${lang ? ` lang-${lang}` : ""}`}><code>{buffer.join("\n")}</code></pre>);
+      out.push(<CodeBlock key={`code-${out.length}`} code={buffer.join("\n")} lang={lang} />);
       continue;
     }
 
@@ -824,7 +906,7 @@ function renderBlocks(input: string): React.ReactNode[] {
     while (
       i < lines.length &&
       lines[i].trim() &&
-      !/^```/.test(lines[i]) &&
+      !/^\s*```/.test(lines[i]) &&
       !/^#{1,6}\s+/.test(lines[i]) &&
       !isTableStart(lines, i) &&
       !/^\s*\d+\.\s+/.test(lines[i]) &&
@@ -927,6 +1009,113 @@ function MarkdownTable({ table }: { table: MarkdownTableModel }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// Aliases that the model commonly emits in fenced code-block headers but
+// which highlight.js doesn't natively recognise as lookup keys. We map them
+// to canonical hljs language ids before calling `hljs.highlight`.
+const HLJS_LANGUAGE_ALIASES: Record<string, string> = {
+  sh: "bash",
+  shell: "bash",
+  zsh: "bash",
+  console: "bash",
+  js: "javascript",
+  jsx: "javascript",
+  ts: "typescript",
+  tsx: "typescript",
+  py: "python",
+  yml: "yaml",
+  md: "markdown",
+  rs: "rust",
+  text: "plaintext",
+  txt: "plaintext",
+};
+
+function escapeHtml(input: string): string {
+  return input.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
+}
+
+function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+  const requested = (lang || "").toLowerCase();
+  const language = HLJS_LANGUAGE_ALIASES[requested] ?? requested;
+  let html: string;
+  let labelLang = language || "text";
+  try {
+    if (language && hljs.getLanguage(language)) {
+      html = hljs.highlight(code, { language, ignoreIllegals: true }).value;
+    } else if (!language) {
+      // Auto-detect when the model omitted a language hint. Cheap on small
+      // snippets and only runs when content actually changes (each render).
+      const auto = hljs.highlightAuto(code);
+      html = auto.value;
+      labelLang = auto.language || "text";
+    } else {
+      // Unknown / unsupported language label — render plain but escaped so
+      // we don't accidentally inject HTML from streamed model output.
+      html = escapeHtml(code);
+    }
+  } catch {
+    html = escapeHtml(code);
+  }
+
+  async function copy(event: React.MouseEvent<HTMLButtonElement>) {
+    const button = event.currentTarget;
+    let ok = false;
+    // Modern path. `navigator.clipboard` requires a secure context — true for
+    // localhost and https, false for plain http on a LAN address.
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(code);
+        ok = true;
+      } catch {
+        ok = false;
+      }
+    }
+    // Fallback for environments where the async clipboard API is missing or
+    // blocked: drop a hidden textarea, select it, and execCommand("copy").
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = code;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        ta.style.pointerEvents = "none";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
+      // Imperative feedback — the in-header label flips to "Copied" briefly.
+      // No sonner here on success: the button itself is the confirmation, and
+      // a toast on every copy gets noisy in long sessions.
+      const original = button.textContent;
+      button.textContent = "Copied";
+      button.classList.add("copied");
+      window.setTimeout(() => {
+        if (button.isConnected) {
+          button.textContent = original;
+          button.classList.remove("copied");
+        }
+      }, 1500);
+    } else {
+      toast.error("Couldn't copy");
+    }
+  }
+
+  return (
+    <div className="md-codeBlock">
+      <div className="md-codeBlock-head">
+        <span className="md-codeBlock-lang">{labelLang}</span>
+        <button type="button" className="md-codeBlock-copy" onClick={copy} title="Copy code">Copy</button>
+      </div>
+      <pre className="md-code"><code className={`hljs language-${language || "plaintext"}`} dangerouslySetInnerHTML={{ __html: html }} /></pre>
     </div>
   );
 }
@@ -1048,8 +1237,9 @@ function Composer({
   onSteer,
   onFollowUp,
   onAbort,
-  onCycleModel,
   onThinking,
+  models,
+  onSetModel,
 }: {
   state: PiState | null;
   connection: string;
@@ -1059,12 +1249,34 @@ function Composer({
   onSteer: (text: string) => void;
   onFollowUp: (text: string) => void;
   onAbort: () => void;
-  onCycleModel: () => void;
   onThinking: (level: PiState["thinkingLevel"]) => void;
+  models: PiModelSummary[];
+  onSetModel: (provider: string, modelId: string) => void;
 }) {
   const disabled = connection !== "open";
   const pct = state?.usage?.percent ?? 0;
-  const modelName = state?.model?.name ?? state?.model?.id ?? "No model";
+  // The "context %" bar reflects how much of the active model's context
+  // window is currently occupied. The server reads `usage` off the most
+  // recent assistant message: `percent = round(tokens / contextWindow * 100)`,
+  // where `tokens = usage.totalTokens ?? usage.input`. So it's an estimate of
+  // *prompt* size going into the next call (output/cached counts roll into
+  // totalTokens when the provider reports them), capped at 100. It updates
+  // every time pi emits a new `state` packet (e.g. after each turn settles).
+  const thinkingLevels: PiState["thinkingLevel"][] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+  const currentThinking = state?.thinkingLevel ?? "off";
+  function cycleThinking() {
+    const idx = thinkingLevels.indexOf(currentThinking);
+    const next = thinkingLevels[(idx + 1) % thinkingLevels.length];
+    onThinking(next);
+  }
+
+  const availableModels = models.filter((m) => m.available);
+  const modelOptions = availableModels.length
+    ? availableModels
+    : (state?.model
+        ? [{ provider: state.model.provider, id: state.model.id, name: state.model.name, available: true, current: true } as PiModelSummary]
+        : []);
+  const currentModelKey = state?.model ? `${state.model.provider}::${state.model.id}` : "";
 
   function submit(mode: "send" | "steer" | "followUp" = "send") {
     if (!value.trim() || disabled) return;
@@ -1077,9 +1289,9 @@ function Composer({
   return (
     <footer className="composerWrap">
       <div className="composer">
-        <button className="add" title="Attach"><IconPlus /></button>
+        <button className="add" title="Attach"><IconPlusSlim size={16} /></button>
         <textarea value={value} disabled={disabled} onChange={(event) => onValueChange(event.target.value)} placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…"} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(state?.isStreaming ? "followUp" : "send"); } }} />
-        {state?.isStreaming ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button> : <button className="send" onClick={() => submit()} title="Send"><IconArrowUp /></button>}
+        {state?.isStreaming ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button> : <button className="send" onClick={() => submit()} title="Send"><IconArrowUpSlim size={16} /></button>}
       </div>
       {state?.isStreaming && (
         <div className="queueActions">
@@ -1090,15 +1302,39 @@ function Composer({
       )}
       <div className="metaBar">
         <span className={`status ${connection}`}>{connection}</span>
-        <button onClick={onCycleModel}>{modelName}</button>
-        <select value={state?.thinkingLevel ?? "off"} onChange={(event) => onThinking(event.target.value as PiState["thinkingLevel"])}>
-          {(["off", "minimal", "low", "medium", "high", "xhigh"] as const).map((level) => <option key={level} value={level}>{level}</option>)}
+        <select
+          className="metaBar-model"
+          value={currentModelKey}
+          onChange={(event) => {
+            const [provider, modelId] = event.target.value.split("::");
+            if (provider && modelId) onSetModel(provider, modelId);
+          }}
+          disabled={modelOptions.length === 0}
+          title="Switch model"
+        >
+          {modelOptions.length === 0 && <option value="">No model</option>}
+          {modelOptions.map((model) => (
+            <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+              {model.name ?? model.id}
+            </option>
+          ))}
         </select>
-        <span className="ctx"><span style={{ width: `${pct}%` }} />{pct || 0}%</span>
+        <button
+          className="metaBar-thinking"
+          onClick={cycleThinking}
+          title={`Reasoning effort: ${currentThinking} (click to cycle)`}
+        >
+          {currentThinking}
+        </button>
+        <span className="ctx" title={state?.usage?.tokens != null && state?.usage?.contextWindow ? `${state.usage.tokens.toLocaleString()} / ${state.usage.contextWindow.toLocaleString()} tokens used in the model's context window` : "Context usage will appear after the first turn"}>
+          <span style={{ width: `${pct}%` }} />{pct || 0}%
+        </span>
       </div>
     </footer>
   );
 }
+
+const SESSIONS_INITIAL_LIMIT = 5;
 
 function LeftSidebar({
   open,
@@ -1106,30 +1342,67 @@ function LeftSidebar({
   onNewSession,
   onOpenWorkspace,
   onSwitchWorkspace,
+  onRemoveWorkspace,
   onSwitchSession,
+  onDeleteSession,
   workspaces,
   activeWorkspaceId,
   sessions,
   activeSessionId,
   dark,
   onToggleDark,
+  models,
+  currentModel,
+  settings,
+  onUpdateSettings,
 }: {
   open: boolean;
   onToggle: () => void;
   onNewSession: () => void;
   onOpenWorkspace: () => void;
   onSwitchWorkspace: (workspaceId: string) => void;
+  onRemoveWorkspace: (workspaceId: string) => void;
   onSwitchSession: (sessionPath: string) => void;
+  onDeleteSession: (sessionPath: string) => void;
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   sessions: PiSessionInfo[];
   activeSessionId?: string;
   dark: boolean;
   onToggleDark: () => void;
+  models: PiModelSummary[];
+  currentModel: PiState["model"];
+  settings: PiSettings | null;
+  onUpdateSettings: (patch: Partial<PiSettings>) => void;
 }) {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(() => new Set());
+  function confirmDelete(session: PiSessionInfo) {
+    const label = session.name || session.firstMessage || "Untitled";
+    toast(`Delete "${label}"?`, {
+      description: "This conversation file will be permanently removed.",
+      duration: 8000,
+      action: {
+        label: "Delete",
+        onClick: () => onDeleteSession(session.path),
+      },
+      cancel: { label: "Cancel", onClick: () => undefined },
+    });
+  }
+
+  function confirmRemoveWorkspace(workspace: Workspace) {
+    toast(`Remove "${workspace.name}" from sidebar?`, {
+      description: "Conversations stay on disk; you can re-open the folder anytime.",
+      duration: 8000,
+      action: {
+        label: "Remove",
+        onClick: () => onRemoveWorkspace(workspace.id),
+      },
+      cancel: { label: "Cancel", onClick: () => undefined },
+    });
+  }
 
   const q = query.trim().toLowerCase();
   const filteredSessions = q
@@ -1150,6 +1423,15 @@ function LeftSidebar({
     });
   }
 
+  function toggleExpanded(workspaceId: string) {
+    setExpandedSessions((prev) => {
+      const next = new Set(prev);
+      if (next.has(workspaceId)) next.delete(workspaceId);
+      else next.add(workspaceId);
+      return next;
+    });
+  }
+
   return (
     <aside className={`sidebar left ${open ? "open" : "closed"}`}>
       <div className="sideInner">
@@ -1164,7 +1446,6 @@ function LeftSidebar({
         </div>
 
         <button className="sb-new" onClick={onNewSession} title="Start a new session">
-          <IconPlus size={12} />
           <span>New chat</span>
         </button>
 
@@ -1177,7 +1458,7 @@ function LeftSidebar({
           <div className="sb-section-label">
             <span>Workspaces</span>
             <button className="sb-section-label-action" onClick={onOpenWorkspace} title="Open workspace">
-              <IconPlus size={11} />
+              <IconPlusSlim size={12} />
             </button>
           </div>
 
@@ -1188,14 +1469,29 @@ function LeftSidebar({
               const isActive = workspace.id === activeWorkspaceId;
               const isOpen = isActive && !collapsed.has(workspace.id);
               const wsSessions = isActive ? filteredSessions : [];
+              const expanded = expandedSessions.has(workspace.id);
+              const visible = expanded || q ? wsSessions : wsSessions.slice(0, SESSIONS_INITIAL_LIMIT);
+              const hiddenCount = wsSessions.length - visible.length;
               return (
                 <div key={workspace.id} className={`sb-ws ${isActive ? "active" : ""} ${isOpen ? "open" : "closed"}`}>
-                  <button className="sb-ws-head" onClick={() => toggleWorkspace(workspace.id)} title={workspace.cwd}>
-                    <IconChev className="sb-chev" size={11} />
-                    <IconFolder className="sb-folder" size={13} />
-                    <span className="sb-ws-name">{workspace.name}</span>
-                    {isActive && wsSessions.length > 0 && <span className="sb-ws-count">{wsSessions.length}</span>}
-                  </button>
+                  <div className="sb-ws-row">
+                    <button className="sb-ws-head" onClick={() => toggleWorkspace(workspace.id)} title={workspace.cwd}>
+                      <IconChev className="sb-chev" size={11} />
+                      <IconFolder className="sb-folder" size={13} />
+                      <span className="sb-ws-name">{workspace.name}</span>
+                      {isActive && wsSessions.length > 0 && <span className="sb-ws-count">{wsSessions.length}</span>}
+                    </button>
+                    {!workspace.pinned && (
+                      <button
+                        className="sb-ws-del"
+                        title="Remove workspace from sidebar"
+                        aria-label="Remove workspace"
+                        onClick={(event) => { event.stopPropagation(); confirmRemoveWorkspace(workspace); }}
+                      >
+                        <IconClose size={12} />
+                      </button>
+                    )}
+                  </div>
                   <div className="sb-ws-body">
                     <div className="sb-ws-body-inner">
                       {isActive && (
@@ -1203,17 +1499,38 @@ function LeftSidebar({
                           {wsSessions.length === 0 ? (
                             <p className="sb-empty">No sessions yet.</p>
                           ) : (
-                            wsSessions.map((session) => (
-                              <button
-                                key={session.path}
-                                className={`sb-conv ${session.id === activeSessionId ? "active" : ""}`}
-                                onClick={() => onSwitchSession(session.path)}
-                                title={session.path}
-                              >
-                                <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
-                                <span className="sb-conv-time">{relativeTime(session.modified)}</span>
-                              </button>
-                            ))
+                            <>
+                              {visible.map((session) => (
+                                <div key={session.path} className={`sb-conv-row ${session.id === activeSessionId ? "active" : ""}`}>
+                                  <button
+                                    className="sb-conv"
+                                    onClick={() => onSwitchSession(session.path)}
+                                    title={session.path}
+                                  >
+                                    <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
+                                    <span className="sb-conv-time">{relativeTime(session.modified)}</span>
+                                  </button>
+                                  <button
+                                    className="sb-conv-del"
+                                    title="Delete conversation"
+                                    aria-label="Delete conversation"
+                                    onClick={(event) => { event.stopPropagation(); confirmDelete(session); }}
+                                  >
+                                    <IconClose size={12} />
+                                  </button>
+                                </div>
+                              ))}
+                              {hiddenCount > 0 && (
+                                <button className="sb-show-more" onClick={() => toggleExpanded(workspace.id)}>
+                                  Show {hiddenCount} more
+                                </button>
+                              )}
+                              {expanded && wsSessions.length > SESSIONS_INITIAL_LIMIT && !q && (
+                                <button className="sb-show-more" onClick={() => toggleExpanded(workspace.id)}>
+                                  Show less
+                                </button>
+                              )}
+                            </>
                           )}
                         </div>
                       )}
@@ -1226,21 +1543,151 @@ function LeftSidebar({
         </div>
 
         <div className="sb-foot">
-          {settingsOpen && (
-            <div className="sb-popover">
-              <button className="sb-popover-row" onClick={onToggleDark}>
-                {dark ? <IconSun size={14} /> : <IconMoon size={14} />}
-                <span>{dark ? "Light mode" : "Dark mode"}</span>
-              </button>
-            </div>
-          )}
-          <button className="sb-foot-btn" onClick={() => setSettingsOpen((v) => !v)}>
+          <button className="sb-foot-btn" onClick={() => setSettingsOpen(true)}>
             <IconSettings size={14} />
             <span>Settings</span>
           </button>
         </div>
       </div>
+
+      {settingsOpen && (
+        <SettingsDialog
+          onClose={() => setSettingsOpen(false)}
+          dark={dark}
+          onToggleDark={onToggleDark}
+          models={models}
+          currentModel={currentModel}
+          settings={settings}
+          onUpdateSettings={onUpdateSettings}
+        />
+      )}
+
     </aside>
+  );
+}
+
+function SettingsDialog({
+  onClose,
+  dark,
+  onToggleDark,
+  models,
+  currentModel,
+  settings,
+  onUpdateSettings,
+}: {
+  onClose: () => void;
+  dark: boolean;
+  onToggleDark: () => void;
+  models: PiModelSummary[];
+  currentModel: PiState["model"];
+  settings: PiSettings | null;
+  onUpdateSettings: (patch: Partial<PiSettings>) => void;
+}) {
+  const availableModels = models.filter((m) => m.available);
+  const fallbackModels = currentModel ? [{ provider: currentModel.provider, id: currentModel.id, name: currentModel.name, available: true, current: true } as PiModelSummary] : [];
+  const modelOptions = availableModels.length ? availableModels : fallbackModels;
+
+  function modelKey(ref: { provider: string; id?: string; modelId?: string } | null | undefined) {
+    if (!ref) return "";
+    const id = "id" in ref ? ref.id : (ref as { modelId?: string }).modelId;
+    return ref.provider && id ? `${ref.provider}::${id}` : "";
+  }
+  function parseModelKey(key: string): { provider: string; modelId: string } | null {
+    if (!key) return null;
+    const [provider, modelId] = key.split("::");
+    return provider && modelId ? { provider, modelId } : null;
+  }
+
+  const titleKey = modelKey(settings?.titleModel ?? null);
+  const defaultKey = modelKey(settings?.defaultModel ?? null);
+
+  const thinkingLevels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+  return (
+    <div className="modalShade" onClick={onClose}>
+      <div className="dialog settingsDialog" onClick={(event) => event.stopPropagation()}>
+        <div className="dialogHeader">
+          <h2>Settings</h2>
+          <button className="iconBtn" onClick={onClose} aria-label="Close settings"><IconClose size={14} /></button>
+        </div>
+
+        <section className="settingsSection">
+          <h3>Appearance</h3>
+          <div className="settingsRow">
+            <label className="settingsLabel">Theme</label>
+            <button className="settingsToggle" onClick={onToggleDark}>
+              {dark ? <IconSun size={13} /> : <IconMoon size={13} />}
+              <span>{dark ? "Light mode" : "Dark mode"}</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="settingsSection">
+          <h3>Chat defaults</h3>
+
+          <div className="settingsRow">
+            <label className="settingsLabel" htmlFor="def-model">Default model (new chats)</label>
+            <select
+              id="def-model"
+              value={defaultKey}
+              onChange={(event) => {
+                const ref = parseModelKey(event.target.value);
+                onUpdateSettings({ defaultModel: ref });
+              }}
+            >
+              <option value="">Use current selection</option>
+              {modelOptions.map((model) => (
+                <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+                  {model.name ?? model.id} ({model.provider})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="settingsRow">
+            <label className="settingsLabel" htmlFor="def-thinking">Default reasoning (new chats)</label>
+            <select
+              id="def-thinking"
+              value={settings?.defaultThinkingLevel ?? ""}
+              onChange={(event) => {
+                const value = event.target.value;
+                onUpdateSettings({ defaultThinkingLevel: value ? (value as PiThinkingLevel) : null });
+              }}
+            >
+              <option value="">Use current selection</option>
+              {thinkingLevels.map((level) => <option key={level} value={level}>{level}</option>)}
+            </select>
+          </div>
+        </section>
+
+        <section className="settingsSection">
+          <h3>Conversation titles</h3>
+          <p className="settingsHint">Pick which model writes the short title shown in your chat history. Default is whichever model the chat is using.</p>
+          <div className="settingsRow">
+            <label className="settingsLabel" htmlFor="title-model">Title model</label>
+            <select
+              id="title-model"
+              value={titleKey}
+              onChange={(event) => {
+                const ref = parseModelKey(event.target.value);
+                onUpdateSettings({ titleModel: ref });
+              }}
+            >
+              <option value="">Same as chat model</option>
+              {modelOptions.map((model) => (
+                <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+                  {model.name ?? model.id} ({model.provider})
+                </option>
+              ))}
+            </select>
+          </div>
+        </section>
+
+        <div className="dialogActions">
+          <button className="primary" onClick={onClose}>Done</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1275,15 +1722,6 @@ function relativeTime(iso: string) {
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`;
   if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d`;
   return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-function NoticeStack({ notices }: { notices: Array<{ id: string; message: string; level?: "info" | "warning" | "error" }> }) {
-  if (!notices.length) return null;
-  return (
-    <div className="noticeStack">
-      {notices.map((notice) => <div key={notice.id} className={`notice ${notice.level ?? "info"}`}>{notice.message}</div>)}
-    </div>
-  );
 }
 
 function ExtensionDialog({ request, onResolve }: { request: ExtensionUiRequest; onResolve: (value: unknown) => void }) {

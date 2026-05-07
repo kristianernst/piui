@@ -8,7 +8,6 @@ import {
   Chart,
   Code,
   CodeSquare,
-  CloseCircle,
   Database,
   Document,
   Folder,
@@ -37,7 +36,6 @@ const bold =
   (Component: AnyIcon) =>
   (props: IconProps) => <Component weight="Bold" {...props} />;
 
-export const IconPlus = bold(AddCircle);
 export const IconCheck = bold(CheckCircle);
 export const IconArrowUp = bold(RoundArrowUp);
 export const IconStop = bold(Stop);
@@ -59,5 +57,49 @@ export const IconBolt = bold(Bolt);
 export const IconDiff = bold(Pen2);
 export const IconSun = bold(Sun);
 export const IconMoon = bold(Moon);
-export const IconClose = bold(CloseCircle);
 export const IconExpand = bold(MaximizeSquareMinimalistic);
+
+// Plain, hairline glyphs (no circle background, no Bold weight). These are
+// the canonical add / close / send / etc. — call sites just use IconPlus and
+// IconClose; the *Slim aliases exist for places that want to be explicit.
+type SlimProps = { size?: number | string; className?: string; title?: string };
+
+const slimSvgProps = (size: number | string, className?: string, title?: string) => ({
+  xmlns: "http://www.w3.org/2000/svg",
+  width: size,
+  height: size,
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.5,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  className,
+  "aria-hidden": title ? undefined : true,
+  role: title ? "img" : undefined,
+});
+
+export const IconPlus = ({ size = 14, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+);
+
+export const IconClose = ({ size = 14, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <path d="M6 6l12 12M18 6L6 18" />
+  </svg>
+);
+
+export const IconArrowUpSlim = ({ size = 16, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <path d="M12 19V5M6 11l6-6 6 6" />
+  </svg>
+);
+
+// Aliases — preferred for places that want to be explicit about the slim look.
+export const IconPlusSlim = IconPlus;
+export const IconCloseSlim = IconClose;

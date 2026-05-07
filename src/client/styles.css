@@ -32,6 +32,26 @@ button, input, textarea, select { font: inherit; }
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
   --shadow-soft: 0 12px 32px rgb(15 23 42 / 0.12);
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Code-block palette — borrowed from GitHub Light. The `--code-bg` is the
+     surface behind highlighted source; token colors below feed `.hljs-*`. */
+  --code-bg: oklch(0.985 0.003 95);
+  --hljs-fg: #24292e;
+  --hljs-comment: #6a737d;
+  --hljs-keyword: #d73a49;
+  --hljs-string: #032f62;
+  --hljs-number: #005cc5;
+  --hljs-function: #6f42c1;
+  --hljs-variable: #e36209;
+  --hljs-attr: #005cc5;
+  --hljs-built-in: #005cc5;
+  --hljs-tag: #22863a;
+  --hljs-meta: #6a737d;
+  --hljs-section: #6f42c1;
+  --hljs-deletion-fg: #b31d28;
+  --hljs-deletion-bg: #ffeef0;
+  --hljs-addition-fg: #22863a;
+  --hljs-addition-bg: #f0fff4;
 }
 body.dark {
   --surface: oklch(0.16 0.005 270);
@@ -44,7 +64,44 @@ body.dark {
   --hairline: oklch(0.28 0.006 270);
   --hairline-strong: oklch(0.34 0.007 270);
   --accent: oklch(0.72 0.18 270);
+
+  /* GitHub Dark token colors. */
+  --code-bg: oklch(0.20 0.006 270);
+  --hljs-fg: #c9d1d9;
+  --hljs-comment: #8b949e;
+  --hljs-keyword: #ff7b72;
+  --hljs-string: #a5d6ff;
+  --hljs-number: #79c0ff;
+  --hljs-function: #d2a8ff;
+  --hljs-variable: #ffa657;
+  --hljs-attr: #79c0ff;
+  --hljs-built-in: #79c0ff;
+  --hljs-tag: #7ee787;
+  --hljs-meta: #8b949e;
+  --hljs-section: #d2a8ff;
+  --hljs-deletion-fg: #ffdcd7;
+  --hljs-deletion-bg: oklch(from #67060c l c h / 0.5);
+  --hljs-addition-fg: #aff5b4;
+  --hljs-addition-bg: oklch(from #033a16 l c h / 0.5);
 }
+
+/* highlight.js tokens — single rule set driven by the variables above so
+   light/dark theming flows automatically with `body.dark`. Mappings reflect
+   the most-used hljs scopes; rare ones fall back to --hljs-fg. */
+.hljs { color: var(--hljs-fg); background: transparent; }
+.hljs-comment, .hljs-quote { color: var(--hljs-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag, .hljs-type { color: var(--hljs-keyword); }
+.hljs-string, .hljs-attr, .hljs-attribute, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-regexp { color: var(--hljs-string); }
+.hljs-number, .hljs-meta-string { color: var(--hljs-number); }
+.hljs-meta, .hljs-meta .hljs-keyword { color: var(--hljs-meta); }
+.hljs-title, .hljs-title.class_, .hljs-title.function_, .hljs-section, .hljs-selector-id, .hljs-selector-class { color: var(--hljs-function); }
+.hljs-variable, .hljs-template-variable, .hljs-name { color: var(--hljs-variable); }
+.hljs-built_in, .hljs-builtin-name, .hljs-tag .hljs-attr { color: var(--hljs-built-in); }
+.hljs-tag, .hljs-tag .hljs-name { color: var(--hljs-tag); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+.hljs-deletion { color: var(--hljs-deletion-fg); background: var(--hljs-deletion-bg); }
+.hljs-addition { color: var(--hljs-addition-fg); background: var(--hljs-addition-bg); }
 
 /* ------- Shell ------- */
 .shell {
@@ -159,14 +216,6 @@ body.dark {
   padding: 7px 12px;
   cursor: pointer;
 }
-.heroDot {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  display: grid; place-items: center;
-  background: oklch(from var(--accent) l c h / 0.12);
-  color: var(--accent);
-  margin-bottom: 14px;
-}
 .empty h1 {
   font-size: 28px;
   line-height: 1.1;
@@ -182,23 +231,6 @@ body.dark {
   font-size: 14px;
   line-height: 1.6;
 }
-.suggestions { display: flex; flex-wrap: wrap; gap: 6px; }
-.suggestions button {
-  border: 1px solid var(--hairline);
-  background: transparent;
-  color: var(--ink-soft);
-  border-radius: 999px;
-  padding: 6px 12px;
-  font-size: 12.5px;
-  cursor: pointer;
-  transition: all 0.18s var(--ease);
-}
-.suggestions button:hover {
-  border-color: var(--hairline-strong);
-  background: var(--paper);
-  transform: translateY(-1px);
-}
-
 /* ------- Messages ------- */
 .msg { margin-bottom: 28px; }
 .msg.user {
@@ -794,18 +826,56 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   color: var(--muted);
   font-style: italic;
 }
-.answer .md-code {
-  background: var(--paper);
+/* Code block chrome: small header with the detected language and a copy
+   button, then the highlighted source. The header lives outside the
+   horizontally-scrolling <pre> so it stays put when long lines overflow. */
+.answer .md-codeBlock {
+  background: var(--code-bg);
   border: 1px solid var(--hairline);
   border-radius: 10px;
-  padding: 12px 14px;
   margin: 0 0 14px;
+  overflow: hidden;
+}
+.answer .md-codeBlock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+  background: oklch(from var(--ink) l c h / 0.025);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.answer .md-codeBlock-lang { line-height: 1; }
+.answer .md-codeBlock-copy {
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font: inherit;
+  letter-spacing: 0.04em;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.answer .md-codeBlock-copy:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink-soft); }
+.answer .md-codeBlock-copy.copied { color: var(--ok); }
+.answer .md-code {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 12px 14px;
+  margin: 0;
   font: 12.5px/1.65 var(--mono);
   color: var(--ink-soft);
   overflow-x: auto;
   white-space: pre;
 }
-.answer .md-code code { background: transparent; border: 0; padding: 0; font-size: inherit; }
+.answer .md-code code { background: transparent; border: 0; padding: 0; font-size: inherit; display: block; }
+.answer .md-code .hljs { background: transparent; padding: 0; color: inherit; }
 .answer .md-table-wrap {
   margin: 0 0 16px;
   overflow-x: auto;
@@ -895,12 +965,13 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   place-items: center;
   cursor: pointer;
   flex: 0 0 auto;
+  background: transparent;
+  color: var(--muted);
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
 }
-.add { background: transparent; color: var(--muted); }
-.add:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
-.send { background: var(--ink); color: var(--surface); }
-.send:hover { transform: scale(1.04); }
-.send.stop { background: var(--ink); color: var(--surface); }
+.add:hover, .send:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+.send.stop { color: var(--ink); }
+.send.stop:hover { background: oklch(from var(--ink) l c h / 0.08); }
 
 .metaBar {
   display: flex;
@@ -925,6 +996,25 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   background: oklch(from var(--ink) l c h / 0.045);
   color: var(--ink-soft);
 }
+/* Model picker can grow large with long names; cap it so the bar stays tidy
+   and let the underlying native dropdown still expose the full list. */
+.metaBar-model {
+  max-width: 200px;
+  text-overflow: ellipsis;
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 14px;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 8px) 50%, calc(100% - 4px) 50%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+/* The reasoning pill cycles on click — give it a subtle pill outline so
+   it reads as a button rather than a label. */
+.metaBar-thinking {
+  border: 1px solid var(--hairline) !important;
+}
+.metaBar-thinking:hover { border-color: var(--hairline-strong) !important; }
 .status { display: inline-flex; align-items: center; gap: 6px; }
 .status::before {
   content: '';
@@ -952,19 +1042,6 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   background: oklch(from var(--accent) l c h / 0.2);
   z-index: 0;
 }
-.errorToast {
-  position: absolute;
-  left: 32px;
-  right: 32px;
-  bottom: 92px;
-  background: oklch(from var(--bad) l c h / 0.12);
-  color: var(--bad);
-  border: 1px solid oklch(from var(--bad) l c h / 0.25);
-  border-radius: 12px;
-  padding: 9px 12px;
-  font-size: 12.5px;
-}
-
 /* =========================================================
    SIDEBARS
    ========================================================= */
@@ -1123,7 +1200,9 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   font-weight: 500;
   letter-spacing: -0.005em;
   color: var(--muted);
-  padding: 6px 4px;
+  /* Match `.sb-ws-head` horizontal padding so the `+` sits on the same right
+     edge as the workspace count badge below it. */
+  padding: 6px 6px;
   margin-top: 2px;
   display: flex;
   align-items: center;
@@ -1134,7 +1213,10 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border: 0; background: transparent;
   color: var(--faint);
   cursor: pointer;
-  padding: 2px 4px;
+  /* Inset matches `.sb-ws-count`'s visual position; keep a small clickable
+     hit area without pushing past the row's right edge. */
+  padding: 2px;
+  margin: -2px -2px -2px 0;
   font-size: 11px;
   border-radius: 4px;
   display: inline-flex; align-items: center; gap: 4px;
@@ -1146,6 +1228,38 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   display: flex;
   flex-direction: column;
 }
+/* Hover-reveal pattern mirroring `.sb-conv-row` so workspaces gain a small ×
+   to remove them from the sidebar. The row wraps the toggle button + the
+   delete button so we can position the latter absolutely on the right. */
+.sb-ws-row {
+  position: relative;
+}
+.sb-ws-del {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translate(6px, -50%);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  padding: 3px;
+  cursor: pointer;
+  color: var(--faint);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s var(--ease), transform 0.18s var(--ease), background 0.15s var(--ease), color 0.15s var(--ease);
+  display: inline-flex;
+}
+.sb-ws-row:hover .sb-ws-del {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(0, -50%);
+}
+/* Hide the count badge on hover so the × can take its slot without overlap. */
+.sb-ws-row:hover .sb-ws-count { opacity: 0; }
+.sb-ws-count { transition: opacity 0.18s var(--ease); }
+.sb-ws-del:hover { background: oklch(from var(--bad) l c h / 0.12); color: var(--bad); }
+
 .sb-ws-head {
   display: flex;
   align-items: center;
@@ -1201,11 +1315,22 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   display: flex;
   flex-direction: column;
 }
+.sb-conv-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+}
+.sb-conv-row:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.sb-conv-row.active { background: oklch(from var(--ink) l c h / 0.06); color: var(--ink); }
+body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 .sb-conv {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
   background: transparent;
   border: 0;
   border-radius: 4px;
@@ -1214,12 +1339,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   font-size: 11.5px;
   text-align: left;
   cursor: pointer;
-  color: var(--ink-soft);
-  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+  color: inherit;
 }
-.sb-conv:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
-.sb-conv.active { background: oklch(from var(--ink) l c h / 0.06); color: var(--ink); }
-body.dark .sb-conv.active { background: oklch(0.26 0.006 270); }
 .sb-conv-title {
   flex: 1;
   min-width: 0;
@@ -1235,8 +1356,49 @@ body.dark .sb-conv.active { background: oklch(0.26 0.006 270); }
   opacity: 0;
   transition: opacity 0.18s var(--ease);
 }
-.sb-conv:hover .sb-conv-time,
-.sb-conv.active .sb-conv-time { opacity: 1; }
+.sb-conv-row:hover .sb-conv-time,
+.sb-conv-row.active .sb-conv-time { opacity: 1; }
+/* Delete affordance: hidden until row is hovered, then slides in. The button
+   overlays the timestamp because they occupy the same right slot — when the
+   row is hovered we want delete to win since it's the actionable element. */
+.sb-conv-del {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translate(6px, -50%);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  padding: 3px;
+  cursor: pointer;
+  color: var(--faint);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s var(--ease), transform 0.18s var(--ease), background 0.15s var(--ease), color 0.15s var(--ease);
+  display: inline-flex;
+}
+.sb-conv-row:hover .sb-conv-del {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(0, -50%);
+}
+.sb-conv-row:hover .sb-conv-time { opacity: 0; }
+.sb-conv-del:hover { background: oklch(from var(--bad) l c h / 0.12); color: var(--bad); }
+
+.sb-show-more {
+  align-self: flex-start;
+  margin: 2px 0 4px 6px;
+  padding: 3px 6px;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--faint);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.sb-show-more:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink-soft); }
 .sb-empty {
   font-size: 11px;
   color: var(--faint);
@@ -1363,26 +1525,6 @@ body.dark .sb-conv.active { background: oklch(0.26 0.006 270); }
 .queueActions button:hover { background: var(--paper); border-color: var(--hairline-strong); color: var(--ink); }
 .queueActions span { margin-left: auto; }
 
-.noticeStack {
-  position: absolute;
-  left: 32px;
-  right: 32px;
-  bottom: 100px;
-  display: grid;
-  gap: 6px;
-  pointer-events: none;
-}
-.notice {
-  background: var(--card);
-  border: 1px solid var(--hairline);
-  border-radius: 12px;
-  padding: 8px 11px;
-  color: var(--ink-soft);
-  font-size: 12.5px;
-  box-shadow: 0 12px 40px oklch(0 0 0 / 0.07);
-}
-.notice.error { border-color: oklch(from var(--bad) l c h / 0.25); color: var(--bad); }
-.notice.warning { border-color: oklch(from var(--warn) l c h / 0.3); color: oklch(0.48 0.12 70); }
 
 .modalShade {
   position: fixed;
@@ -1443,6 +1585,101 @@ body.dark .sb-conv.active { background: oklch(0.26 0.006 270); }
 .dialogList button:hover, .dialogActions button:hover { background: var(--paper); color: var(--ink); }
 .dialogActions { display: flex; justify-content: flex-end; gap: 8px; }
 .dialogActions .primary { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+.dialogActions .danger {
+  background: oklch(from var(--bad) l c h / 0.08);
+  border-color: oklch(from var(--bad) l c h / 0.4);
+  color: var(--bad);
+}
+.dialogActions .danger:hover { background: oklch(from var(--bad) l c h / 0.16); color: var(--bad); }
+
+/* Settings dialog */
+.settingsDialog { width: min(520px, 100%); max-height: min(calc(100vh - 40px), 720px); overflow-y: auto; }
+.settingsDialog .dialogHeader {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.settingsDialog .iconBtn {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  color: var(--muted);
+}
+.settingsDialog .iconBtn:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+/* Each section is itself a 2-col grid so every label aligns to the widest
+   one in that section, and selects fill whatever's left. `display: contents`
+   on the row lets its label + control participate directly in the parent
+   grid without an extra wrapper layer. */
+.settingsSection {
+  display: grid;
+  grid-template-columns: max-content minmax(180px, 1fr);
+  column-gap: 14px;
+  row-gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--hairline);
+}
+.settingsSection:first-of-type { border-top: 0; padding-top: 4px; }
+.settingsSection h3,
+.settingsSection > .settingsHint {
+  grid-column: 1 / -1;
+}
+.settingsSection h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.settingsHint {
+  margin: -2px 0 4px;
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.45;
+}
+.settingsRow { display: contents; }
+.settingsLabel {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  align-self: center;
+  /* Long-but-still-on-one-line labels stay readable; very long copy will
+     wrap into a second line rather than expand the column further. */
+  white-space: normal;
+  line-height: 1.3;
+}
+.settingsRow > select,
+.settingsRow > .settingsToggle { align-self: center; }
+.settingsRow select {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  outline: 0;
+  transition: border-color 0.15s var(--ease);
+}
+.settingsRow select:hover { border-color: var(--hairline-strong); }
+.settingsRow select:focus { border-color: var(--ink-soft); }
+.settingsRow select:disabled { opacity: 0.6; cursor: not-allowed; }
+.settingsToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  justify-self: start;
+  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+.settingsToggle:hover { background: var(--card); border-color: var(--hairline-strong); }
 
 /* ------- Animations ------- */
 .fadeUp {
