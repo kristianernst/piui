@@ -103,6 +103,40 @@ body.dark {
 .hljs-deletion { color: var(--hljs-deletion-fg); background: var(--hljs-deletion-bg); }
 .hljs-addition { color: var(--hljs-addition-fg); background: var(--hljs-addition-bg); }
 
+/* ------- Scrollbars ------- */
+/* Apply to every scrollable element so we don't get bright OS-default
+   scrollbars on dark backgrounds. The thumb tracks the `--hairline-strong`
+   token, which already flips with `body.dark`, so this stays in sync with
+   the rest of the theme. Per-component rules (.thread, .sb-scroll, etc.)
+   can still override — Firefox's `scrollbar-width: none` and the webkit
+   `display:none` on `.thread::-webkit-scrollbar` continue to win there. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--hairline-strong);
+  border-radius: 6px;
+  /* Inset border carved from the surrounding surface lets the thumb feel
+     slimmer than 10px without sacrificing a comfortable click target. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* ------- Shell ------- */
 .shell {
   display: grid;
@@ -137,14 +171,44 @@ body.dark {
 }
 .topbar .titleBlock {
   justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-size: 12.5px;
   color: var(--ink-soft);
   font-weight: 450;
   letter-spacing: -0.005em;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
   max-width: 100%;
+}
+.topbar .titleBlock .titleText {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Per-session agent identity. The canvas is sized via inline style so the
+   particle layout matches; this just adds the round mask and a quiet halo so
+   the orb separates from neighboring text without competing with it. */
+/* Each agent orb is a 22×22 pixel-art particle sim displayed at ~14–18 CSS px.
+   The wrapping span clips the canvas to a circle and provides the dark
+   palette[0] base color visible at the rim; the canvas inside fills 100% and
+   uses pixelated rendering so the small grid stays chunky on retina instead
+   of bilinear-blurring into a smudge. */
+.orb {
+  display: inline-block;
+  vertical-align: middle;
+  border-radius: 50%;
+  overflow: hidden;
+  line-height: 0;
+  flex-shrink: 0;
+}
+.orb-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  image-rendering: pixelated;
 }
 .topbar .topbar-side { display: flex; align-items: center; gap: 4px; min-width: 24px; }
 .topbar .topbar-side.right { justify-content: flex-end; }
@@ -416,12 +480,12 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.tool .toolErr {
-  font: 10px var(--mono);
-  color: var(--bad);
-  letter-spacing: 0.04em;
-  margin-left: 2px;
-}
+/* Errored tool calls — instead of appending a separate "error" badge, recolor
+   the icon + tool name in the error tone so the whole row reads as failed. */
+.tool.error .toolHead svg,
+.tool.error .toolHead:hover svg,
+.tool.error.open .toolHead svg { color: var(--bad); }
+.tool.error .toolName { color: var(--bad); }
 .tool.running > summary { border-color: oklch(from var(--accent) l c h / 0.45); }
 .tool .toolPulse {
   width: 6px; height: 6px;
@@ -486,6 +550,51 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   background: transparent;
   border: 0;
 }
+/* Edit-tool diff preview — unified diff rendered with add/del/hunk coloring,
+   capped vertically to keep the chat scrollable; "show all N lines" expands
+   to a hard cap before truncation. */
+.diffPanel { padding: 0; }
+.diffBody {
+  margin: 0;
+  padding: 8px 0;
+  background: var(--code-bg);
+  font: 12px/1.5 var(--mono);
+  color: var(--hljs-fg);
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 4;
+}
+.diffLine {
+  padding: 0 12px;
+  min-height: 1.5em;
+  white-space: pre;
+}
+.diffLine.diffMeta { color: var(--faint); }
+.diffLine.diffHunk { color: var(--hljs-section); background: oklch(from var(--ink) l c h / 0.03); }
+.diffLine.diffAdd { color: var(--hljs-addition-fg); background: var(--hljs-addition-bg); }
+.diffLine.diffDel { color: var(--hljs-deletion-fg); background: var(--hljs-deletion-bg); }
+.diffLine.diffCtx { color: var(--ink-soft); }
+.diffToggle {
+  width: 100%;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  padding: 6px 12px;
+  font: 11px var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+}
+.diffToggle:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.diffNote {
+  padding: 6px 12px;
+  border-top: 1px solid var(--hairline);
+  font: 11px var(--mono);
+  color: var(--faint);
+}
+
 .analyticsPanel {
   display: grid;
   gap: 12px;
@@ -869,7 +978,6 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   background: oklch(from var(--ink) l c h / 0.025);
   font: 10.5px var(--mono);
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--faint);
 }
 .answer .md-codeBlock-lang { line-height: 1; }
@@ -981,7 +1089,6 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .mention-head {
   font: 10px var(--mono);
   letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: var(--faint);
   padding: 4px 8px 6px;
 }
@@ -1028,7 +1135,6 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   font: 10px var(--mono);
   color: var(--faint);
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .composer:focus-within {
   border-color: var(--hairline-strong);
@@ -1726,7 +1832,6 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--muted);
 }
 .settingsHint {
@@ -1788,6 +1893,177 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 }
 @keyframes fadeUp { to { opacity: 1; transform: translateY(0); filter: blur(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ------- Extension dock ------- */
+/* The dock visually morphs into the composer: shared border-color, no margin
+   between them, and the dock takes the composer's outer radius on its top
+   corners while the composer keeps its bottom corners. The end result is a
+   single rounded shape with the dock as a header band. */
+.extDock {
+  margin-bottom: 0;
+  border: 1px solid var(--hairline);
+  border-bottom: 0;
+  border-radius: 22px 22px 0 0;
+  background: var(--card);
+  overflow: hidden;
+  transition: border-color 0.18s var(--ease), box-shadow 0.18s var(--ease);
+}
+.extDock.hasRun { border-color: var(--hairline-strong); }
+.extDock.open { /* no extra shadow — the composer-attached look is calmer without it */ }
+/* Composer mirrors the merge from its side: flat top corners + no top border
+   so the dock's bottom edge serves as the divider. */
+.composerWrap:has(.extDock.hasRun) .composer {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.extDock-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: var(--ink-soft);
+  text-align: left;
+  gap: 12px;
+}
+.extDock-bar:hover { background: oklch(from var(--ink) l c h / 0.025); }
+.extDock-leading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.extDock-trailing {
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  transition: transform 0.18s var(--ease);
+}
+.extDock.open .extDock-trailing { transform: rotate(180deg); }
+.extDock-title {
+  font: 12px var(--mono);
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.extDock-title.muted { color: var(--muted); font-family: 'Inter', sans-serif; font-size: 12.5px; letter-spacing: 0; }
+.extDock-msg {
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* Extension overlay — `ctx.ui.custom(...)` surface. Portaled to <body> with
+   fixed positioning so it covers the entire viewport edge-to-edge — sidebars
+   and chat disappear under it, which is what extensions invoking a "custom"
+   surface (autoresearch's fullscreen dashboard, future debugger overlays,
+   etc.) expect from a TUI-style modal.
+
+   The chrome is deliberately minimal: a single solid `--surface` background
+   and a generic `esc to close` hint. We don't add a card, border, or
+   shadow — the extension's own theme.fg / box-drawing output supplies all
+   the visual structure, so this surface works the same for any extension
+   without piui-side per-extension styling. */
+.extOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 32px 32px;
+  overflow: hidden;
+}
+.extOverlay-lines {
+  margin: 0;
+  flex: 1;
+  overflow: auto;
+  font: 12.5px var(--mono);
+  line-height: 1.4;
+  color: var(--ink);
+  white-space: pre;
+  tab-size: 4;
+}
+.extOverlay-hint {
+  align-self: flex-end;
+  margin-top: 12px;
+  font: 10px var(--mono);
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+
+/* Live view — sits directly under the bar inside the dock card. No additional
+   border (dock card already provides one) and minimal padding so a single-line
+   widget like autoresearch's collapsed status doesn't take half the screen. */
+.extLive {
+  border-top: 1px solid var(--hairline);
+  padding: 6px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.extLive-empty {
+  color: var(--faint);
+  font-size: 12.5px;
+  padding: 8px 0;
+  text-align: center;
+}
+.extLive-status {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font: 12px var(--mono);
+  color: var(--ink-soft);
+}
+.extLive-status-row { display: flex; gap: 10px; align-items: baseline; }
+.extLive-status-key {
+  color: var(--faint);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  flex: 0 0 auto;
+}
+.extLive-status-val { word-break: break-word; white-space: pre-wrap; }
+/* Slot — one rendered TUI surface (header / footer / widget). The lines come
+   from the extension's own Component.render(width), with ANSI styling already
+   baked in by the theme; we just lay them out as monospaced text. We
+   deliberately drop the inner card-with-border treatment so single-slot,
+   single-line widgets feel inline rather than nested. */
+.extSlot { display: flex; flex-direction: column; gap: 2px; }
+.extSlot-label {
+  font: 9.5px var(--mono);
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+.extSlot-lines {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  overflow-x: auto;
+  font: 12.5px var(--mono);
+  line-height: 1.4;
+  color: var(--ink);
+  white-space: pre;
+  tab-size: 4;
+}
+.extSlot-line {
+  white-space: pre;
+  min-height: 1.4em;
+}
+.extSlot-empty {
+  color: var(--faint);
+  font-style: italic;
+}
 
 @media (max-width: 900px) {
   .sidebar.right { display: none; }

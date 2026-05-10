@@ -95,6 +95,9 @@ export type PiPacket =
   | { type: "tree"; data: { entries: PiTreeEntry[] } }
   | { type: "extension_ui_request"; request: ExtensionUiRequest }
   | { type: "extension_ui_status"; data: { key: string; text?: string; value?: unknown } }
+  | { type: "extension_ui_widget"; data: { slot: string; lines?: string[]; removed?: true } }
+  | { type: "extension_reset" }
+  | { type: "shortcuts"; data: { shortcuts: Array<{ key: string; description?: string }> } }
   | { type: "notification"; data: { message: string; level?: "info" | "warning" | "error" } }
   | { type: "event"; event: AgentEvent }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
@@ -143,6 +146,14 @@ export type ToolResultDetails =
       schemas: string[];
       tables: Array<{ schema: string; name: string; type: string; rowEstimate?: number | null }>;
       columns: Array<{ schema: string; table: string; name: string; dataType: string; nullable: boolean }>;
+    }
+  | {
+      // Edit-tool result. Pi doesn't tag these with a `kind`, so the client
+      // synthesizes one by checking for the `diff` field (a unified diff
+      // string). We surface a syntax-highlighted, length-capped preview.
+      kind: "edit_diff";
+      diff: string;
+      firstChangedLine?: number;
     };
 
 export type AgentMessage =

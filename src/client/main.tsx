@@ -1,4 +1,4 @@
-import React, { Component, lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { Toaster, toast } from "sonner";
@@ -40,6 +40,7 @@ import {
   type ToolResultDetails,
   type Workspace,
 } from "./piSocket";
+import { parseAnsi, styleToCss } from "./ansi";
 import "./styles.css";
 import "./stage3.css";
 
@@ -70,6 +71,20 @@ type UiMessage = {
   streaming?: boolean;
   startedAt?: number;    // assistant only — for duration metadata
   endedAt?: number;
+};
+
+// State an extension run paints into the composer-header dock. Each "slot"
+// corresponds to a Pi extension UI surface — `setHeader`, `setFooter`, or a
+// `setWidget(key, …)` call. Server-side, a synthetic TUI hosts the extension's
+// Component factory and ships the rendered ANSI lines for each slot here.
+type ExtensionSlot = { slot: string; lines: string[] };
+type ExtensionRun = {
+  title?: string;
+  workingMessage?: string;
+  workingVisible: boolean;
+  hiddenThinkingLabel?: string;
+  status: Record<string, string>;
+  slots: ExtensionSlot[]; // ordered by first-seen insertion
 };
 
 type AppErrorBoundaryState = { error?: Error };
@@ -151,9 +166,7 @@ function hydrateToolOutputs(history: AgentMessage[], ui: UiMessage[]): UiMessage
     if (message.role === "toolResult") {
       const id = String((message as { toolCallId?: unknown }).toolCallId ?? "");
       if (!id) continue;
-      const details = isToolResultDetails((message as { details?: unknown }).details)
-        ? (message as { details: ToolResultDetails }).details
-        : undefined;
+      const details = coerceToolResultDetails((message as { details?: unknown }).details);
       outputs.set(id, { text: contentToText(message.content), details, isError: !!message.isError });
     }
   }
@@ -171,10 +184,25 @@ function hydrateToolOutputs(history: AgentMessage[], ui: UiMessage[]): UiMessage
   });
 }
 
-function isToolResultDetails(value: unknown): value is ToolResultDetails {
-  if (!value || typeof value !== "object") return false;
-  const kind = (value as { kind?: unknown }).kind;
-  return kind === "sql_result" || kind === "analytics_visualization" || kind === "database_schema";
+// Coerce raw Pi tool-result details into our typed union. Most Pi tools tag
+// their details with a `kind` we recognize; the edit tool returns an untagged
+// `{ diff: string, firstChangedLine? }`, so we sniff that shape and stamp a
+// synthetic kind so the renderer can dispatch on it.
+function coerceToolResultDetails(value: unknown): ToolResultDetails | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const obj = value as Record<string, unknown>;
+  const kind = obj.kind;
+  if (kind === "sql_result" || kind === "analytics_visualization" || kind === "database_schema") {
+    return value as ToolResultDetails;
+  }
+  if (typeof obj.diff === "string") {
+    return {
+      kind: "edit_diff",
+      diff: obj.diff,
+      firstChangedLine: typeof obj.firstChangedLine === "number" ? obj.firstChangedLine : undefined,
+    };
+  }
+  return undefined;
 }
 
 function App() {
@@ -193,6 +221,8 @@ function App() {
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
   const [draft, setDraft] = useState("");
   const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
+  const [extension, setExtension] = useState<ExtensionRun | null>(null);
+  const [shortcuts, setShortcuts] = useState<Array<{ key: string; description?: string }>>([]);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   // Autoscroll is "sticky" — we follow new content to the bottom unless the
@@ -226,6 +256,10 @@ function App() {
       if (packet.type === "files") setFiles(packet.data.files);
       if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
       if (packet.type === "extension_ui_request") setUiRequest(packet.request);
+      if (packet.type === "extension_ui_status") applyExtensionStatus(packet.data);
+      if (packet.type === "extension_ui_widget") applyExtensionWidget(packet.data);
+      if (packet.type === "extension_reset") setExtension(null);
+      if (packet.type === "shortcuts") setShortcuts(packet.data.shortcuts);
       if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
       if (packet.type === "event") applyEvent(packet.event);
       if (packet.type === "response" && !packet.success) {
@@ -243,6 +277,47 @@ function App() {
       el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     }
   }, [messages]);
+
+  // Forward registered Pi extension shortcuts AND raw input for focused
+  // overlays. An overlay (e.g. autoresearch's fullscreen dashboard via
+  // ctx.ui.custom) wants every keystroke encoded as a terminal sequence and
+  // sent to its `handleInput`. When no overlay is active we fall back to the
+  // registered-shortcut path so global combos still fire.
+  const overlayActive = !!extension?.slots.some((s) => s.slot === "overlay");
+  useEffect(() => {
+    if (shortcuts.length === 0 && !overlayActive) return;
+    const known = new Set(shortcuts.map((s) => s.key));
+    const onKeyDown = (e: KeyboardEvent) => {
+      // When an extension overlay is focused, route everything to the
+      // server-side component — including Esc/arrows/etc. that the overlay
+      // needs to navigate or close itself.
+      if (overlayActive) {
+        // Still let registered shortcuts run; the user may want to close the
+        // overlay via the same key combo that opened it.
+        const key = browserEventToKeyId(e);
+        if (key && known.has(key)) {
+          e.preventDefault();
+          e.stopPropagation();
+          socketRef.current?.send({ type: "trigger_shortcut", key });
+          return;
+        }
+        const data = browserEventToTerminalInput(e);
+        if (data) {
+          e.preventDefault();
+          e.stopPropagation();
+          socketRef.current?.send({ type: "extension_input", data });
+        }
+        return;
+      }
+      const key = browserEventToKeyId(e);
+      if (!key || !known.has(key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      socketRef.current?.send({ type: "trigger_shortcut", key });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [shortcuts, overlayActive]);
 
   // Refresh `@`-mention candidates whenever the active workspace changes.
   // We send a fresh request rather than caching per-workspace because file
@@ -265,6 +340,51 @@ function App() {
     else if (level === "warning") toast.warning(message);
     else toast(message);
   }
+
+  function applyExtensionStatus(data: { key: string; text?: string; value?: unknown }) {
+    // A few keys are routed straight at the composer textarea — the extension
+    // is asking us to mutate the user's draft, not the dock surface.
+    if (data.key === "pasteToEditor" && typeof data.text === "string") {
+      setDraft((d) => d + data.text!);
+      return;
+    }
+    if (data.key === "setEditorText" && typeof data.text === "string") {
+      setDraft(data.text!);
+      return;
+    }
+    setExtension((prev) => {
+      const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
+      const next: ExtensionRun = { ...base, status: { ...base.status }, slots: base.slots.slice() };
+      if (data.key === "title") next.title = data.text;
+      else if (data.key === "workingMessage") next.workingMessage = data.text;
+      else if (data.key === "workingVisible") next.workingVisible = !!data.value;
+      else if (data.key === "hiddenThinkingLabel") next.hiddenThinkingLabel = data.text;
+      else if (data.key === "workingIndicator") { /* reserved — no-op for v1 */ }
+      else if (typeof data.text === "string") {
+        next.status[data.key] = data.text;
+      } else if (data.text === undefined && data.value === undefined) {
+        delete next.status[data.key];
+      }
+      return next;
+    });
+  }
+
+  function applyExtensionWidget(data: { slot: string; lines?: string[]; removed?: true }) {
+    setExtension((prev) => {
+      const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
+      const slots = base.slots.slice();
+      const idx = slots.findIndex((s) => s.slot === data.slot);
+      if (data.removed) {
+        if (idx >= 0) slots.splice(idx, 1);
+      } else if (idx >= 0) {
+        slots[idx] = { slot: data.slot, lines: data.lines ?? [] };
+      } else {
+        slots.push({ slot: data.slot, lines: data.lines ?? [] });
+      }
+      return { ...base, status: { ...base.status }, slots };
+    });
+  }
+
 
   function applyEvent(event: AgentEvent) {
     if (event.type === "message_start" && event.message && event.message.role === "user") {
@@ -321,7 +441,7 @@ function App() {
     }
     if ((event.type === "tool_execution_update" || event.type === "tool_execution_end") && event.toolCallId) {
       const output = contentToText(event.result?.content ?? event.partialResult?.content ?? "");
-      const details = event.result?.details;
+      const details = coerceToolResultDetails(event.result?.details);
       const status = event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running";
       setMessages((prev) => updateLastAssistant(prev, (message) => ({
         ...message,
@@ -427,6 +547,7 @@ function App() {
         activeWorkspaceId={activeWorkspaceId}
         sessions={sessions}
         activeSessionId={state?.sessionId}
+        activeIsStreaming={!!state?.isStreaming}
         dark={dark}
         onToggleDark={() => setDark((v) => !v)}
         models={models}
@@ -443,7 +564,10 @@ function App() {
               </button>
             )}
           </div>
-          <div className="titleBlock">{headerTitle}</div>
+          <div className="titleBlock">
+            {state?.sessionId && <AgentOrb seed={state.sessionId} running={!!state?.isStreaming} size={18} />}
+            <span className="titleText">{headerTitle}</span>
+          </div>
           <div className="topbar-side right">
             {!rightOpen && (
               <button className="ghost" onClick={() => setRightOpen(true)} title="Show diffs">
@@ -471,6 +595,7 @@ function App() {
           onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
           resources={resources}
           files={files}
+          extension={extension}
         />
       </main>
       <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} />
@@ -494,6 +619,97 @@ function App() {
   );
 }
 
+function extensionRunHasContent(run: ExtensionRun | null): boolean {
+  if (!run) return false;
+  if (run.workingVisible) return true;
+  if (run.workingMessage) return true;
+  if (run.title) return true;
+  if (run.slots.length) return true;
+  if (Object.keys(run.status).length) return true;
+  return false;
+}
+
+// Encode a browser KeyboardEvent into the raw terminal byte sequence that
+// pi-tui's `matchesKey` recognizes. Used when the user types into a focused
+// extension overlay (e.g. autoresearch's fullscreen dashboard): the overlay's
+// `handleInput` runs server-side and expects standard ANSI escape sequences.
+// We only support what real extensions actually check for — no kitty protocol
+// quirks, no modified arrow keys yet. Returns null when the key isn't worth
+// forwarding (modifier-only keypress, etc.).
+function browserEventToTerminalInput(e: KeyboardEvent): string | null {
+  const k = e.key;
+  if (k === "Control" || k === "Shift" || k === "Alt" || k === "Meta") return null;
+  // Modified printable keys via ctrl+letter map to ASCII control codes
+  // (Ctrl-A = 0x01, etc.). Skip ctrl+letter combos that are registered as
+  // shortcuts elsewhere — the shortcut path already handled them upstream.
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && /^[a-z]$/i.test(k)) {
+    return String.fromCharCode(k.toLowerCase().charCodeAt(0) - 96);
+  }
+  // Named keys → CSI / SS3 / standalone sequences.
+  switch (k) {
+    case "Escape": return "\x1b";
+    case "Enter": return "\r";
+    case "Tab": return e.shiftKey ? "\x1b[Z" : "\t";
+    case "Backspace": return "\x7f";
+    case "Delete": return "\x1b[3~";
+    case "ArrowUp": return "\x1b[A";
+    case "ArrowDown": return "\x1b[B";
+    case "ArrowRight": return "\x1b[C";
+    case "ArrowLeft": return "\x1b[D";
+    case "Home": return "\x1b[H";
+    case "End": return "\x1b[F";
+    case "PageUp": return "\x1b[5~";
+    case "PageDown": return "\x1b[6~";
+    case " ": return " ";
+  }
+  // Printable single character (incl. shifted variants — autoresearch reads
+  // raw "k"/"K"/"j"/"g"/"G"/"q" directly).
+  if (k.length === 1) return k;
+  return null;
+}
+
+// Map a browser KeyboardEvent to Pi's KeyId string (e.g. "ctrl+shift+t").
+// Modifiers are emitted in the same canonical order the server uses, so a
+// direct string compare against the registered-shortcut list works.
+function browserEventToKeyId(e: KeyboardEvent): string | null {
+  const raw = e.key;
+  // Modifier-only keypress events (Shift, Control alone) — ignore.
+  if (raw === "Control" || raw === "Shift" || raw === "Alt" || raw === "Meta") return null;
+  const SPECIAL: Record<string, string> = {
+    Escape: "escape", Enter: "enter", Tab: "tab", " ": "space",
+    Backspace: "backspace", Delete: "delete", Insert: "insert", Clear: "clear",
+    Home: "home", End: "end", PageUp: "pageUp", PageDown: "pageDown",
+    ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  };
+  for (let i = 1; i <= 12; i++) SPECIAL[`F${i}`] = `f${i}`;
+  // Letters: e.key gives the *typed* character, which is uppercase under
+  // shift. Pi's KeyId vocabulary uses the unshifted lowercase form, so a
+  // plain shift adjustment isn't enough — fall back to e.code (KeyT → "t")
+  // when the shift key is held.
+  let base: string;
+  if (SPECIAL[raw]) base = SPECIAL[raw];
+  else if (e.shiftKey && /^Key[A-Z]$/.test(e.code)) base = e.code.slice(3).toLowerCase();
+  else if (e.shiftKey && /^Digit\d$/.test(e.code)) base = e.code.slice(5);
+  else base = raw.toLowerCase();
+  const mods: string[] = [];
+  if (e.ctrlKey) mods.push("ctrl");
+  if (e.shiftKey) mods.push("shift");
+  if (e.altKey) mods.push("alt");
+  if (e.metaKey) mods.push("super");
+  // Don't intercept naked alphanumerics — the user is just typing.
+  if (mods.length === 0 && /^[a-z0-9]$/.test(base)) return null;
+  return [...mods, base].join("+");
+}
+
+// Header first, footer last, widgets in insertion order between them — matches
+// what the Pi TUI does when laying out a session.
+function orderedSlots(slots: ExtensionSlot[]): ExtensionSlot[] {
+  const head = slots.filter((s) => s.slot === "header");
+  const foot = slots.filter((s) => s.slot === "footer");
+  const body = slots.filter((s) => s.slot !== "header" && s.slot !== "footer");
+  return [...head, ...body, ...foot];
+}
+
 function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage) => UiMessage): UiMessage[] {
   const next = [...messages];
   let index = next.length - 1;
@@ -506,6 +722,319 @@ function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage
 // Pi logo from https://pi.dev/logo.svg, inlined and re-fitted to use
 // `currentColor` so it picks up the heading's color (black in light mode,
 // near-white in dark mode) without a second asset round-trip.
+// Each Pi session gets a chunky, alive pixel orb — a tiny self-contained
+// particle simulation rendered into a 22×22 canvas, displayed via
+// `image-rendering: pixelated` for crisp pixel-art edges. Adapted from the
+// design-team prototype shipped in the AI Orb library handoff bundle. The
+// seed (session id) picks a palette + initial particle layout deterministically,
+// so the same conversation always shows the same orb identity; per-frame
+// color morphing + ember sparkles use Math.random for liveness so two parallel
+// orbs from the same seed don't lockstep.
+//
+// Rendering: per-pixel winner-takes-all over the 9 particles' weighted
+// distance fields. Where two particles' weights are close we 4×4 Bayer-dither
+// between them, giving hard pixel-art boundaries instead of a mushy blend.
+// The silhouette is a strict circle (pixels outside the disk are transparent)
+// so the orb is always perfectly round at any size.
+//
+// `running` gates the rAF loop. When false we still render a single static
+// frame so the identity badge is visible — idle orbs cost zero animation
+// cycles. Once piui supports multiple parallel runtimes per tab, each
+// session's `running` bit becomes independent and every sidebar row can
+// animate on its own schedule.
+
+const ORB_PALETTES: Record<string, string[]> = {
+  ember:  ['#07070a', '#3a0a08', '#9c1a10', '#e84818', '#ffa01c', '#ffe040', '#c8ff3c', '#3cf088', '#a8ffd8'],
+  reef:   ['#03060c', '#08203c', '#0e60a8', '#1cb4e8', '#54f0e0', '#a8ffd0', '#fff5b0', '#ffb850', '#ff5030'],
+  cosmic: ['#06031a', '#1c0848', '#5418b8', '#a838e8', '#ff48c0', '#ff90a0', '#ffe080', '#a8f0ff', '#ffffff'],
+  forest: ['#020a06', '#082818', '#147028', '#5cc830', '#c8ff48', '#fff5b0', '#f0a020', '#c44010', '#5c0810'],
+  arctic: ['#020812', '#0a2c4c', '#2870a0', '#6cc0e0', '#c4f0f0', '#ffffff', '#e8c4ff', '#a040d8', '#48108c'],
+  toxic:  ['#020806', '#082018', '#0c5c2c', '#2cc848', '#c8ff20', '#ffffff', '#ff48c0', '#a01890', '#380838'],
+};
+const ORB_PALETTE_KEYS = Object.keys(ORB_PALETTES);
+
+// 4×4 Bayer matrix, pre-normalized to [0,1). Used to dither between two
+// competing particles at pixel boundaries — gives hard pixel-art edges
+// instead of bilinear-blended muck.
+const BAYER4 = [
+  [ 0, 8, 2,10],
+  [12, 4,14, 6],
+  [ 3,11, 1, 9],
+  [15, 7,13, 5],
+].map((row) => row.map((v) => (v + 0.5) / 16));
+
+type RGB = [number, number, number];
+
+function hexToRgb(h: string): RGB {
+  const n = parseInt(h.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function lerpRgb(a: RGB, b: RGB, t: number): RGB {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+// Deterministic PRNG seeded from session id — gives stable palette and
+// initial particle layout per session.
+function makeSeededRandom(seed: string): () => number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 0x01000193) >>> 0;
+  return () => {
+    h ^= h << 13; h >>>= 0;
+    h ^= h >>> 17;
+    h ^= h << 5; h >>>= 0;
+    return (h >>> 0) / 0xffffffff;
+  };
+}
+
+type OrbParticle = {
+  baseAng: number; baseRad: number;
+  angSpeed: number;
+  radFreq: number; radAmp: number;
+  wobFreq: number; wobAmp: number;
+  phase: number; phase2: number;
+  r: number; rPhase: number; rFreq: number;
+  from: number; to: number;
+  morph: number; morphDur: number;
+  // runtime
+  x: number; y: number; rNow: number;
+};
+
+type OrbState = {
+  seed: string;
+  particles: OrbParticle[];
+  t: number;
+  colors: RGB[];
+  particleColors: RGB[];
+  bg: RGB;
+  hot: RGB;
+  hot2: RGB;
+  embers: Array<{ x: number; y: number; life: number; hot: boolean }>;
+};
+
+const ORB_GRID = 22;
+const ORB_PARTICLE_COUNT = 9;
+const ORB_CONTRAST = 4;
+const ORB_MORPH_RATE = 1;
+const ORB_EMBER_RATE = 1.2;
+
+function paletteFor(seed: string): string[] {
+  // Run a fresh PRNG (separate stream from particle init) so palette and
+  // particle layouts decorrelate — adjacent seeds don't end up with the
+  // same palette and a near-identical particle field.
+  const rand = makeSeededRandom(seed + ":palette");
+  return ORB_PALETTES[ORB_PALETTE_KEYS[Math.floor(rand() * ORB_PALETTE_KEYS.length)]];
+}
+
+function initOrbState(seed: string, palette: string[]): OrbState {
+  const rand = makeSeededRandom(seed + ":particles");
+  const G = ORB_GRID;
+  const colors = palette.map(hexToRgb);
+  const particleColors = colors.slice(1);
+  const M = particleColors.length;
+  const particles: OrbParticle[] = [];
+  for (let i = 0; i < ORB_PARTICLE_COUNT; i++) {
+    const baseAng = (i / ORB_PARTICLE_COUNT) * Math.PI * 2;
+    const ci = (i + ((rand() * M) | 0)) % M;
+    const ciNext = (ci + 1 + ((rand() * (M - 2)) | 0)) % M;
+    particles.push({
+      baseAng,
+      baseRad: G * (0.20 + rand() * 0.14),
+      angSpeed: 0.18 + rand() * 0.22,
+      radFreq: 0.25 + rand() * 0.35,
+      radAmp: G * (0.06 + rand() * 0.07),
+      wobFreq: 0.4 + rand() * 0.5,
+      wobAmp: G * (0.04 + rand() * 0.06),
+      phase: rand() * Math.PI * 2,
+      phase2: rand() * Math.PI * 2,
+      r: G * (0.20 + rand() * 0.10),
+      rPhase: rand() * Math.PI * 2,
+      rFreq: 0.2 + rand() * 0.3,
+      from: ci, to: ciNext, morph: 0,
+      morphDur: 1.6 + rand() * 1.6,
+      x: G / 2, y: G / 2, rNow: G * 0.22,
+    });
+  }
+  return {
+    seed,
+    particles,
+    t: 0,
+    colors,
+    particleColors,
+    bg: colors[0],
+    hot: colors[colors.length - 1],
+    hot2: colors[colors.length - 2],
+    embers: [],
+  };
+}
+
+function AgentOrb({ seed, running, size = 18 }: { seed: string; running: boolean; size?: number }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stateRef = useRef<OrbState | null>(null);
+
+  const palette = useMemo(() => paletteFor(seed || "default"), [seed]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    if (!stateRef.current || stateRef.current.seed !== (seed || "default")) {
+      stateRef.current = initOrbState(seed || "default", palette);
+    }
+    const G = ORB_GRID;
+    const img = ctx.createImageData(G, G);
+    const data = img.data;
+    const cx = G / 2, cy = G / 2;
+    const R = G / 2 - 0.5;
+    const Rsq = R * R;
+
+    let raf = 0;
+    let last = 0;
+    const tick = (now: number) => {
+      if (!last) last = now;
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const s = stateRef.current;
+      if (!s) {
+        if (running) raf = requestAnimationFrame(tick);
+        return;
+      }
+      s.t += dt;
+      const t = s.t;
+      const particles = s.particles;
+      const M = s.particleColors.length;
+
+      // ── smooth orbital motion ────────────────────────────────────────
+      for (const p of particles) {
+        const ang = p.baseAng + t * p.angSpeed * ORB_MORPH_RATE
+                  + Math.sin(t * p.wobFreq + p.phase) * 0.35;
+        const rad = p.baseRad
+                  + Math.sin(t * p.radFreq * ORB_MORPH_RATE + p.phase) * p.radAmp
+                  + Math.cos(t * p.wobFreq * 0.6 + p.phase2) * p.wobAmp;
+        p.x = cx + Math.cos(ang) * rad;
+        p.y = cy + Math.sin(ang) * rad;
+        p.rNow = G * (0.22 + 0.06 * Math.sin(t * p.rFreq + p.rPhase));
+
+        // smooth color lerp; when one cycle finishes, pick next target
+        p.morph += dt * ORB_MORPH_RATE;
+        if (p.morph >= p.morphDur) {
+          p.from = p.to;
+          let next = (Math.random() * M) | 0;
+          let tries = 0;
+          while (Math.abs(next - p.from) < 2 && tries < 5) {
+            next = (Math.random() * M) | 0; tries++;
+          }
+          p.to = next;
+          p.morph = 0;
+          p.morphDur = 1.4 + Math.random() * 1.8;
+        }
+      }
+
+      // resolve current rgb for each particle (smoothstep lerp from→to)
+      const pColors = particles.map((p) => {
+        const k = Math.min(1, p.morph / p.morphDur);
+        const ks = k * k * (3 - 2 * k);
+        return lerpRgb(s.particleColors[p.from], s.particleColors[p.to], ks);
+      });
+
+      // ── embers (random in-orb pixel flashes) ─────────────────────────
+      const e = s.embers;
+      for (let i = e.length - 1; i >= 0; i--) {
+        e[i].life -= dt * 5;
+        if (e[i].life <= 0) e.splice(i, 1);
+      }
+      const spawnTarget = ORB_EMBER_RATE * dt * 60;
+      const nSpawn = Math.floor(spawnTarget) + (Math.random() < (spawnTarget % 1) ? 1 : 0);
+      for (let i = 0; i < nSpawn; i++) {
+        const p = particles[(Math.random() * particles.length) | 0];
+        const ang = Math.random() * Math.PI * 2;
+        const rad = Math.random() * (p.rNow || p.r) * 0.85;
+        const ex = Math.round(p.x + Math.cos(ang) * rad);
+        const ey = Math.round(p.y + Math.sin(ang) * rad);
+        const ddx = ex - cx + 0.5, ddy = ey - cy + 0.5;
+        if (ddx * ddx + ddy * ddy < Rsq && ex >= 0 && ex < G && ey >= 0 && ey < G) {
+          e.push({ x: ex, y: ey, life: 0.8 + Math.random() * 0.5, hot: Math.random() < 0.35 });
+        }
+      }
+
+      // ── render: strict circle silhouette + winner-takes-all w/ dither ─
+      const sharp = ORB_CONTRAST;
+      const bg = s.bg;
+      let pIdx = 0;
+      for (let y = 0; y < G; y++) {
+        for (let x = 0; x < G; x++) {
+          const dxc = x - cx + 0.5, dyc = y - cy + 0.5;
+          const distSq = dxc * dxc + dyc * dyc;
+          if (distSq > Rsq) {
+            // Outside the circle — transparent. The wrapping div's bg shows
+            // the palette[0] base, and overflow:hidden keeps the rim crisp.
+            data[pIdx++] = 0; data[pIdx++] = 0; data[pIdx++] = 0; data[pIdx++] = 0;
+            continue;
+          }
+          // Inside: find top-2 particles by sharpened weight.
+          let bestW = 0, bestI = -1;
+          let secW = 0, secI = -1;
+          for (let i = 0; i < particles.length; i++) {
+            const pp = particles[i];
+            const ddx = x + 0.5 - pp.x, ddy = y + 0.5 - pp.y;
+            const d2 = ddx * ddx + ddy * ddy + 0.4;
+            const w = Math.pow((pp.rNow * pp.rNow) / d2, sharp);
+            if (w > bestW) { secW = bestW; secI = bestI; bestW = w; bestI = i; }
+            else if (w > secW) { secW = w; secI = i; }
+          }
+          let r: number, g: number, b: number;
+          if (bestI < 0) {
+            r = bg[0]; g = bg[1]; b = bg[2];
+          } else {
+            const bc = pColors[bestI];
+            if (secI >= 0 && secW > 0) {
+              const ratio = secW / (bestW + secW);
+              const thresh = BAYER4[y & 3][x & 3];
+              const c = ratio > thresh * 0.55 ? pColors[secI] : bc;
+              r = c[0]; g = c[1]; b = c[2];
+            } else {
+              r = bc[0]; g = bc[1]; b = bc[2];
+            }
+          }
+          data[pIdx++] = r; data[pIdx++] = g; data[pIdx++] = b; data[pIdx++] = 255;
+        }
+      }
+      // Ember overlay (only painted while the spark is bright).
+      for (let i = 0; i < e.length; i++) {
+        const sp = e[i];
+        if (sp.life > 0.15) {
+          const idx = (sp.y * G + sp.x) * 4;
+          const c = sp.hot ? s.hot : s.hot2;
+          data[idx]     = c[0];
+          data[idx + 1] = c[1];
+          data[idx + 2] = c[2];
+          data[idx + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      if (running) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => { if (raf) cancelAnimationFrame(raf); };
+  }, [seed, running, palette]);
+
+  return (
+    <span
+      className="orb"
+      style={{ width: size, height: size, background: palette[0] }}
+      aria-hidden="true"
+    >
+      <canvas
+        ref={canvasRef}
+        width={ORB_GRID}
+        height={ORB_GRID}
+        className="orb-canvas"
+      />
+    </span>
+  );
+}
+
 function PiLogo({ className, title = "Pi" }: { className?: string; title?: string }) {
   return (
     <svg
@@ -693,7 +1222,6 @@ function ToolCard({ tool }: { tool: UiTool }) {
         <span className="toolName">{tool.name}</span>
         {hint && <span className="toolHint">{hint}</span>}
         {tool.status === "running" && <span className="toolPulse" />}
-        {tool.status === "error" && <span className="toolErr">error</span>}
       </button>
       {hasBody && (
         <div className="toolCollapse" data-open={open ? "true" : "false"}>
@@ -717,7 +1245,50 @@ function ToolCard({ tool }: { tool: UiTool }) {
 function StructuredToolResult({ details }: { details: ToolResultDetails }) {
   if (details.kind === "database_schema") return <SchemaResult details={details} />;
   if (details.kind === "analytics_visualization") return <VisualizationResult details={details} />;
+  if (details.kind === "edit_diff") return <EditDiffResult details={details} />;
   return <SqlResult details={details} />;
+}
+
+// Unified diff for an edit-tool call. Long diffs are clipped to a preview cap
+// with an inline "show more" toggle; expanded view caps at a hard limit so a
+// 5000-line refactor still fits inside the tool body without nuking layout.
+function EditDiffResult({ details }: { details: Extract<ToolResultDetails, { kind: "edit_diff" }> }) {
+  const PREVIEW_LINES = 16;
+  const HARD_CAP_LINES = 600;
+  const allLines = details.diff.split("\n");
+  // Strip the leading file-header lines (`--- a/foo`, `+++ b/foo`) from the
+  // preview — the tool header already shows the path, so the visible diff
+  // can lead with the first hunk instead.
+  const startIdx = allLines.findIndex((line, i) => i > 0 && (line.startsWith("@@") || line.startsWith("+") || line.startsWith("-") || line.startsWith(" ")));
+  const bodyLines = startIdx >= 0 ? allLines.slice(startIdx) : allLines;
+  const [expanded, setExpanded] = useState(false);
+  const overflow = bodyLines.length > PREVIEW_LINES;
+  const visible = expanded ? bodyLines.slice(0, HARD_CAP_LINES) : bodyLines.slice(0, PREVIEW_LINES);
+  const clippedBeyondCap = expanded && bodyLines.length > HARD_CAP_LINES;
+  return (
+    <div className="toolPanel diffPanel">
+      <pre className="diffBody">
+        {visible.map((line, i) => {
+          const cls = line.startsWith("+++") || line.startsWith("---") ? "diffMeta"
+            : line.startsWith("@@") ? "diffHunk"
+            : line.startsWith("+") ? "diffAdd"
+            : line.startsWith("-") ? "diffDel"
+            : "diffCtx";
+          return <div key={i} className={`diffLine ${cls}`}>{line || " "}</div>;
+        })}
+      </pre>
+      {overflow && (
+        <button className="diffToggle" onClick={() => setExpanded((v) => !v)}>
+          {expanded
+            ? `Show first ${PREVIEW_LINES} lines`
+            : `Show all ${bodyLines.length} lines`}
+        </button>
+      )}
+      {clippedBeyondCap && (
+        <div className="diffNote">Diff is {bodyLines.length} lines; showing first {HARD_CAP_LINES}.</div>
+      )}
+    </div>
+  );
 }
 
 function SqlResult({ details }: { details: Extract<ToolResultDetails, { kind: "sql_result" }> }) {
@@ -1365,6 +1936,7 @@ function Composer({
   onSetModel,
   resources,
   files,
+  extension,
 }: {
   state: PiState | null;
   connection: string;
@@ -1379,6 +1951,7 @@ function Composer({
   onSetModel: (provider: string, modelId: string) => void;
   resources: PiResourceSummary | null;
   files: string[];
+  extension: ExtensionRun | null;
 }) {
   const disabled = connection !== "open";
   const pct = state?.usage?.percent ?? 0;
@@ -1522,6 +2095,7 @@ function Composer({
 
   return (
     <footer className="composerWrap">
+      <ExtensionDock extension={extension} />
       <div className="composer">
         <button className="add" title="Attach"><IconPlusSlim size={16} /></button>
         <textarea
@@ -1588,6 +2162,153 @@ function Composer({
   );
 }
 
+function ExtensionDock({
+  extension,
+}: {
+  extension: ExtensionRun | null;
+}) {
+  const hasRun = extensionRunHasContent(extension);
+  // The dock is the user's window into Pi extension UI: it surfaces whatever
+  // the extension paints via setHeader/setFooter/setWidget. We host the
+  // extension's TUI Components server-side and stream their rendered ANSI
+  // lines down — the dock is a faithful viewer with a slim toggle bar.
+  // Default-open: the dashboard is the point, no reason to hide it on mount.
+  const [open, setOpen] = useState(true);
+
+  if (!hasRun) return null;
+
+  // Overlay slots (from `ctx.ui.custom`) are pulled out of the inline list and
+  // rendered as a focused, portal'd overlay over the chat column. Everything
+  // else stays in the inline dock.
+  const overlaySlot = extension!.slots.find((s) => s.slot === "overlay");
+  const inlineRun: ExtensionRun = overlaySlot
+    ? { ...extension!, slots: extension!.slots.filter((s) => s.slot !== "overlay") }
+    : extension!;
+  const widgetSlots = inlineRun.slots.filter((s) => s.slot.startsWith("widget:"));
+  // Bar title: explicit setTitle > single widget's key > generic. autoresearch
+  // never calls setTitle, so the single-widget fallback gives "autoresearch"
+  // instead of a meaningless "Extension".
+  const liveLabel = extension?.title
+    ?? (widgetSlots.length === 1 ? widgetSlots[0].slot.slice("widget:".length) : null)
+    ?? "Extension";
+  const workingMessage = extension?.workingMessage;
+  // Hide per-slot labels when there's only one — the bar title already says
+  // what extension we're looking at, so a duplicate label below is just noise.
+  const hideSlotLabels = inlineRun.slots.length <= 1;
+
+  return (
+    <>
+      {overlaySlot && <ExtensionOverlay slot={overlaySlot} />}
+      <div className={`extDock${open ? " open" : ""} hasRun`}>
+        <button
+          className="extDock-bar"
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          title={open ? "Hide extension panel" : "Show extension panel"}
+        >
+          <span className="extDock-leading">
+            <span className="extDock-title">{liveLabel}</span>
+            {workingMessage && <span className="extDock-msg">{workingMessage}</span>}
+          </span>
+          <span className="extDock-trailing">
+            <IconChev size={14} />
+          </span>
+        </button>
+        {open && inlineRun.slots.length + Object.keys(inlineRun.status).length > 0 && (
+          <ExtensionLiveView run={inlineRun} hideSlotLabels={hideSlotLabels} />
+        )}
+      </div>
+    </>
+  );
+}
+
+function ExtensionOverlay({ slot }: { slot: ExtensionSlot }) {
+  // Generic modal surface for whatever Pi extensions paint via ctx.ui.custom.
+  // Portaled to <body> with fixed positioning so it covers the full viewport
+  // — sidebars and chat disappear under it. The frame is deliberately bare:
+  // a `<pre>` of ANSI lines plus an Esc hint. Everything visual comes from
+  // the extension's own theme.fg / box-drawing output, so a brand-pipeline
+  // overlay or a future debugger overlay would look at home here without
+  // any piui-side styling tuned for autoresearch.
+  useEffect(() => {
+    const active = document.activeElement as HTMLElement | null;
+    if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
+      active.blur();
+    }
+  }, []);
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div className="extOverlay" role="dialog" aria-modal="true">
+      <pre className="extOverlay-lines">
+        {slot.lines.length === 0
+          ? <span className="extSlot-empty">(empty)</span>
+          : slot.lines.map((line, idx) => <AnsiLine key={idx} line={line} />)}
+      </pre>
+      <div className="extOverlay-hint" aria-hidden="true">esc to close</div>
+    </div>,
+    document.body,
+  );
+}
+
+function ExtensionLiveView({ run, hideSlotLabels }: { run: ExtensionRun; hideSlotLabels: boolean }) {
+  const statusEntries = Object.entries(run.status);
+  const slots = orderedSlots(run.slots);
+  return (
+    <div className="extLive">
+      {statusEntries.length > 0 && (
+        <div className="extLive-status">
+          {statusEntries.map(([key, text]) => (
+            <span key={key} className="extLive-status-row">
+              <span className="extLive-status-key">{key}</span>
+              <span className="extLive-status-val">{text}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {slots.length === 0 && statusEntries.length === 0 && (
+        <div className="extLive-empty">
+          {run.workingVisible ? "Working…" : "No output yet."}
+        </div>
+      )}
+      {slots.map((slot) => <ExtensionSlotView key={slot.slot} slot={slot} hideLabel={hideSlotLabels} />)}
+    </div>
+  );
+}
+
+function ExtensionSlotView({ slot, hideLabel }: { slot: ExtensionSlot; hideLabel: boolean }) {
+  // Slots from `setHeader`/`setFooter` rarely carry useful metadata in the
+  // key, so we suppress the label for them. Widget keys (the part after
+  // "widget:") only get a label when there are multiple slots — otherwise the
+  // dock bar title already conveys which extension is rendering.
+  const label = hideLabel || slot.slot === "header" || slot.slot === "footer"
+    ? null
+    : slot.slot.startsWith("widget:") ? slot.slot.slice("widget:".length) : slot.slot;
+  return (
+    <section className="extSlot">
+      {label && <div className="extSlot-label">{label}</div>}
+      <pre className="extSlot-lines">
+        {slot.lines.length === 0
+          ? <span className="extSlot-empty">(empty)</span>
+          : slot.lines.map((line, idx) => <AnsiLine key={idx} line={line} />)}
+      </pre>
+    </section>
+  );
+}
+
+function AnsiLine({ line }: { line: string }) {
+  // Empty lines still need a row so vertical spacing matches the source.
+  if (line.length === 0) return <div className="extSlot-line">&nbsp;</div>;
+  const segments = parseAnsi(line);
+  return (
+    <div className="extSlot-line">
+      {segments.map((seg, idx) => (
+        <span key={idx} style={styleToCss(seg.style)}>{seg.text}</span>
+      ))}
+    </div>
+  );
+}
+
 function MentionPopover({
   trigger,
   items,
@@ -1642,6 +2363,7 @@ function LeftSidebar({
   activeWorkspaceId,
   sessions,
   activeSessionId,
+  activeIsStreaming,
   dark,
   onToggleDark,
   models,
@@ -1661,6 +2383,7 @@ function LeftSidebar({
   activeWorkspaceId: string | null;
   sessions: PiSessionInfo[];
   activeSessionId?: string;
+  activeIsStreaming: boolean;
   dark: boolean;
   onToggleDark: () => void;
   models: PiModelSummary[];
@@ -1800,6 +2523,11 @@ function LeftSidebar({
                                     onClick={() => onSwitchSession(session.path)}
                                     title={session.path}
                                   >
+                                    <AgentOrb
+                                      seed={session.id}
+                                      running={session.id === activeSessionId && activeIsStreaming}
+                                      size={14}
+                                    />
                                     <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
                                     <span className="sb-conv-time">{relativeTime(session.modified)}</span>
                                   </button>

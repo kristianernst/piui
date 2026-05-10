@@ -33,28 +33,20 @@ PIUI_CWD=/path/to/your/project npm run dev
 
 Workspace registry is stored at `~/.pi/agent/piui-workspaces.json`.
 
-## SQL analytics demo
+## Extensions
 
-This repo includes a project-local Pi extension at `.pi/extensions/sql-analytics/` that registers:
+Extensions are loaded by Pi from the standard discovery roots (`~/.pi/agent/extensions`, project-local `.pi/extensions/`, installed Pi packages, etc.) — `piui` does not host its own. The composer surfaces them two ways:
 
-- `db_describe` — inspect read-only database schemas and columns.
-- `db_query` — run bounded read-only `SELECT`/`WITH` SQL.
-- `db_visualize` — run read-only aggregate SQL and return chart-ready rows.
+- **`/` autocomplete** in the composer textarea — quick fuzzy picker for extension commands, prompts, and built-ins.
+- **Extension dock** above the composer — collapses to a single bar with the run's title, working message, and spinner; expands into a faithful viewer for whatever the extension paints into Pi's UI surface (`setHeader`, `setFooter`, `setWidget`).
 
-The extension defaults to the medicine supply-chain demo database:
+The dock is a TUI viewer, not a piui-specific protocol. Extensions written for the Pi terminal Just Work — their `(tui, theme) => Component` factories are hosted by a synthetic TUI server-side, `Component.render(width)` is invoked on every `requestRender()`, and the resulting ANSI lines are streamed to the browser and rendered with a small SGR parser. So an extension like [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) — which paints its experiment status as a `setWidget("autoresearch", (tui, theme) => …)` factory — shows up in the dock unchanged.
 
-```text
-postgresql://medicine_agent_ro:medicine_agent_ro_password@localhost:55432/medicine_supply_chain_demo
-```
+Notes for extension authors:
 
-To seed the demo database:
-
-```bash
-cd /Users/kristianernst/work/datasets/medicine_supply_chain_seed_package
-docker compose up -d
-```
-
-Override the connection with either `PIUI_ANALYTICS_DB_DSN` or `ANALYSIS_DB_MEDICINE_DSN` before starting `piui`.
+- The shim provides a fixed render width (currently 100 cols). Read it from `tui.terminal.columns` if your component depends on viewport size.
+- `Component.dispose()` is called when a slot is replaced or cleared, so clean up subscriptions there.
+- Interactive overlays via `ctx.ui.custom(...)` are routed to a focused browser overlay. Keyboard input is forwarded back to the server-side component as terminal escape sequences.
 
 ## Scripts
 
@@ -80,6 +72,7 @@ Current daemon capabilities:
 - prompt, abort, explicit steer/follow-up queues, model selection/cycling, thinking level changes
 - resource snapshots for commands, tools, skills, prompts, and context files
 - browser fallback for extension UI select/confirm/input/editor/status requests
+- server-hosted extension widgets and focused overlays (`setHeader`, `setFooter`, `setWidget`, `ctx.ui.custom`)
 - streaming assistant/tool events
 
-See `docs/feasibility.md` for the Pi docs reviewed and next implementation steps.
+See `design.md` for the feasibility notes and SDK/runtime architecture rationale.

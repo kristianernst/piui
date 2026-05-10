@@ -23,6 +23,7 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { completeSimple, type Api, type Model } from "@mariozechner/pi-ai";
+import { WidgetHost, OVERLAY_SLOT } from "./tui-shim.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === "production";
@@ -119,6 +120,8 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "set_thinking_level",
   "set_settings",
   "extension_ui_response",
+  "trigger_shortcut",
+  "extension_input",
 ]);
 
 type Workspace = {
@@ -162,7 +165,9 @@ type ClientCommand = {
     | "get_settings"
     | "set_settings"
     | "list_files"
-    | "extension_ui_response";
+    | "extension_ui_response"
+    | "trigger_shortcut"
+    | "extension_input";
   cwd?: string;
   name?: string;
   workspaceId?: string;
@@ -178,6 +183,8 @@ type ClientCommand = {
   settings?: Partial<PiSettings>;
   uiRequestId?: string;
   value?: unknown;
+  key?: string;
+  data?: string;
 };
 
 type ModelRef = { provider: string; modelId: string };
@@ -210,6 +217,9 @@ type ServerPacket =
   | { type: "tree"; data: unknown }
   | { type: "extension_ui_request"; request: unknown }
   | { type: "extension_ui_status"; data: unknown }
+  | { type: "extension_ui_widget"; data: { slot: string; lines?: string[]; removed?: true } }
+  | { type: "extension_reset" }
+  | { type: "shortcuts"; data: { shortcuts: Array<{ key: string; description?: string }> } }
   | { type: "notification"; data: { message: string; level?: "info" | "warning" | "error" } }
   | { type: "event"; event: unknown }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
@@ -734,7 +744,7 @@ function createCommandActions(handle: RuntimeHandle, locks: LockStore, ownerId: 
   };
 }
 
-function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown) => void>): ExtensionUIContext {
+function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost): ExtensionUIContext {
   function request<T>(kind: string, payload: Record<string, unknown>, opts?: { signal?: AbortSignal; timeout?: number }) {
     const requestId = crypto.randomUUID();
     send(ws, { type: "extension_ui_request", request: { id: requestId, kind, ...payload } });
@@ -757,6 +767,27 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
     });
   }
 
+  // Reused by setWidget/setHeader/setFooter — Pi's contract accepts either a
+  // string[] (raw terminal lines) or a `(tui, theme) => Component` factory.
+  // We funnel both into the WidgetHost; passing `undefined` clears the slot.
+  function setSlot(slot: string, content: unknown, theme: Theme): void {
+    if (content == null) {
+      widgetHost.clear(slot);
+      return;
+    }
+    if (typeof content === "function") {
+      widgetHost.setFactory(slot, content as (tui: unknown, theme: Theme) => { render(width: number): string[] }, theme);
+      return;
+    }
+    if (Array.isArray(content)) {
+      widgetHost.setLines(slot, content.filter((line): line is string => typeof line === "string"));
+      return;
+    }
+    // Unknown shape — drop it rather than crash.
+    console.warn(`[piui] setWidget for slot ${slot} got unsupported content type: ${typeof content}`);
+    widgetHost.clear(slot);
+  }
+
   return {
     select: (title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("select", { title, options, opts }, opts),
     confirm: async (title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }) => Boolean(await request<boolean>("confirm", { title, message, opts }, opts)),
@@ -768,11 +799,18 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
     setWorkingVisible: (visible: boolean) => send(ws, { type: "extension_ui_status", data: { key: "workingVisible", value: visible } }),
     setWorkingIndicator: (options?: unknown) => send(ws, { type: "extension_ui_status", data: { key: "workingIndicator", value: options } }),
     setHiddenThinkingLabel: (label?: string) => send(ws, { type: "extension_ui_status", data: { key: "hiddenThinkingLabel", text: label } }),
-    setWidget: (key: string, content: unknown) => send(ws, { type: "extension_ui_status", data: { key: `widget:${key}`, value: Array.isArray(content) ? content : undefined } }),
-    setFooter: () => undefined,
-    setHeader: () => undefined,
+    setWidget: (key: string, content: unknown) => setSlot(`widget:${key}`, content, defaultExtensionTheme),
+    setFooter: (factory: unknown) => setSlot("footer", factory, defaultExtensionTheme),
+    setHeader: (factory: unknown) => setSlot("header", factory, defaultExtensionTheme),
     setTitle: (title: string) => send(ws, { type: "extension_ui_status", data: { key: "title", text: title } }),
-    custom: async <T,>() => undefined as T,
+    // Open a focused, scrollable overlay. The extension's factory returns a
+    // Component with optional `handleInput` — keystrokes captured client-side
+    // are forwarded back through `extension_input` and dispatched here.
+    custom: async <T,>(factory: unknown) => {
+      if (typeof factory !== "function") return undefined as T;
+      const result = await widgetHost.setOverlay(factory as Parameters<WidgetHost["setOverlay"]>[0], defaultExtensionTheme);
+      return result as T;
+    },
     pasteToEditor: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "pasteToEditor", text } }),
     setEditorText: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "setEditorText", text } }),
     getEditorText: () => "",
@@ -789,15 +827,77 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
   } as unknown as ExtensionUIContext;
 }
 
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void) {
+// Pi extension shortcuts are KeyId strings like "ctrl+shift+t" with modifiers
+// in any order. We canonicalize to a fixed modifier order [ctrl, shift, alt,
+// super] so server-side lookup matches whatever the client emits, regardless
+// of how the extension author wrote it.
+function canonicalKeyId(key: string): string {
+  const parts = key.toLowerCase().split("+").map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return "";
+  const order = ["ctrl", "shift", "alt", "super"];
+  const base = parts[parts.length - 1];
+  const mods = parts.slice(0, -1).filter((m) => order.includes(m));
+  mods.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  // Drop duplicates while preserving order.
+  const dedup = mods.filter((m, i) => mods.indexOf(m) === i);
+  return [...dedup, base].join("+");
+}
+
+function listExtensionShortcuts(handle: RuntimeHandle): Array<{ key: string; description?: string }> {
+  try {
+    const shortcuts = handle.runtime.session.extensionRunner.getShortcuts({});
+    return [...shortcuts].map(([key, sc]) => ({ key: canonicalKeyId(key), description: sc.description }));
+  } catch (error) {
+    console.warn("Failed to enumerate extension shortcuts:", error);
+    return [];
+  }
+}
+
+// Build the minimum-viable ExtensionContext that an extension's shortcut /
+// event handler expects. Pi's interactive mode constructs a richer one with
+// access to streaming internals; piui exposes the public AgentSession API.
+// Most handlers (autoresearch's toggle dashboard, etc.) only touch ctx.cwd
+// and ctx.ui, so this lightweight context is enough in practice.
+function buildExtensionContext(handle: RuntimeHandle, ui: ExtensionUIContext) {
+  const session = handle.runtime.session;
+  return {
+    ui,
+    hasUI: true,
+    cwd: handle.workspace.cwd,
+    sessionManager: session.sessionManager,
+    modelRegistry: session.modelRegistry,
+    model: session.model,
+    isIdle: () => !session.isStreaming,
+    signal: undefined,
+    abort: () => session.abort(),
+    hasPendingMessages: () => false,
+    shutdown: () => undefined,
+    getContextUsage: () => undefined,
+    compact: (opts?: { customInstructions?: string }) => { void session.compact(opts?.customInstructions); },
+    getSystemPrompt: () => "",
+  };
+}
+
+async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost, uiContext: ExtensionUIContext, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void) {
   unsubscribe?.();
   const session = handle.runtime.session;
   const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
   if (lock.owner !== "other") {
+    // Wipe any widgets the previous session's extensions registered before we
+    // bind the new one — extension factories will re-register from scratch.
+    widgetHost.reset();
+    // Tell the client to clear residual extension status/title/working-message
+    // fields too. Slots are removed via widgetHost.reset() above, but the
+    // chrome state lives only on the client and needs an explicit reset so it
+    // doesn't bleed from one conversation into the next.
+    send(ws, { type: "extension_reset" });
     await session.bindExtensions({
-      uiContext: createExtensionUI(ws, pendingUi),
+      uiContext,
       commandContextActions: createCommandActions(handle, locks, ownerId),
     });
+    // Once extensions have re-registered, push their shortcut list down to the
+    // browser so it can capture matching keys and forward them to us.
+    send(ws, { type: "shortcuts", data: { shortcuts: listExtensionShortcuts(handle) } });
   }
   // Track in-flight title generation per session-file so we don't fire the
   // model twice if `agent_end` lands while a previous request is still open.
@@ -899,6 +999,18 @@ async function main() {
     let readOnly = false;
     const ownerId = crypto.randomUUID();
     const pendingUi = new Map<string, (value: unknown) => void>();
+    // One WidgetHost per WS connection; it's reset between sessions so a new
+    // session's extensions start with an empty slot table. The host emits
+    // ANSI lines straight to this socket whenever a registered Component
+    // requests a re-render.
+    const widgetHost = new WidgetHost({
+      emit: (slot, lines) => send(ws, { type: "extension_ui_widget", data: { slot, lines } }),
+      remove: (slot) => send(ws, { type: "extension_ui_widget", data: { slot, removed: true } }),
+    });
+    // The uiContext lives at WS-connection scope: all session binds and any
+    // shortcut-handler invocations share the same one, so when an extension
+    // calls ctx.ui.setWidget from a shortcut it routes back through this WS.
+    const extensionUi = createExtensionUI(ws, pendingUi, widgetHost);
 
     async function applySessionDefaults(session: AgentSession) {
       const settings = settingsStore.get();
@@ -924,12 +1036,12 @@ async function main() {
       // existing session preserves whatever it was last using.
       if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(handle.runtime.session);
       handle.runtime.setRebindSession(async () => {
-        const binding = await bindSession(ws, handle!, pendingUi, locks, ownerId, settingsStore, unsubscribe);
+        const binding = await bindSession(ws, handle!, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
         unsubscribe = binding.unsubscribe;
         readOnly = binding.readOnly;
         send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
       });
-      const binding = await bindSession(ws, handle, pendingUi, locks, ownerId, settingsStore, unsubscribe);
+      const binding = await bindSession(ws, handle, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
       unsubscribe = binding.unsubscribe;
       readOnly = binding.readOnly;
       send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
@@ -1217,6 +1329,40 @@ async function main() {
             pendingUi.delete(command.uiRequestId);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
+          case "extension_input": {
+            // Terminal-encoded keystroke for the active overlay component
+            // (e.g. autoresearch's fullscreen dashboard). Silently dropped
+            // when there's no overlay; that's fine — extra keystrokes after
+            // close are racy anyway.
+            if (typeof command.data === "string" && command.data.length > 0) {
+              widgetHost.dispatchInput(command.data);
+            }
+            send(ws, { type: "response", id, command: command.type, success: true });
+            break;
+          }
+          case "trigger_shortcut": {
+            if (!command.key || !handle) throw new Error("Missing key or no active session");
+            const target = canonicalKeyId(command.key);
+            const shortcuts = handle.runtime.session.extensionRunner.getShortcuts({});
+            const matchedHandler = (() => {
+              for (const [registeredKey, sc] of shortcuts) {
+                if (canonicalKeyId(registeredKey) === target) return sc.handler;
+              }
+              return undefined;
+            })();
+            if (!matchedHandler) {
+              send(ws, { type: "response", id, command: command.type, success: false, error: `No shortcut registered for ${command.key}` });
+              break;
+            }
+            // Fire and forget — extension handlers are usually short, but we
+            // don't want to block the WS message loop on a slow one. The cast
+            // sidesteps the strict ExtensionContext shape; our buildExtension-
+            // Context returns a structurally-compatible subset.
+            void Promise.resolve(matchedHandler(buildExtensionContext(handle, extensionUi) as Parameters<typeof matchedHandler>[0]))
+              .catch((error) => send(ws, { type: "notification", data: { message: `Shortcut handler failed: ${error instanceof Error ? error.message : String(error)}`, level: "error" } }));
+            send(ws, { type: "response", id, command: command.type, success: true });
+            break;
+          }
           default:
             send(ws, { type: "response", id, command: command.type ?? "unknown", success: false, error: "Unknown command" });
         }
@@ -1234,6 +1380,7 @@ async function main() {
 
     ws.on("close", async () => {
       unsubscribe?.();
+      widgetHost.reset();
       for (const resolve of pendingUi.values()) resolve(undefined);
       pendingUi.clear();
       await locks.release(handle?.runtime.session.sessionFile, ownerId);
