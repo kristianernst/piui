@@ -17,6 +17,8 @@ export type PiSessionInfo = {
   modified: string;
   messageCount: number;
   firstMessage: string;
+  liveSessionId?: string;
+  isRunning?: boolean;
 };
 
 export type PiState = {
@@ -65,6 +67,28 @@ export type PiSettings = {
   showStarterPrompts: boolean;
 };
 
+export type GitFileStatus = {
+  path: string;
+  oldPath?: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "copied" | "typechange" | "unknown";
+  index: string;
+  worktree: string;
+};
+
+export type GitSnapshot = {
+  isRepo: boolean;
+  root?: string;
+  branch?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  clean?: boolean;
+  files: GitFileStatus[];
+  diff?: string;
+  diffTruncated?: boolean;
+  error?: string;
+};
+
 export type PiTreeEntry = {
   id: string;
   parentId: string | null;
@@ -82,7 +106,7 @@ export type ExtensionUiRequest =
   | { id: string; kind: string; title?: string; message?: string; options?: string[]; placeholder?: string; [key: string]: unknown };
 
 export type PiPacket =
-  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState; settings?: PiSettings } }
+  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState; settings?: PiSettings; editors?: Array<{ id: string; label: string; hasIcon: boolean }> } }
   | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string } }
   | { type: "workspace"; data: Workspace }
   | { type: "sessions"; data: { workspaceId: string; sessions: PiSessionInfo[] } }
@@ -91,6 +115,7 @@ export type PiPacket =
   | { type: "resources"; data: PiResourceSummary }
   | { type: "models"; data: { models: PiModelSummary[] } }
   | { type: "settings"; data: PiSettings }
+  | { type: "git"; data: GitSnapshot }
   | { type: "files"; data: { workspaceId: string; files: string[] } }
   | { type: "tree"; data: { entries: PiTreeEntry[] } }
   | { type: "extension_ui_request"; request: ExtensionUiRequest }

@@ -75,4 +75,4 @@ Current daemon capabilities:
 - server-hosted extension widgets and focused overlays (`setHeader`, `setFooter`, `setWidget`, `ctx.ui.custom`)
 - streaming assistant/tool events
 
-See `design.md` for the feasibility notes and SDK/runtime architecture rationale.
+See `docs/design.md` for the feasibility notes and SDK/runtime architecture rationale.

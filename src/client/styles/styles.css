@@ -374,14 +374,10 @@ code {
   letter-spacing: -0.005em;
 }
 .reasoning > button:hover { color: var(--ink); }
-.reasoning .spinner {
-  width: 12px; height: 12px;
-  border-radius: 50%;
-  border: 1.5px solid var(--hairline-strong);
-  border-top-color: var(--accent);
-  animation: spin 1s linear infinite;
-  flex-shrink: 0;
-}
+/* Orb takes the slot the old `.spinner` lived in: same flex-row, same gap,
+   but it animates only while the turn is streaming and freezes to a static
+   identity badge when the turn settles. */
+.reasoning > button .orb { flex-shrink: 0; }
 
 /* Unified timeline: thoughts and tools live in the same list, in order. */
 .timeline {
@@ -1219,6 +1215,25 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border: 1px solid var(--hairline) !important;
 }
 .metaBar-thinking:hover { border-color: var(--hairline-strong) !important; }
+.gitBranch {
+  /* Sits inline with the other metaBar tokens (model name, thinking level,
+     ctx %). No pill border — just an icon + name + optional ahead/behind. */
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  min-width: 0;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.gitBranch svg { color: var(--faint); flex-shrink: 0; }
+.gitBranch-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.gitBranch-trail { color: var(--faint); flex-shrink: 0; }
 .status { display: inline-flex; align-items: center; gap: 6px; }
 .status::before {
   content: '';
@@ -1263,7 +1278,13 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border-right: 0;
   border-left: 1px solid var(--hairline);
   width: 244px;
+  /* Width is driven by inline style when open so the drag handle has a live
+     value to update. The transition is dropped on the right sidebar while
+     dragging would otherwise lag the cursor; we only animate open/close. */
+  transition: border-color 0.3s var(--ease);
 }
+/* Restore the smooth open/close animation when the user toggles the rail. */
+.sidebar.right.closed { transition: width 0.42s var(--ease), border-color 0.3s var(--ease); }
 .sidebar.closed { width: 0; border-color: transparent; }
 
 .sideInner {
@@ -1274,8 +1295,23 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   padding: 10px 8px 8px;
   transition: opacity 0.32s var(--ease);
 }
+/* Right sidebar's inner width is driven by inline style (matches the aside),
+   so the static 244px fallback is only used during the closed-state transition. */
 .right .sideInner { width: 244px; }
 .sidebar.closed .sideInner { opacity: 0; pointer-events: none; }
+
+/* Drag handle on the left edge of the right sidebar. Sits as an absolute
+   strip over the border so the cursor flips to col-resize when hovered. */
+.sidebar-resize {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  margin-left: -2px;
+  cursor: col-resize;
+  z-index: 5;
+}
+.sidebar-resize:hover,
+.sidebar-resize:active { background: oklch(from var(--accent) l c h / 0.18); }
 
 /* Sidebar head */
 .sideHead {
@@ -1437,6 +1473,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
    delete button so we can position the latter absolutely on the right. */
 .sb-ws-row {
   position: relative;
+  display: flex;
+  align-items: center;
 }
 .sb-ws-del {
   position: absolute;
@@ -1464,11 +1502,11 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .sb-ws-count { transition: opacity 0.18s var(--ease); }
 .sb-ws-del:hover { background: oklch(from var(--bad) l c h / 0.12); color: var(--bad); }
 
+.sb-ws-toggle,
 .sb-ws-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
   padding: 5px 6px;
   background: transparent;
   border: 0;
@@ -1480,14 +1518,25 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   transition: background 0.15s var(--ease), color 0.15s var(--ease);
   text-align: left;
 }
+.sb-ws-toggle {
+  width: 24px;
+  justify-content: center;
+  padding-inline: 4px;
+}
+.sb-ws-head {
+  flex: 1;
+  min-width: 0;
+}
+.sb-ws-toggle:hover,
 .sb-ws-head:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.sb-ws-toggle svg,
 .sb-ws-head svg { flex-shrink: 0; }
-.sb-ws-head .sb-chev {
+.sb-ws-toggle .sb-chev {
   color: var(--faint);
   transition: transform 0.32s var(--ease);
 }
-.sb-ws.open .sb-ws-head .sb-chev { transform: rotate(0deg); }
-.sb-ws.closed .sb-ws-head .sb-chev { transform: rotate(-90deg); }
+.sb-ws.open .sb-ws-toggle .sb-chev { transform: rotate(0deg); }
+.sb-ws.closed .sb-ws-toggle .sb-chev { transform: rotate(-90deg); }
 .sb-ws-head .sb-folder { color: var(--muted); }
 .sb-ws.active .sb-ws-head { color: var(--ink); }
 .sb-ws.active .sb-ws-head .sb-folder { color: var(--accent); }
@@ -1674,7 +1723,51 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 .sb-popover-row .extra { margin-left: auto; font: 10.5px var(--mono); color: var(--faint); }
 
 /* Right sidebar — Diffs panel */
-.sb-empty-panel {
+/* Right-sidebar panel system — shared by the Diffs and Files tabs. The
+   chrome is deliberately minimal: no card-in-card borders, no boxy panels;
+   small uppercase-free monospaced labels, hairline separators, and the rest
+   of the visual structure comes from the content itself (diff/file list).
+   This matches the rest of the app's typography conventions. */
+.sidePanel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sidePanel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+.sidePanel-head:first-child { padding-top: 4px; }
+.sidePanel-label {
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  flex-shrink: 0;
+}
+.sidePanel-value {
+  font: 11.5px var(--mono);
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sidePanel-note {
+  margin: 8px 10px;
+  padding: 0;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* Compact two-line empty state shared across both tabs. Pretext-balanced
+   body so the helper copy never leaves an orphan line. */
+.sidePanel-empty {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1682,29 +1775,265 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   justify-content: center;
   text-align: center;
   padding: 32px 18px;
-  color: var(--muted);
+  gap: 6px;
 }
-.sb-empty-panel-glyph {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  background: oklch(from var(--ink) l c h / 0.04);
-  color: var(--muted);
+.sidePanel-empty-title {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.sidePanel-empty p {
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.5;
+  max-width: 100%;
+}
+
+/* Generic list row — used by the diff file list. Status badge sits in a
+   fixed-width slot so paths align cleanly down the column. */
+.sideList {
+  list-style: none;
+  margin: 0;
+  padding: 4px 4px;
+  flex: 0 0 auto;
+  max-height: 36%;
+  overflow: auto;
+  border-bottom: 1px solid var(--hairline);
+}
+.sideList-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.sideList-row:hover { background: oklch(from var(--ink) l c h / 0.04); }
+.sideList-badge {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+  font: 10px var(--mono);
+  color: var(--faint);
+}
+.sideList-row.status-added .sideList-badge,
+.sideList-row.status-untracked .sideList-badge { color: var(--hljs-addition-fg); }
+.sideList-row.status-deleted .sideList-badge { color: var(--hljs-deletion-fg); }
+.sideList-row.status-renamed .sideList-badge,
+.sideList-row.status-copied .sideList-badge { color: var(--accent); }
+.sideList-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+/* Per-file diff list — each changed file is its own collapsible row. Click
+   the header to expand the file's hunks inline; the rest of the rows stay
+   compact so you can scan the change set first and drill in second. Same
+   diff coloring as the edit-tool diffs in chat for visual continuity. */
+.diffFiles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.diffFile {
+  border-bottom: 1px solid var(--hairline);
+}
+.diffFile:last-child { border-bottom: 0; }
+.diffFile-headRow {
+  display: flex;
+  align-items: center;
+}
+.diffFile-headRow > .diffFile-head { flex: 1; min-width: 0; }
+.diffFile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.diffFile-head:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.diffFile-head:disabled { cursor: default; color: var(--muted); }
+.diffFile-head:disabled:hover { background: transparent; }
+.diffFile.open .diffFile-head { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+.diffFile-chev {
+  flex: 0 0 auto;
+  width: 10px;
+  text-align: center;
+  font-size: 9px;
+  color: var(--faint);
+}
+.diffFile-body {
+  margin: 0;
+  padding: 4px 0 10px;
+  background: oklch(from var(--ink) l c h / 0.025);
+  font: 11px/1.5 var(--mono);
+  color: var(--hljs-fg);
+  white-space: pre;
+  overflow-x: auto;
+  border-top: 1px solid var(--hairline);
+}
+.diffFile-body .diffLine { padding: 0 14px; }
+
+/* File tree — flat ul/li with depth-indented padding. Buttons for folders
+   (toggle expand/collapse), li for files. Mono everywhere. */
+.fileTree, .fileTree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+.fileTree { padding: 4px 0 12px; }
+.fileTree-folderHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding-right: 8px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  background: transparent;
+  border: 0;
+  font: 12px var(--mono);
+  color: var(--ink-soft);
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+/* File rows pair the path with the open-in-editor menu trigger on hover.
+   The row is the hit target; the trigger only shows when the row is hovered
+   so the file list stays calm in its resting state. */
+.fileTree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 0;
+  font: 12px var(--mono);
+  color: var(--ink-soft);
+  border-radius: 4px;
+}
+.fileTree-rowMain {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+.fileTree-folderHead:hover,
+.fileTree-row:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.fileTree-chev {
+  flex: 0 0 auto;
+  width: 10px;
+  font-size: 9px;
+  color: var(--faint);
+  text-align: center;
+}
+.fileTree-icon {
+  flex: 0 0 auto;
+  width: 10px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 10px;
+}
+.fileTree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Open-in-editor — slim trigger button + floating popover. The trigger is
+   hidden until the parent row is hovered/focused; the popover anchors
+   bottom-right so it never collides with the path that just spawned it. */
+.openInEditor {
+  position: relative;
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.14s var(--ease);
+}
+.fileTree-row:hover .openInEditor,
+.fileTree-row:focus-within .openInEditor,
+.diffFile-headRow:hover .openInEditor,
+.diffFile-headRow:focus-within .openInEditor,
+.openInEditor:focus-within { opacity: 1; }
+.openInEditor-trigger {
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 12px;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
 }
-.sb-empty-panel-title {
-  font-size: 12px;
+.openInEditor-trigger:hover { color: var(--ink); }
+/* Editor picker — horizontal row of icons. Each item is a small square
+   button showing the editor's actual .app icon (extracted server-side from
+   the bundle's CFBundleIconFile). Name carried by title/aria-label so the
+   menu reads purely as icons in the visual register. */
+.openInEditor-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 10px;
+  box-shadow: 0 12px 28px oklch(0 0 0 / 0.18);
+  display: flex;
+  flex-direction: row;
+  gap: 2px;
+  z-index: 40;
+}
+.openInEditor-item {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 3px;
+}
+.openInEditor-item:hover { background: oklch(from var(--ink) l c h / 0.07); }
+.openInEditor-icon {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  /* The icons we extract are raster PNGs at 64px; on retina they're already
+     sharp at the 22px button. No additional smoothing needed. */
+}
+.openInEditor-iconFallback {
+  width: 100%;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: 12px var(--mono);
   color: var(--ink-soft);
-  margin-bottom: 4px;
-  font-weight: 500;
-}
-.sb-empty-panel-sub {
-  font-size: 11px;
-  color: var(--faint);
-  line-height: 1.5;
-  max-width: 200px;
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
 }
 
 /* ------- Notices / queue / dialogs (kept minimal) ------- */

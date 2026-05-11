@@ -1,8 +1,12 @@
 import express from "express";
 import http from "node:http";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+// Sync filesystem helpers — used at startup for editor detection and icon
+// extraction. Kept under a distinct namespace so the `fs` async API stays
+// the default everywhere else.
+import * as fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,6 +77,186 @@ end try`;
   });
 }
 
+// Editor opener — open a workspace file in an installed editor. Detection
+// can't lean on `process.env.PATH` alone: when piui is spawned from a GUI
+// context (Claude Code, launchd, etc.) the inherited PATH is the stripped-down
+// system one and misses `/usr/local/bin`, `/opt/homebrew/bin`, the codeium
+// install dir, etc. Instead we probe a candidate list of well-known absolute
+// paths AND the macOS `/Applications/*.app` bundles, falling back to launching
+// via `open -a "<App>"` when only the .app exists (no CLI shim installed).
+type EditorEntry = {
+  id: string;
+  label: string;
+  // List of likely CLI binary locations. First hit wins; if none match we
+  // fall back to the .app bundle if available.
+  cliCandidates: string[];
+  // macOS .app bundle name (sans the `.app` suffix). Looked up under both
+  // `/Applications` and `~/Applications`. Use undefined to skip.
+  appName?: string;
+  // Fixed-args strategy for the CLI (most editors just want a path).
+  cliArgs?: (absPath: string) => string[];
+};
+
+const HOME = os.homedir();
+const EDITOR_CATALOG: EditorEntry[] = [
+  {
+    id: "cursor",
+    label: "Cursor",
+    cliCandidates: ["/usr/local/bin/cursor", "/opt/homebrew/bin/cursor", `${HOME}/.local/bin/cursor`],
+    appName: "Cursor",
+  },
+  {
+    id: "vscode",
+    label: "VS Code",
+    cliCandidates: [
+      "/usr/local/bin/code",
+      "/opt/homebrew/bin/code",
+      "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    ],
+    appName: "Visual Studio Code",
+  },
+  {
+    id: "windsurf",
+    label: "Windsurf",
+    cliCandidates: [
+      "/usr/local/bin/windsurf",
+      "/opt/homebrew/bin/windsurf",
+      `${HOME}/.codeium/windsurf/bin/windsurf`,
+    ],
+    appName: "Windsurf",
+  },
+  {
+    id: "zed",
+    label: "Zed",
+    cliCandidates: [
+      "/usr/local/bin/zed",
+      "/opt/homebrew/bin/zed",
+      `${HOME}/.local/bin/zed`,
+    ],
+    appName: "Zed",
+  },
+];
+
+function existsAsFile(p: string): boolean {
+  try { return fsSync.statSync(p).isFile(); } catch { return false; }
+}
+function existsAsDir(p: string): boolean {
+  try { return fsSync.statSync(p).isDirectory(); } catch { return false; }
+}
+
+// Walk a candidate list — returns the first absolute path that exists as a
+// regular file. Symlinks resolve through statSync to their targets.
+function locateCli(candidates: string[]): string | null {
+  for (const c of candidates) {
+    if (existsAsFile(c)) return c;
+  }
+  return null;
+}
+
+// Look in the standard macOS app roots for `<appName>.app`. Returns the
+// absolute path to the bundle (a directory) or null.
+function locateApp(appName: string): string | null {
+  if (process.platform !== "darwin") return null;
+  for (const root of ["/Applications", `${HOME}/Applications`]) {
+    const candidate = `${root}/${appName}.app`;
+    if (existsAsDir(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Resolved opener: either spawn the CLI directly or fall back to `open -a`
+// on macOS using the discovered .app bundle. Stored at module scope so the
+// `open_in_editor` command handler can look up by id in O(1).
+type ResolvedOpener = { command: string; args: (absPath: string) => string[] };
+const resolvedOpeners = new Map<string, ResolvedOpener>();
+// Disk-cached PNG icons keyed by editor id. Extracted once at startup from
+// the .app bundle's CFBundleIconFile via `plutil` + `sips`, then served by
+// the daemon as `/api/editor-icon/:id`. Skipped silently when the helpers
+// aren't available (non-macOS, missing binaries) — the client falls back to
+// its generic glyph in that case.
+const editorIcons = new Map<string, string>();
+const iconCacheDir = path.join(agentDir, "piui-editor-icons");
+try { fsSync.mkdirSync(iconCacheDir, { recursive: true }); } catch { /* best-effort */ }
+
+function extractAppIcon(appPath: string, editorId: string): string | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const plist = path.join(appPath, "Contents/Info.plist");
+    const probe = spawnSync("plutil", ["-extract", "CFBundleIconFile", "raw", plist], { encoding: "utf-8" });
+    if (probe.status !== 0) return null;
+    let iconName = probe.stdout.trim();
+    if (!iconName) return null;
+    if (!iconName.toLowerCase().endsWith(".icns")) iconName += ".icns";
+    const icnsPath = path.join(appPath, "Contents/Resources", iconName);
+    if (!existsAsFile(icnsPath)) return null;
+    const outPath = path.join(iconCacheDir, `${editorId}.png`);
+    // Cache-busting key: source mtime. If the .app was upgraded since last
+    // boot we want a fresh icon, not yesterday's. Compare via stat.
+    const srcMtime = fsSync.statSync(icnsPath).mtimeMs;
+    if (existsAsFile(outPath) && fsSync.statSync(outPath).mtimeMs > srcMtime) return outPath;
+    // 64px is comfortable for a 16-22px button at 2× DPR; sips rasterizes
+    // the best-matching size from the multi-image .icns container.
+    const conv = spawnSync("sips", ["-s", "format", "png", icnsPath, "--out", outPath, "-Z", "64"], { encoding: "utf-8" });
+    if (conv.status !== 0) return null;
+    return outPath;
+  } catch {
+    return null;
+  }
+}
+
+function registerEditor(id: string, label: string, opener: ResolvedOpener, iconSource: string | null) {
+  resolvedOpeners.set(id, opener);
+  const icon = iconSource ? extractAppIcon(iconSource, id) : null;
+  if (icon) editorIcons.set(id, icon);
+  return { id, label, hasIcon: !!icon };
+}
+
+const availableEditors: Array<{ id: string; label: string; hasIcon: boolean }> = (() => {
+  const out: Array<{ id: string; label: string; hasIcon: boolean }> = [];
+  for (const entry of EDITOR_CATALOG) {
+    const cli = locateCli(entry.cliCandidates);
+    const app = entry.appName ? locateApp(entry.appName) : null;
+    if (cli) {
+      const argsFn = entry.cliArgs ?? ((p: string) => [p]);
+      out.push(registerEditor(entry.id, entry.label, { command: cli, args: argsFn }, app));
+      continue;
+    }
+    if (app && entry.appName) {
+      // `open -a "AppName" <file>` works for any registered .app whether
+      // or not the CLI shim is installed. We deliberately don't pass `-g`
+      // so the editor comes to the foreground.
+      const appName = entry.appName;
+      out.push(registerEditor(entry.id, entry.label, {
+        command: "open",
+        args: (p: string) => ["-a", appName, p],
+      }, app));
+    }
+  }
+  // macOS Finder reveal — always available via the built-in `open` binary;
+  // -R highlights the file in its containing folder rather than launching
+  // it with the default app. Pull the icon from the system Finder.app.
+  if (process.platform === "darwin") {
+    out.push(registerEditor("finder", "Finder",
+      { command: "open", args: (p: string) => ["-R", p] },
+      "/System/Library/CoreServices/Finder.app",
+    ));
+  }
+  return out;
+})();
+
+function openInEditor(editorId: string, absPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const opener = resolvedOpeners.get(editorId);
+    if (!opener) { reject(new Error(`Unknown editor: ${editorId}`)); return; }
+    const child = spawn(opener.command, opener.args(absPath), { stdio: "ignore", detached: true });
+    child.on("error", reject);
+    // Detach immediately — we don't want the agent server to babysit a GUI
+    // editor's lifecycle. `unref` lets node exit independently.
+    child.unref();
+    resolve();
+  });
+}
+
 initTheme();
 const themeColors: ThemeColor[] = [
   "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning", "muted", "dim", "text", "thinkingText", "userMessageText", "customMessageText", "customMessageLabel", "toolTitle", "toolOutput", "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "mdQuote", "mdQuoteBorder", "mdHr", "mdListBullet", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString", "syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation", "thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh", "bashMode",
@@ -122,6 +306,7 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "extension_ui_response",
   "trigger_shortcut",
   "extension_input",
+  "open_in_editor",
 ]);
 
 type Workspace = {
@@ -165,9 +350,11 @@ type ClientCommand = {
     | "get_settings"
     | "set_settings"
     | "list_files"
+    | "get_git"
     | "extension_ui_response"
     | "trigger_shortcut"
-    | "extension_input";
+    | "extension_input"
+    | "open_in_editor";
   cwd?: string;
   name?: string;
   workspaceId?: string;
@@ -185,6 +372,8 @@ type ClientCommand = {
   value?: unknown;
   key?: string;
   data?: string;
+  editor?: string;
+  path?: string;
 };
 
 type ModelRef = { provider: string; modelId: string };
@@ -213,6 +402,7 @@ type ServerPacket =
   | { type: "resources"; data: unknown }
   | { type: "models"; data: unknown }
   | { type: "settings"; data: unknown }
+  | { type: "git"; data: unknown }
   | { type: "files"; data: unknown }
   | { type: "tree"; data: unknown }
   | { type: "extension_ui_request"; request: unknown }
@@ -277,7 +467,7 @@ class WorkspaceStore {
   }
 
   list() {
-    return [...this.workspaces.values()].sort((a, b) => b.lastOpenedAt.localeCompare(a.lastOpenedAt));
+    return [...this.workspaces.values()];
   }
 
   get(id: string) {
@@ -482,18 +672,34 @@ function publicState(workspace: Workspace, session: AgentSession) {
   };
 }
 
-async function listSessions(cwd: string) {
+function sessionIsRunning(session: AgentSession) {
+  return session.isStreaming || session.isCompacting || session.isRetrying;
+}
+
+async function listSessions(cwd: string, liveSessions: AgentSession[] = []) {
   const sessions = await SessionManager.list(cwd);
-  return sessions.slice(0, 50).map((session) => ({
-    path: session.path,
-    id: session.id,
-    cwd: session.cwd,
-    name: session.name,
-    created: session.created,
-    modified: session.modified,
-    messageCount: session.messageCount,
-    firstMessage: session.firstMessage,
-  }));
+  return sessions.slice(0, 50).map((session) => {
+    const liveSession = liveSessions.find((candidate) => candidate.sessionFile === session.path);
+    return {
+      path: session.path,
+      id: session.id,
+      cwd: session.cwd,
+      name: session.name,
+      created: session.created,
+      modified: session.modified,
+      messageCount: session.messageCount,
+      firstMessage: session.firstMessage,
+      liveSessionId: liveSession?.sessionId,
+      isRunning: liveSession ? sessionIsRunning(liveSession) : undefined,
+    };
+  });
+}
+
+function workspaceFromCommand(store: WorkspaceStore, activeWorkspace: Workspace, workspaceId?: string) {
+  if (!workspaceId) return activeWorkspace;
+  const workspace = store.get(workspaceId);
+  if (!workspace) throw new Error(`Unknown workspace: ${workspaceId}`);
+  return workspace;
 }
 
 async function mostRecentSessionPath(cwd: string) {
@@ -502,6 +708,7 @@ async function mostRecentSessionPath(cwd: string) {
 }
 
 const FILE_LIST_LIMIT = 4000;
+const GIT_DIFF_LIMIT = 220_000;
 const FILE_WALK_EXCLUDE = new Set([
   ".git", "node_modules", "dist", "build", "out", ".next", ".vite",
   ".turbo", ".cache", ".venv", "venv", "__pycache__", ".mypy_cache",
@@ -512,18 +719,135 @@ const FILE_WALK_EXCLUDE = new Set([
 // is `git ls-files` (already gitignore-aware); falls back to a bounded
 // recursive walk that skips common heavy directories. Capped at FILE_LIST_LIMIT
 // so a monorepo doesn't ship a giant payload over the wire.
+function runGit(cwd: string, args: string[], opts: { maxBytes?: number } = {}): Promise<{ stdout: string; stderr: string; code: number; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", cwd, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const maxBytes = opts.maxBytes ?? 1024 * 1024;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let truncated = false;
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdoutBytes >= maxBytes) { truncated = true; return; }
+      const remaining = maxBytes - stdoutBytes;
+      stdout += chunk.subarray(0, remaining).toString();
+      stdoutBytes += Math.min(chunk.length, remaining);
+      if (chunk.length > remaining) truncated = true;
+    });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 0, truncated }));
+  });
+}
+
+async function gitText(cwd: string, args: string[], opts?: { maxBytes?: number }) {
+  const result = await runGit(cwd, args, opts);
+  if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args.join(" ")} exited ${result.code}`);
+  return result;
+}
+
+type GitFileStatus = {
+  path: string;
+  oldPath?: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "copied" | "typechange" | "unknown";
+  index: string;
+  worktree: string;
+};
+
+type GitSnapshot = {
+  isRepo: boolean;
+  root?: string;
+  branch?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  clean?: boolean;
+  files: GitFileStatus[];
+  diff?: string;
+  diffTruncated?: boolean;
+  error?: string;
+};
+
+function statusFromXY(index: string, worktree: string): GitFileStatus["status"] {
+  if (index === "?" && worktree === "?") return "untracked";
+  if (index === "R" || worktree === "R") return "renamed";
+  if (index === "C" || worktree === "C") return "copied";
+  if (index === "A" || worktree === "A") return "added";
+  if (index === "D" || worktree === "D") return "deleted";
+  if (index === "T" || worktree === "T") return "typechange";
+  if (index === "M" || worktree === "M") return "modified";
+  return "unknown";
+}
+
+function parseGitStatus(output: string): GitFileStatus[] {
+  const entries = output.split("\0").filter(Boolean);
+  const files: GitFileStatus[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const index = entry[0] ?? " ";
+    const worktree = entry[1] ?? " ";
+    const path = entry.slice(3);
+    const status = statusFromXY(index, worktree);
+    const file: GitFileStatus = { path, status, index, worktree };
+    if ((index === "R" || index === "C") && entries[i + 1]) file.oldPath = entries[++i];
+    files.push(file);
+  }
+  return files;
+}
+
+async function gitSnapshot(cwd: string): Promise<GitSnapshot> {
+  try {
+    const root = (await gitText(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
+    const branch = (await gitText(cwd, ["branch", "--show-current"])).stdout.trim()
+      || (await gitText(cwd, ["rev-parse", "--short", "HEAD"])).stdout.trim();
+    const statusOut = await gitText(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]);
+    const files = parseGitStatus(statusOut.stdout);
+
+    let upstream: string | undefined;
+    let ahead = 0;
+    let behind = 0;
+    try {
+      upstream = (await gitText(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])).stdout.trim() || undefined;
+      const counts = (await gitText(cwd, ["rev-list", "--left-right", "--count", "HEAD...@{u}"])).stdout.trim().split(/\s+/).map(Number);
+      ahead = Number.isFinite(counts[0]) ? counts[0] : 0;
+      behind = Number.isFinite(counts[1]) ? counts[1] : 0;
+    } catch {
+      // No upstream configured — local branch name is still useful.
+    }
+
+    const staged = await gitText(cwd, ["diff", "--cached", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"], { maxBytes: GIT_DIFF_LIMIT });
+    const remaining = Math.max(0, GIT_DIFF_LIMIT - Buffer.byteLength(staged.stdout));
+    const unstaged = remaining > 0
+      ? await gitText(cwd, ["diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"], { maxBytes: remaining })
+      : { stdout: "", truncated: true };
+    const chunks = [staged.stdout.trimEnd(), unstaged.stdout.trimEnd()].filter(Boolean);
+    return {
+      isRepo: true,
+      root,
+      branch,
+      upstream,
+      ahead,
+      behind,
+      clean: files.length === 0,
+      files,
+      diff: chunks.join("\n\n"),
+      diffTruncated: staged.truncated || unstaged.truncated,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not a git repository/i.test(message)) return { isRepo: false, files: [] };
+    return { isRepo: false, files: [], error: message };
+  }
+}
+
 async function listWorkspaceFiles(cwd: string): Promise<string[]> {
   // Prefer git when the workspace is a checkout — it respects .gitignore and
   // is dramatically faster on large repos.
   try {
     const out = await new Promise<string>((resolve, reject) => {
-      const child = spawn("git", ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard"], { stdio: ["ignore", "pipe", "pipe"] });
-      let buf = "";
-      let err = "";
-      child.stdout.on("data", (chunk) => { buf += chunk.toString(); });
-      child.stderr.on("data", (chunk) => { err += chunk.toString(); });
-      child.on("error", reject);
-      child.on("close", (code) => code === 0 ? resolve(buf) : reject(new Error(err.trim() || `git ls-files exited ${code}`)));
+      runGit(cwd, ["ls-files", "--cached", "--others", "--exclude-standard"])
+        .then((result) => result.code === 0 ? resolve(result.stdout) : reject(new Error(result.stderr.trim() || `git ls-files exited ${result.code}`)))
+        .catch(reject);
     });
     const files = out.split("\n").filter(Boolean).slice(0, FILE_LIST_LIMIT);
     if (files.length) return files;
@@ -878,7 +1202,7 @@ function buildExtensionContext(handle: RuntimeHandle, ui: ExtensionUIContext) {
   };
 }
 
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost, uiContext: ExtensionUIContext, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void) {
+async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost, uiContext: ExtensionUIContext, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void, isCurrent: () => boolean = () => true) {
   unsubscribe?.();
   const session = handle.runtime.session;
   const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
@@ -903,6 +1227,7 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
   // model twice if `agent_end` lands while a previous request is still open.
   let titleInFlight = false;
   const nextUnsubscribe = session.subscribe((event) => {
+    if (!isCurrent()) return;
     send(ws, { type: "event", event });
     if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
       send(ws, { type: "state", data: publicState(handle.workspace, session) });
@@ -914,10 +1239,10 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
         try {
           const title = await generateSessionTitle(session, settingsStore.get().titleModel);
           // Bail out if the user has switched away from this session before we got a result.
-          if (!title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
+          if (!isCurrent() || !title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
           session.setSessionName(title);
           send(ws, { type: "state", data: publicState(handle.workspace, session) });
-          send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd) } });
+          send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd, [session]) } });
         } finally {
           titleInFlight = false;
         }
@@ -927,10 +1252,11 @@ async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<
   send(ws, { type: "workspace", data: handle.workspace });
   send(ws, { type: "state", data: publicState(handle.workspace, session) });
   send(ws, { type: "messages", data: { messages: session.messages } });
-  send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd) } });
+  send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd, [session]) } });
   send(ws, { type: "resources", data: publicResources(session) });
   send(ws, { type: "models", data: { models: publicModels(session) } });
   send(ws, { type: "tree", data: { entries: publicTree(session) } });
+  send(ws, { type: "git", data: await gitSnapshot(handle.workspace.cwd) });
   if (lock.owner === "other") {
     send(ws, { type: "notification", data: { level: "warning", message: `Session file is already owned by PID ${lock.lock.pid}; avoid writing from two runtimes.` } });
   }
@@ -982,6 +1308,18 @@ async function main() {
     }
   });
 
+  // Serve the editor icons extracted from each detected `.app`'s
+  // CFBundleIconFile. Keyed by editor id; 404 when an icon couldn't be
+  // extracted (the client falls back to its generic IconCode glyph).
+  app.get("/api/editor-icon/:id", (req, res) => {
+    const file = editorIcons.get(req.params.id);
+    if (!file) { res.status(404).end(); return; }
+    // Long max-age + immutable; the cache key changes when the .app is
+    // upgraded because the source mtime triggers re-extraction at boot.
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.sendFile(file);
+  });
+
   if (isProduction) {
     const staticDir = path.resolve(__dirname, "../client");
     app.use(express.static(staticDir));
@@ -997,6 +1335,9 @@ async function main() {
     let handle: RuntimeHandle | undefined;
     let unsubscribe: (() => void) | undefined;
     let readOnly = false;
+    const handles = new Map<string, RuntimeHandle>();
+    const activeHandleByWorkspace = new Map<string, RuntimeHandle>();
+    const statusUnsubscribes = new Map<string, () => void>();
     const ownerId = crypto.randomUUID();
     const pendingUi = new Map<string, (value: unknown) => void>();
     // One WidgetHost per WS connection; it's reset between sessions so a new
@@ -1027,30 +1368,135 @@ async function main() {
       }
     }
 
-    async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
-      if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile, ownerId);
-      await handle?.runtime.dispose();
-      activeWorkspace = await store.touch(workspace.id);
-      handle = { workspace: activeWorkspace, runtime: await createRuntimeFor(activeWorkspace.cwd, options?.mode, options?.sessionPath) };
-      // Apply settings-driven defaults to brand-new sessions only — resuming an
-      // existing session preserves whatever it was last using.
-      if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(handle.runtime.session);
-      handle.runtime.setRebindSession(async () => {
-        const binding = await bindSession(ws, handle!, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
-        unsubscribe = binding.unsubscribe;
-        readOnly = binding.readOnly;
-        send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
+    function handleKey(workspaceId: string, sessionFile?: string) {
+      return `${workspaceId}:${sessionFile ?? "new"}`;
+    }
+
+    function keyForHandle(next: RuntimeHandle) {
+      return handleKey(next.workspace.id, next.runtime.session.sessionFile);
+    }
+
+    function handlesForWorkspace(workspaceId: string) {
+      return [...handles.values()].filter((candidate) => candidate.workspace.id === workspaceId);
+    }
+
+    function liveSessionsFor(workspaceId: string) {
+      return handlesForWorkspace(workspaceId).map((candidate) => candidate.runtime.session);
+    }
+
+    function registerHandle(next: RuntimeHandle) {
+      const nextKey = keyForHandle(next);
+      for (const [key, candidate] of handles) {
+        if (candidate === next && key !== nextKey) {
+          handles.delete(key);
+          statusUnsubscribes.get(key)?.();
+          statusUnsubscribes.delete(key);
+        }
+      }
+      handles.set(nextKey, next);
+      activeHandleByWorkspace.set(next.workspace.id, next);
+    }
+
+    async function sendWorkspaceSessions(workspace: Workspace) {
+      send(ws, {
+        type: "sessions",
+        data: {
+          workspaceId: workspace.id,
+          sessions: await listSessions(workspace.cwd, liveSessionsFor(workspace.id)),
+        },
       });
-      const binding = await bindSession(ws, handle, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
+    }
+
+    function bindWorkspaceStatus(next: RuntimeHandle) {
+      const key = keyForHandle(next);
+      statusUnsubscribes.get(key)?.();
+      const session = next.runtime.session;
+      statusUnsubscribes.set(key, session.subscribe((event) => {
+        if (["agent_start", "agent_end", "compaction_start", "compaction_end", "session_info_changed"].includes(event.type)) {
+          void sendWorkspaceSessions(next.workspace).catch((error) => {
+            console.warn("Failed to refresh workspace sessions:", error);
+          });
+        }
+      }));
+    }
+
+    async function bindActive(next: RuntimeHandle) {
+      const binding = await bindSession(
+        ws,
+        next,
+        pendingUi,
+        widgetHost,
+        extensionUi,
+        locks,
+        ownerId,
+        settingsStore,
+        unsubscribe,
+        () => handle === next && activeWorkspace.id === next.workspace.id,
+      );
       unsubscribe = binding.unsubscribe;
       readOnly = binding.readOnly;
       send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
-      return handle;
+    }
+
+    async function createHandle(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
+      const next: RuntimeHandle = { workspace, runtime: await createRuntimeFor(workspace.cwd, options?.mode, options?.sessionPath) };
+      registerHandle(next);
+      // Apply settings-driven defaults to brand-new sessions only — resuming an
+      // existing session preserves whatever it was last using.
+      if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(next.runtime.session);
+      bindWorkspaceStatus(next);
+      next.runtime.setRebindSession(async () => {
+        registerHandle(next);
+        bindWorkspaceStatus(next);
+        if (handle !== next) return;
+        await bindActive(next);
+      });
+      return next;
+    }
+
+    async function disposeHandle(workspaceId: string) {
+      const existingHandles = handlesForWorkspace(workspaceId);
+      for (const existing of existingHandles) {
+        if (handle === existing) {
+          unsubscribe?.();
+          unsubscribe = undefined;
+          handle = undefined;
+        }
+        await locks.release(existing.runtime.session.sessionFile, ownerId);
+        await existing.runtime.dispose();
+        const key = keyForHandle(existing);
+        statusUnsubscribes.get(key)?.();
+        statusUnsubscribes.delete(key);
+        handles.delete(key);
+      }
+      activeHandleByWorkspace.delete(workspaceId);
+    }
+
+    async function openHandle(workspace: Workspace, sessionPath: string) {
+      return handles.get(handleKey(workspace.id, sessionPath)) ?? await createHandle(workspace, { mode: "open", sessionPath });
+    }
+
+    async function activateHandle(workspace: Workspace, next: RuntimeHandle) {
+      activeWorkspace = await store.touch(workspace.id);
+      next.workspace = activeWorkspace;
+      registerHandle(next);
+      handle = next;
+      await bindActive(next);
+      return next;
+    }
+
+    async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
+      activeWorkspace = await store.touch(workspace.id);
+      const cached = options?.mode === "open" && options.sessionPath
+        ? handles.get(handleKey(activeWorkspace.id, options.sessionPath))
+        : activeHandleByWorkspace.get(activeWorkspace.id);
+      const next = cached ?? await createHandle(activeWorkspace, options);
+      return activateHandle(activeWorkspace, next);
     }
 
     try {
       await activate(activeWorkspace);
-      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session), settings: settingsStore.get() } });
+      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session), settings: settingsStore.get(), editors: availableEditors } });
       send(ws, { type: "settings", data: settingsStore.get() });
     } catch (error) {
       send(ws, { type: "response", command: "connect", success: false, error: error instanceof Error ? error.message : String(error) });
@@ -1105,43 +1551,51 @@ async function main() {
             if (command.workspaceId === initialWorkspaceId) {
               throw new Error("This workspace is the launch directory and is pinned — it can't be removed.");
             }
-            if (command.workspaceId === activeWorkspace.id) await handle?.runtime.dispose();
+            await disposeHandle(command.workspaceId);
             await store.remove(command.workspaceId);
             const next = store.list()[0] ?? (await store.add(initialCwd));
             await activate(next);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
-          case "list_sessions":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { sessions: await listSessions(activeWorkspace.cwd) } });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+          case "list_sessions": {
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const sessions = await listSessions(workspace.cwd, liveSessionsFor(workspace.id));
+            send(ws, { type: "response", id, command: command.type, success: true, data: { sessions } });
+            send(ws, { type: "sessions", data: { workspaceId: workspace.id, sessions } });
             break;
+          }
           case "delete_session": {
             if (!command.sessionPath) throw new Error("Missing sessionPath");
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
             // Refuse to delete the session file we currently hold open.
-            if (handle?.runtime.session.sessionFile === command.sessionPath) {
+            if ([...handles.values()].some((existing) => existing.runtime.session.sessionFile === command.sessionPath)) {
               throw new Error("This session is open. Switch to another conversation first, then delete it.");
             }
-            // Don't allow deletion of files outside the active workspace's session listing.
-            const sessionsForWs = await listSessions(activeWorkspace.cwd);
+            // Don't allow deletion of files outside the target workspace's session listing.
+            const sessionsForWs = await listSessions(workspace.cwd);
             if (!sessionsForWs.some((s) => s.path === command.sessionPath)) {
               throw new Error("Session not found in this workspace.");
             }
             await fs.unlink(command.sessionPath);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+            await sendWorkspaceSessions(workspace);
             break;
           }
           case "switch_session":
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             {
-              const lock = await locks.claim(command.sessionPath, activeWorkspace, ownerId);
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const lock = await locks.claim(command.sessionPath, workspace, ownerId);
               if (lock.owner === "other") throw lockConflictError(command.sessionPath, lock.lock);
-              const previousSessionFile = handle!.runtime.session.sessionFile;
-              const result = await handle!.runtime.switchSession(command.sessionPath, { cwdOverride: activeWorkspace.cwd });
-              if (!result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(previousSessionFile, ownerId);
-              else if (result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(command.sessionPath, ownerId);
-              send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+              try {
+                const next = await openHandle(workspace, command.sessionPath);
+                await activateHandle(workspace, next);
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
+              } catch (error) {
+                await locks.release(command.sessionPath, ownerId);
+                throw error;
+              }
             }
             break;
           case "continue_recent":
@@ -1150,24 +1604,23 @@ async function main() {
               if (sessionPath) {
                 const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
                 if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                const previousSessionFile = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
-                if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
-                else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
-                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+                try {
+                  const next = await openHandle(activeWorkspace, sessionPath);
+                  await activateHandle(activeWorkspace, next);
+                  send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
+                } catch (error) {
+                  await locks.release(sessionPath, ownerId);
+                  throw error;
+                }
               } else {
-                const previousSessionFile = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.newSession();
-                if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "New session cancelled by extension." : undefined });
+                await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
               }
             }
             break;
           case "new_session":
-            const previousSessionFile = handle!.runtime.session.sessionFile;
-            const newSessionResult = await handle!.runtime.newSession();
-            if (!newSessionResult.cancelled) await locks.release(previousSessionFile, ownerId);
-            send(ws, { type: "response", id, command: command.type, success: !newSessionResult.cancelled, data: newSessionResult, error: newSessionResult.cancelled ? "New session cancelled by extension." : undefined });
+            await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
+            send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
             break;
           case "get_state":
             send(ws, { type: "response", id, command: command.type, success: true, data: publicState(activeWorkspace, handle!.runtime.session) });
@@ -1188,18 +1641,18 @@ async function main() {
             if (!command.commandName) throw new Error("Missing commandName");
             const name = command.commandName.replace(/^\//, "");
             if (name === "new") {
-              const previous = handle!.runtime.session.sessionFile;
-              const result = await handle!.runtime.newSession();
-              if (!result.cancelled) await locks.release(previous, ownerId);
+              await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
             } else if (name === "resume") {
               const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
               if (sessionPath) {
                 const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
                 if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                const previous = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
-                if (!result.cancelled && previous !== sessionPath) await locks.release(previous, ownerId);
-                else if (result.cancelled && previous !== sessionPath) await locks.release(sessionPath, ownerId);
+                try {
+                  await activateHandle(activeWorkspace, await openHandle(activeWorkspace, sessionPath));
+                } catch (error) {
+                  await locks.release(sessionPath, ownerId);
+                  throw error;
+                }
               }
             } else if (name === "clone") {
               const leafId = handle!.runtime.session.sessionManager.getLeafId();
@@ -1227,12 +1680,15 @@ async function main() {
             break;
           case "prompt": {
             const session = handle!.runtime.session;
+            const workspace = activeWorkspace;
             if (!command.message?.trim()) throw new Error("Missing message");
             send(ws, { type: "response", id, command: command.type, success: true });
             await session.prompt(command.message, { streamingBehavior: command.streamingBehavior });
-            send(ws, { type: "state", data: publicState(activeWorkspace, session) });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
-            send(ws, { type: "tree", data: { entries: publicTree(session) } });
+            if (handle?.runtime.session === session && activeWorkspace.id === workspace.id) {
+              send(ws, { type: "state", data: publicState(workspace, session) });
+              send(ws, { type: "tree", data: { entries: publicTree(session) } });
+            }
+            await sendWorkspaceSessions(workspace);
             break;
           }
           case "steer":
@@ -1275,7 +1731,7 @@ async function main() {
           case "set_session_name":
             handle!.runtime.session.setSessionName(command.name ?? "");
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+            await sendWorkspaceSessions(activeWorkspace);
             send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
             break;
           case "export_html": {
@@ -1311,6 +1767,28 @@ async function main() {
             const files = await listWorkspaceFiles(activeWorkspace.cwd);
             send(ws, { type: "response", id, command: command.type, success: true, data: { files } });
             send(ws, { type: "files", data: { workspaceId: activeWorkspace.id, files } });
+            break;
+          }
+          case "open_in_editor": {
+            if (!command.editor || !command.path) throw new Error("Missing editor or path");
+            // Path comes from the client as workspace-relative (the same shape
+            // we ship in the `files` packet). Resolve against the active
+            // workspace so the editor opens the right absolute location.
+            const abs = path.resolve(activeWorkspace.cwd, command.path);
+            // Don't allow escaping the workspace via "../" — keep this strictly
+            // bounded so a misbehaving client can't `open -R /Users/.../id_rsa`.
+            const rel = path.relative(activeWorkspace.cwd, abs);
+            if (rel.startsWith("..") || path.isAbsolute(rel)) {
+              throw new Error("Path is outside the active workspace");
+            }
+            await openInEditor(command.editor, abs);
+            send(ws, { type: "response", id, command: command.type, success: true });
+            break;
+          }
+          case "get_git": {
+            const snapshot = await gitSnapshot(activeWorkspace.cwd);
+            send(ws, { type: "response", id, command: command.type, success: true, data: snapshot });
+            send(ws, { type: "git", data: snapshot });
             break;
           }
           case "get_settings":
@@ -1383,8 +1861,13 @@ async function main() {
       widgetHost.reset();
       for (const resolve of pendingUi.values()) resolve(undefined);
       pendingUi.clear();
-      await locks.release(handle?.runtime.session.sessionFile, ownerId);
-      await handle?.runtime.dispose();
+      await Promise.all([...handles.values()].map(async (existing) => {
+        await locks.release(existing.runtime.session.sessionFile, ownerId);
+        await existing.runtime.dispose();
+      }));
+      for (const releaseStatus of statusUnsubscribes.values()) releaseStatus();
+      statusUnsubscribes.clear();
+      handles.clear();
     });
   });
 

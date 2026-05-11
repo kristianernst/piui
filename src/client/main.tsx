@@ -6,12 +6,12 @@ import { measureLineStats, prepareWithSegments, type PreparedTextWithSegments } 
 import hljs from "highlight.js/lib/common";
 import {
   IconArrowUpSlim,
+  IconBranch,
   IconChev,
   IconChart,
   IconClose,
   IconCode,
   IconDb,
-  IconDiff,
   IconExpand,
   IconFile,
   IconFolder,
@@ -24,13 +24,15 @@ import {
   IconStop,
   IconSun,
   IconTerminal,
-} from "./icons";
+} from "./components/icons";
 import {
   connectPi,
   contentToText,
   type AgentEvent,
   type AgentMessage,
   type ExtensionUiRequest,
+  type GitFileStatus,
+  type GitSnapshot,
   type PiModelSummary,
   type PiResourceSummary,
   type PiSessionInfo,
@@ -39,12 +41,12 @@ import {
   type PiThinkingLevel,
   type ToolResultDetails,
   type Workspace,
-} from "./piSocket";
-import { parseAnsi, styleToCss } from "./ansi";
-import "./styles.css";
-import "./stage3.css";
+} from "./lib/piSocket";
+import { parseAnsi, styleToCss } from "./lib/ansi";
+import { AgentOrb } from "./components/AgentOrb";
+import "./styles/styles.css";
 
-const VisualizationChart = lazy(() => import("./VisualizationChart"));
+const VisualizationChart = lazy(() => import("./components/VisualizationChart"));
 
 type UiTool = {
   id: string;
@@ -210,14 +212,30 @@ function App() {
   const [state, setState] = useState<PiState | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
-  const [sessions, setSessions] = useState<PiSessionInfo[]>([]);
+  const [sessionsByWorkspace, setSessionsByWorkspace] = useState<Record<string, PiSessionInfo[]>>({});
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [models, setModels] = useState<PiModelSummary[]>([]);
   const [settings, setSettings] = useState<PiSettings | null>(null);
+  const [editors, setEditors] = useState<Array<{ id: string; label: string; hasIcon: boolean }>>([]);
   const [resources, setResources] = useState<PiResourceSummary | null>(null);
+  const [git, setGit] = useState<GitSnapshot | null>(null);
   const [files, setFiles] = useState<string[]>([]);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  // Persisted right-sidebar width — clamped to a sane range so dragging can't
+  // collapse it off-screen or grow it past half the viewport.
+  const RIGHT_MIN = 220;
+  const RIGHT_MAX = 640;
+  const [rightWidth, setRightWidth] = useState<number>(() => {
+    if (typeof localStorage === "undefined") return 244;
+    const stored = Number(localStorage.getItem("piui:right-sidebar-width"));
+    return Number.isFinite(stored) && stored >= RIGHT_MIN && stored <= RIGHT_MAX ? stored : 244;
+  });
+  useEffect(() => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("piui:right-sidebar-width", String(rightWidth));
+    }
+  }, [rightWidth]);
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
   const [draft, setDraft] = useState("");
   const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
@@ -243,16 +261,20 @@ function App() {
         setWorkspaces(packet.data.workspaces);
         setActiveWorkspaceId(packet.data.activeWorkspaceId);
         if (packet.data.settings) setSettings(packet.data.settings);
+        if (packet.data.editors) setEditors(packet.data.editors);
       }
       if (packet.type === "workspaces") {
         setWorkspaces(packet.data.workspaces);
         setActiveWorkspaceId(packet.data.activeWorkspaceId);
       }
       if (packet.type === "state") setState(packet.data);
-      if (packet.type === "sessions") setSessions(packet.data.sessions);
+      if (packet.type === "sessions") {
+        setSessionsByWorkspace((prev) => ({ ...prev, [packet.data.workspaceId]: packet.data.sessions }));
+      }
       if (packet.type === "models") setModels(packet.data.models);
       if (packet.type === "settings") setSettings(packet.data);
       if (packet.type === "resources") setResources(packet.data);
+      if (packet.type === "git") setGit(packet.data);
       if (packet.type === "files") setFiles(packet.data.files);
       if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
       if (packet.type === "extension_ui_request") setUiRequest(packet.request);
@@ -325,7 +347,10 @@ function App() {
   useEffect(() => {
     if (!activeWorkspaceId) return;
     setFiles([]);
+    setGit(null);
+    socketRef.current?.send({ type: "list_sessions", workspaceId: activeWorkspaceId });
     socketRef.current?.send({ type: "list_files" });
+    socketRef.current?.send({ type: "get_git" });
   }, [activeWorkspaceId]);
 
   function handleThreadScroll() {
@@ -387,6 +412,9 @@ function App() {
 
 
   function applyEvent(event: AgentEvent) {
+    if (event.type === "tool_execution_end" || event.type === "agent_end") {
+      socketRef.current?.send({ type: "get_git" });
+    }
     if (event.type === "message_start" && event.message && event.message.role === "user") {
       setMessages((prev) => {
         const ui = uiMessageFromAgent(event.message!, `e-${Date.now()}`);
@@ -504,7 +532,6 @@ function App() {
 
   function switchWorkspace(workspaceId: string) {
     setMessages([]);
-    setSessions([]);
     socketRef.current?.send({ type: "switch_workspace", workspaceId });
   }
 
@@ -512,13 +539,17 @@ function App() {
     socketRef.current?.send({ type: "remove_workspace", workspaceId });
   }
 
-  function switchSession(sessionPath: string) {
-    setMessages([]);
-    socketRef.current?.send({ type: "switch_session", sessionPath });
+  function listSessions(workspaceId: string) {
+    socketRef.current?.send({ type: "list_sessions", workspaceId });
   }
 
-  function deleteSession(sessionPath: string) {
-    socketRef.current?.send({ type: "delete_session", sessionPath });
+  function switchSession(workspaceId: string, sessionPath: string) {
+    setMessages([]);
+    socketRef.current?.send({ type: "switch_session", workspaceId, sessionPath });
+  }
+
+  function deleteSession(workspaceId: string, sessionPath: string) {
+    socketRef.current?.send({ type: "delete_session", workspaceId, sessionPath });
   }
 
   function updateSettings(patch: Partial<PiSettings>) {
@@ -541,11 +572,13 @@ function App() {
         onOpenWorkspace={openWorkspace}
         onSwitchWorkspace={switchWorkspace}
         onRemoveWorkspace={removeWorkspace}
+        onListSessions={listSessions}
         onSwitchSession={switchSession}
         onDeleteSession={deleteSession}
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
-        sessions={sessions}
+        sessionsByWorkspace={sessionsByWorkspace}
+        activeSessionFile={state?.sessionFile}
         activeSessionId={state?.sessionId}
         activeIsStreaming={!!state?.isStreaming}
         dark={dark}
@@ -565,7 +598,6 @@ function App() {
             )}
           </div>
           <div className="titleBlock">
-            {state?.sessionId && <AgentOrb seed={state.sessionId} running={!!state?.isStreaming} size={18} />}
             <span className="titleText">{headerTitle}</span>
           </div>
           <div className="topbar-side right">
@@ -578,7 +610,7 @@ function App() {
         </header>
 
         <div className="thread" ref={threadRef} onScroll={handleThreadScroll}>
-          {messages.length === 0 ? <EmptyState /> : messages.map((message) => <MessageView key={message.id} message={message} />)}
+          {messages.length === 0 ? <EmptyState /> : messages.map((message) => <MessageView key={message.id} message={message} seed={state?.sessionId} />)}
         </div>
 
         <Composer
@@ -595,10 +627,21 @@ function App() {
           onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
           resources={resources}
           files={files}
+          git={git}
           extension={extension}
         />
       </main>
-      <RightSidebar open={rightOpen} onToggle={() => setRightOpen((v) => !v)} />
+      <RightSidebar
+        open={rightOpen}
+        onToggle={() => setRightOpen((v) => !v)}
+        git={git}
+        files={files}
+        workspaceName={state?.workspace?.name ?? ""}
+        width={rightWidth}
+        onWidthChange={setRightWidth}
+        editors={editors}
+        onOpenInEditor={(editor, p) => socketRef.current?.send({ type: "open_in_editor", editor, path: p })}
+      />
       {uiRequest && (
         <ExtensionDialog
           request={uiRequest}
@@ -722,318 +765,6 @@ function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage
 // Pi logo from https://pi.dev/logo.svg, inlined and re-fitted to use
 // `currentColor` so it picks up the heading's color (black in light mode,
 // near-white in dark mode) without a second asset round-trip.
-// Each Pi session gets a chunky, alive pixel orb — a tiny self-contained
-// particle simulation rendered into a 22×22 canvas, displayed via
-// `image-rendering: pixelated` for crisp pixel-art edges. Adapted from the
-// design-team prototype shipped in the AI Orb library handoff bundle. The
-// seed (session id) picks a palette + initial particle layout deterministically,
-// so the same conversation always shows the same orb identity; per-frame
-// color morphing + ember sparkles use Math.random for liveness so two parallel
-// orbs from the same seed don't lockstep.
-//
-// Rendering: per-pixel winner-takes-all over the 9 particles' weighted
-// distance fields. Where two particles' weights are close we 4×4 Bayer-dither
-// between them, giving hard pixel-art boundaries instead of a mushy blend.
-// The silhouette is a strict circle (pixels outside the disk are transparent)
-// so the orb is always perfectly round at any size.
-//
-// `running` gates the rAF loop. When false we still render a single static
-// frame so the identity badge is visible — idle orbs cost zero animation
-// cycles. Once piui supports multiple parallel runtimes per tab, each
-// session's `running` bit becomes independent and every sidebar row can
-// animate on its own schedule.
-
-const ORB_PALETTES: Record<string, string[]> = {
-  ember:  ['#07070a', '#3a0a08', '#9c1a10', '#e84818', '#ffa01c', '#ffe040', '#c8ff3c', '#3cf088', '#a8ffd8'],
-  reef:   ['#03060c', '#08203c', '#0e60a8', '#1cb4e8', '#54f0e0', '#a8ffd0', '#fff5b0', '#ffb850', '#ff5030'],
-  cosmic: ['#06031a', '#1c0848', '#5418b8', '#a838e8', '#ff48c0', '#ff90a0', '#ffe080', '#a8f0ff', '#ffffff'],
-  forest: ['#020a06', '#082818', '#147028', '#5cc830', '#c8ff48', '#fff5b0', '#f0a020', '#c44010', '#5c0810'],
-  arctic: ['#020812', '#0a2c4c', '#2870a0', '#6cc0e0', '#c4f0f0', '#ffffff', '#e8c4ff', '#a040d8', '#48108c'],
-  toxic:  ['#020806', '#082018', '#0c5c2c', '#2cc848', '#c8ff20', '#ffffff', '#ff48c0', '#a01890', '#380838'],
-};
-const ORB_PALETTE_KEYS = Object.keys(ORB_PALETTES);
-
-// 4×4 Bayer matrix, pre-normalized to [0,1). Used to dither between two
-// competing particles at pixel boundaries — gives hard pixel-art edges
-// instead of bilinear-blended muck.
-const BAYER4 = [
-  [ 0, 8, 2,10],
-  [12, 4,14, 6],
-  [ 3,11, 1, 9],
-  [15, 7,13, 5],
-].map((row) => row.map((v) => (v + 0.5) / 16));
-
-type RGB = [number, number, number];
-
-function hexToRgb(h: string): RGB {
-  const n = parseInt(h.slice(1), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-function lerpRgb(a: RGB, b: RGB, t: number): RGB {
-  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-}
-
-// Deterministic PRNG seeded from session id — gives stable palette and
-// initial particle layout per session.
-function makeSeededRandom(seed: string): () => number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 0x01000193) >>> 0;
-  return () => {
-    h ^= h << 13; h >>>= 0;
-    h ^= h >>> 17;
-    h ^= h << 5; h >>>= 0;
-    return (h >>> 0) / 0xffffffff;
-  };
-}
-
-type OrbParticle = {
-  baseAng: number; baseRad: number;
-  angSpeed: number;
-  radFreq: number; radAmp: number;
-  wobFreq: number; wobAmp: number;
-  phase: number; phase2: number;
-  r: number; rPhase: number; rFreq: number;
-  from: number; to: number;
-  morph: number; morphDur: number;
-  // runtime
-  x: number; y: number; rNow: number;
-};
-
-type OrbState = {
-  seed: string;
-  particles: OrbParticle[];
-  t: number;
-  colors: RGB[];
-  particleColors: RGB[];
-  bg: RGB;
-  hot: RGB;
-  hot2: RGB;
-  embers: Array<{ x: number; y: number; life: number; hot: boolean }>;
-};
-
-const ORB_GRID = 22;
-const ORB_PARTICLE_COUNT = 9;
-const ORB_CONTRAST = 4;
-const ORB_MORPH_RATE = 1;
-const ORB_EMBER_RATE = 1.2;
-
-function paletteFor(seed: string): string[] {
-  // Run a fresh PRNG (separate stream from particle init) so palette and
-  // particle layouts decorrelate — adjacent seeds don't end up with the
-  // same palette and a near-identical particle field.
-  const rand = makeSeededRandom(seed + ":palette");
-  return ORB_PALETTES[ORB_PALETTE_KEYS[Math.floor(rand() * ORB_PALETTE_KEYS.length)]];
-}
-
-function initOrbState(seed: string, palette: string[]): OrbState {
-  const rand = makeSeededRandom(seed + ":particles");
-  const G = ORB_GRID;
-  const colors = palette.map(hexToRgb);
-  const particleColors = colors.slice(1);
-  const M = particleColors.length;
-  const particles: OrbParticle[] = [];
-  for (let i = 0; i < ORB_PARTICLE_COUNT; i++) {
-    const baseAng = (i / ORB_PARTICLE_COUNT) * Math.PI * 2;
-    const ci = (i + ((rand() * M) | 0)) % M;
-    const ciNext = (ci + 1 + ((rand() * (M - 2)) | 0)) % M;
-    particles.push({
-      baseAng,
-      baseRad: G * (0.20 + rand() * 0.14),
-      angSpeed: 0.18 + rand() * 0.22,
-      radFreq: 0.25 + rand() * 0.35,
-      radAmp: G * (0.06 + rand() * 0.07),
-      wobFreq: 0.4 + rand() * 0.5,
-      wobAmp: G * (0.04 + rand() * 0.06),
-      phase: rand() * Math.PI * 2,
-      phase2: rand() * Math.PI * 2,
-      r: G * (0.20 + rand() * 0.10),
-      rPhase: rand() * Math.PI * 2,
-      rFreq: 0.2 + rand() * 0.3,
-      from: ci, to: ciNext, morph: 0,
-      morphDur: 1.6 + rand() * 1.6,
-      x: G / 2, y: G / 2, rNow: G * 0.22,
-    });
-  }
-  return {
-    seed,
-    particles,
-    t: 0,
-    colors,
-    particleColors,
-    bg: colors[0],
-    hot: colors[colors.length - 1],
-    hot2: colors[colors.length - 2],
-    embers: [],
-  };
-}
-
-function AgentOrb({ seed, running, size = 18 }: { seed: string; running: boolean; size?: number }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const stateRef = useRef<OrbState | null>(null);
-
-  const palette = useMemo(() => paletteFor(seed || "default"), [seed]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    if (!stateRef.current || stateRef.current.seed !== (seed || "default")) {
-      stateRef.current = initOrbState(seed || "default", palette);
-    }
-    const G = ORB_GRID;
-    const img = ctx.createImageData(G, G);
-    const data = img.data;
-    const cx = G / 2, cy = G / 2;
-    const R = G / 2 - 0.5;
-    const Rsq = R * R;
-
-    let raf = 0;
-    let last = 0;
-    const tick = (now: number) => {
-      if (!last) last = now;
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      const s = stateRef.current;
-      if (!s) {
-        if (running) raf = requestAnimationFrame(tick);
-        return;
-      }
-      s.t += dt;
-      const t = s.t;
-      const particles = s.particles;
-      const M = s.particleColors.length;
-
-      // ── smooth orbital motion ────────────────────────────────────────
-      for (const p of particles) {
-        const ang = p.baseAng + t * p.angSpeed * ORB_MORPH_RATE
-                  + Math.sin(t * p.wobFreq + p.phase) * 0.35;
-        const rad = p.baseRad
-                  + Math.sin(t * p.radFreq * ORB_MORPH_RATE + p.phase) * p.radAmp
-                  + Math.cos(t * p.wobFreq * 0.6 + p.phase2) * p.wobAmp;
-        p.x = cx + Math.cos(ang) * rad;
-        p.y = cy + Math.sin(ang) * rad;
-        p.rNow = G * (0.22 + 0.06 * Math.sin(t * p.rFreq + p.rPhase));
-
-        // smooth color lerp; when one cycle finishes, pick next target
-        p.morph += dt * ORB_MORPH_RATE;
-        if (p.morph >= p.morphDur) {
-          p.from = p.to;
-          let next = (Math.random() * M) | 0;
-          let tries = 0;
-          while (Math.abs(next - p.from) < 2 && tries < 5) {
-            next = (Math.random() * M) | 0; tries++;
-          }
-          p.to = next;
-          p.morph = 0;
-          p.morphDur = 1.4 + Math.random() * 1.8;
-        }
-      }
-
-      // resolve current rgb for each particle (smoothstep lerp from→to)
-      const pColors = particles.map((p) => {
-        const k = Math.min(1, p.morph / p.morphDur);
-        const ks = k * k * (3 - 2 * k);
-        return lerpRgb(s.particleColors[p.from], s.particleColors[p.to], ks);
-      });
-
-      // ── embers (random in-orb pixel flashes) ─────────────────────────
-      const e = s.embers;
-      for (let i = e.length - 1; i >= 0; i--) {
-        e[i].life -= dt * 5;
-        if (e[i].life <= 0) e.splice(i, 1);
-      }
-      const spawnTarget = ORB_EMBER_RATE * dt * 60;
-      const nSpawn = Math.floor(spawnTarget) + (Math.random() < (spawnTarget % 1) ? 1 : 0);
-      for (let i = 0; i < nSpawn; i++) {
-        const p = particles[(Math.random() * particles.length) | 0];
-        const ang = Math.random() * Math.PI * 2;
-        const rad = Math.random() * (p.rNow || p.r) * 0.85;
-        const ex = Math.round(p.x + Math.cos(ang) * rad);
-        const ey = Math.round(p.y + Math.sin(ang) * rad);
-        const ddx = ex - cx + 0.5, ddy = ey - cy + 0.5;
-        if (ddx * ddx + ddy * ddy < Rsq && ex >= 0 && ex < G && ey >= 0 && ey < G) {
-          e.push({ x: ex, y: ey, life: 0.8 + Math.random() * 0.5, hot: Math.random() < 0.35 });
-        }
-      }
-
-      // ── render: strict circle silhouette + winner-takes-all w/ dither ─
-      const sharp = ORB_CONTRAST;
-      const bg = s.bg;
-      let pIdx = 0;
-      for (let y = 0; y < G; y++) {
-        for (let x = 0; x < G; x++) {
-          const dxc = x - cx + 0.5, dyc = y - cy + 0.5;
-          const distSq = dxc * dxc + dyc * dyc;
-          if (distSq > Rsq) {
-            // Outside the circle — transparent. The wrapping div's bg shows
-            // the palette[0] base, and overflow:hidden keeps the rim crisp.
-            data[pIdx++] = 0; data[pIdx++] = 0; data[pIdx++] = 0; data[pIdx++] = 0;
-            continue;
-          }
-          // Inside: find top-2 particles by sharpened weight.
-          let bestW = 0, bestI = -1;
-          let secW = 0, secI = -1;
-          for (let i = 0; i < particles.length; i++) {
-            const pp = particles[i];
-            const ddx = x + 0.5 - pp.x, ddy = y + 0.5 - pp.y;
-            const d2 = ddx * ddx + ddy * ddy + 0.4;
-            const w = Math.pow((pp.rNow * pp.rNow) / d2, sharp);
-            if (w > bestW) { secW = bestW; secI = bestI; bestW = w; bestI = i; }
-            else if (w > secW) { secW = w; secI = i; }
-          }
-          let r: number, g: number, b: number;
-          if (bestI < 0) {
-            r = bg[0]; g = bg[1]; b = bg[2];
-          } else {
-            const bc = pColors[bestI];
-            if (secI >= 0 && secW > 0) {
-              const ratio = secW / (bestW + secW);
-              const thresh = BAYER4[y & 3][x & 3];
-              const c = ratio > thresh * 0.55 ? pColors[secI] : bc;
-              r = c[0]; g = c[1]; b = c[2];
-            } else {
-              r = bc[0]; g = bc[1]; b = bc[2];
-            }
-          }
-          data[pIdx++] = r; data[pIdx++] = g; data[pIdx++] = b; data[pIdx++] = 255;
-        }
-      }
-      // Ember overlay (only painted while the spark is bright).
-      for (let i = 0; i < e.length; i++) {
-        const sp = e[i];
-        if (sp.life > 0.15) {
-          const idx = (sp.y * G + sp.x) * 4;
-          const c = sp.hot ? s.hot : s.hot2;
-          data[idx]     = c[0];
-          data[idx + 1] = c[1];
-          data[idx + 2] = c[2];
-          data[idx + 3] = 255;
-        }
-      }
-      ctx.putImageData(img, 0, 0);
-      if (running) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => { if (raf) cancelAnimationFrame(raf); };
-  }, [seed, running, palette]);
-
-  return (
-    <span
-      className="orb"
-      style={{ width: size, height: size, background: palette[0] }}
-      aria-hidden="true"
-    >
-      <canvas
-        ref={canvasRef}
-        width={ORB_GRID}
-        height={ORB_GRID}
-        className="orb-canvas"
-      />
-    </span>
-  );
-}
 
 function PiLogo({ className, title = "Pi" }: { className?: string; title?: string }) {
   return (
@@ -1064,7 +795,7 @@ function EmptyState() {
   );
 }
 
-function MessageView({ message }: { message: UiMessage }) {
+function MessageView({ message, seed }: { message: UiMessage; seed?: string }) {
   if (message.role === "user") return <div className="msg user fadeUp"><div className="bubble">{message.text}</div></div>;
 
   const blocks = message.blocks ?? [];
@@ -1088,6 +819,7 @@ function MessageView({ message }: { message: UiMessage }) {
           active={isWorking}
           toolCount={toolCount}
           durationMs={durationMs}
+          seed={seed ?? message.id}
         />
       )}
       {answer ? <Markdown text={answer} /> : null}
@@ -1101,18 +833,41 @@ function formatDuration(ms?: number): string | null {
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 }
 
+// Threshold above which a *completed* turn collapses by default. While the
+// turn is still streaming we always keep the timeline expanded so the user
+// can watch progress; once it settles, a long reasoning trail folds into a
+// "Worked …" pill so the chat stays readable.
+const REASONING_AUTO_COLLAPSE_THRESHOLD = 5;
+
 function Reasoning({
   blocks,
   active,
   toolCount,
   durationMs,
+  seed,
 }: {
   blocks: UiBlock[];
   active?: boolean;
   toolCount: number;
   durationMs?: number;
+  seed: string;
 }) {
-  const [open, setOpen] = useState(true);
+  // Initial state: open while working, open if short, collapsed if a settled
+  // turn already has > N steps (e.g. when scrolling back through history).
+  const [open, setOpen] = useState(() => active || blocks.length <= REASONING_AUTO_COLLAPSE_THRESHOLD);
+  // Track explicit user clicks so the active → done transition doesn't yank
+  // the panel shut on someone who deliberately opened it mid-stream.
+  const [userToggled, setUserToggled] = useState(false);
+  useEffect(() => {
+    if (!userToggled && !active && blocks.length > REASONING_AUTO_COLLAPSE_THRESHOLD) {
+      setOpen(false);
+    }
+  }, [active, blocks.length, userToggled]);
+  function toggle() {
+    setUserToggled(true);
+    setOpen((v) => !v);
+  }
+
   const duration = formatDuration(durationMs);
   const label = active ? "Working" : "Worked";
   const meta = [
@@ -1121,8 +876,12 @@ function Reasoning({
   ].filter(Boolean).join(" ");
   return (
     <div className={`reasoning ${open ? "open" : ""}`}>
-      <button onClick={() => setOpen((v) => !v)} className={active ? "thinking" : "done"}>
-        {active && <span className="spinner" />}
+      <button onClick={toggle} className={active ? "thinking" : "done"}>
+        {/* The orb replaces the old static spinner: while a turn streams it
+            ticks on rAF as the active session's identity, and when the turn
+            settles it freezes on its last frame as a quiet badge next to
+            "Worked". */}
+        <AgentOrb seed={seed} running={!!active} size={16} />
         <span className="reasoningLabel">{label}{active ? "…" : ""}</span>
         {meta && <span className="reasoningMeta">{meta}</span>}
       </button>
@@ -1936,6 +1695,7 @@ function Composer({
   onSetModel,
   resources,
   files,
+  git,
   extension,
 }: {
   state: PiState | null;
@@ -1951,6 +1711,7 @@ function Composer({
   onSetModel: (provider: string, modelId: string) => void;
   resources: PiResourceSummary | null;
   files: string[];
+  git: GitSnapshot | null;
   extension: ExtensionRun | null;
 }) {
   const disabled = connection !== "open";
@@ -2154,6 +1915,14 @@ function Composer({
         >
           {currentThinking}
         </button>
+        {git?.isRepo && git.branch && (
+          <span className="gitBranch" title={git.upstream ? `${git.branch} → ${git.upstream}` : `Git branch: ${git.branch}`}>
+            <IconBranch size={12} />
+            <span className="gitBranch-name">{git.branch}</span>
+            {git.ahead ? <span className="gitBranch-trail">↑{git.ahead}</span> : null}
+            {git.behind ? <span className="gitBranch-trail">↓{git.behind}</span> : null}
+          </span>
+        )}
         <span className="ctx" title={state?.usage?.tokens != null && state?.usage?.contextWindow ? `${state.usage.tokens.toLocaleString()} / ${state.usage.contextWindow.toLocaleString()} tokens used in the model's context window` : "Context usage will appear after the first turn"}>
           <span style={{ width: `${pct}%` }} />{pct || 0}%
         </span>
@@ -2357,11 +2126,13 @@ function LeftSidebar({
   onOpenWorkspace,
   onSwitchWorkspace,
   onRemoveWorkspace,
+  onListSessions,
   onSwitchSession,
   onDeleteSession,
   workspaces,
   activeWorkspaceId,
-  sessions,
+  sessionsByWorkspace,
+  activeSessionFile,
   activeSessionId,
   activeIsStreaming,
   dark,
@@ -2377,11 +2148,13 @@ function LeftSidebar({
   onOpenWorkspace: () => void;
   onSwitchWorkspace: (workspaceId: string) => void;
   onRemoveWorkspace: (workspaceId: string) => void;
-  onSwitchSession: (sessionPath: string) => void;
-  onDeleteSession: (sessionPath: string) => void;
+  onListSessions: (workspaceId: string) => void;
+  onSwitchSession: (workspaceId: string, sessionPath: string) => void;
+  onDeleteSession: (workspaceId: string, sessionPath: string) => void;
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
-  sessions: PiSessionInfo[];
+  sessionsByWorkspace: Record<string, PiSessionInfo[]>;
+  activeSessionFile?: string;
   activeSessionId?: string;
   activeIsStreaming: boolean;
   dark: boolean;
@@ -2392,17 +2165,22 @@ function LeftSidebar({
   onUpdateSettings: (patch: Partial<PiSettings>) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [openWorkspaces, setOpenWorkspaces] = useState<Set<string>>(() => new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(() => new Set());
-  function confirmDelete(session: PiSessionInfo) {
+
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    setOpenWorkspaces((prev) => new Set(prev).add(activeWorkspaceId));
+  }, [activeWorkspaceId]);
+  function confirmDelete(workspaceId: string, session: PiSessionInfo) {
     const label = session.name || session.firstMessage || "Untitled";
     toast(`Delete "${label}"?`, {
       description: "This conversation file will be permanently removed.",
       duration: 8000,
       action: {
         label: "Delete",
-        onClick: () => onDeleteSession(session.path),
+        onClick: () => onDeleteSession(workspaceId, session.path),
       },
       cancel: { label: "Cancel", onClick: () => undefined },
     });
@@ -2421,20 +2199,23 @@ function LeftSidebar({
   }
 
   const q = query.trim().toLowerCase();
-  const filteredSessions = q
-    ? sessions.filter((session) => `${session.name ?? ""} ${session.firstMessage} ${session.path}`.toLowerCase().includes(q))
-    : sessions;
+  function sessionsForWorkspace(workspaceId: string) {
+    const sessions = sessionsByWorkspace[workspaceId] ?? [];
+    return q
+      ? sessions.filter((session) => `${session.name ?? ""} ${session.firstMessage} ${session.path}`.toLowerCase().includes(q))
+      : sessions;
+  }
 
   function toggleWorkspace(id: string) {
-    if (id !== activeWorkspaceId) {
-      onSwitchWorkspace(id);
-      setCollapsed((prev) => { const next = new Set(prev); next.delete(id); return next; });
-      return;
-    }
-    setCollapsed((prev) => {
+    // Expansion and active-workspace are decoupled: the workspace row is just
+    // an accordion. Picking a session inside it is the explicit switch.
+    setOpenWorkspaces((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
-      else next.add(id);
+      else {
+        next.add(id);
+        onListSessions(id);
+      }
       return next;
     });
   }
@@ -2483,19 +2264,26 @@ function LeftSidebar({
           ) : (
             workspaces.map((workspace) => {
               const isActive = workspace.id === activeWorkspaceId;
-              const isOpen = isActive && !collapsed.has(workspace.id);
-              const wsSessions = isActive ? filteredSessions : [];
+              const wsSessions = sessionsForWorkspace(workspace.id);
+              const isOpen = q ? wsSessions.length > 0 : openWorkspaces.has(workspace.id);
               const expanded = expandedSessions.has(workspace.id);
               const visible = expanded || q ? wsSessions : wsSessions.slice(0, SESSIONS_INITIAL_LIMIT);
               const hiddenCount = wsSessions.length - visible.length;
               return (
                 <div key={workspace.id} className={`sb-ws ${isActive ? "active" : ""} ${isOpen ? "open" : "closed"}`}>
                   <div className="sb-ws-row">
-                    <button className="sb-ws-head" onClick={() => toggleWorkspace(workspace.id)} title={workspace.cwd}>
+                    <button
+                      className="sb-ws-toggle"
+                      onClick={() => toggleWorkspace(workspace.id)}
+                      title={isOpen ? "Collapse workspace" : "Expand workspace"}
+                      aria-label={isOpen ? "Collapse workspace" : "Expand workspace"}
+                    >
                       <IconChev className="sb-chev" size={11} />
+                    </button>
+                    <button className="sb-ws-head" onClick={() => onSwitchWorkspace(workspace.id)} title={workspace.cwd}>
                       <IconFolder className="sb-folder" size={13} />
                       <span className="sb-ws-name">{workspace.name}</span>
-                      {isActive && wsSessions.length > 0 && <span className="sb-ws-count">{wsSessions.length}</span>}
+                      {wsSessions.length > 0 && <span className="sb-ws-count">{wsSessions.length}</span>}
                     </button>
                     {!workspace.pinned && (
                       <button
@@ -2510,37 +2298,42 @@ function LeftSidebar({
                   </div>
                   <div className="sb-ws-body">
                     <div className="sb-ws-body-inner">
-                      {isActive && (
+                      {isOpen && (
                         <div className="sb-convs">
                           {wsSessions.length === 0 ? (
                             <p className="sb-empty">No sessions yet.</p>
                           ) : (
                             <>
-                              {visible.map((session) => (
-                                <div key={session.path} className={`sb-conv-row ${session.id === activeSessionId ? "active" : ""}`}>
-                                  <button
-                                    className="sb-conv"
-                                    onClick={() => onSwitchSession(session.path)}
-                                    title={session.path}
-                                  >
-                                    <AgentOrb
-                                      seed={session.id}
-                                      running={session.id === activeSessionId && activeIsStreaming}
-                                      size={14}
-                                    />
-                                    <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
-                                    <span className="sb-conv-time">{relativeTime(session.modified)}</span>
-                                  </button>
-                                  <button
-                                    className="sb-conv-del"
-                                    title="Delete conversation"
-                                    aria-label="Delete conversation"
-                                    onClick={(event) => { event.stopPropagation(); confirmDelete(session); }}
-                                  >
-                                    <IconClose size={12} />
-                                  </button>
-                                </div>
-                              ))}
+                              {visible.map((session) => {
+                                const isCurrent = session.path === activeSessionFile || session.id === activeSessionId;
+                                const running = !!session.isRunning || (isCurrent && activeIsStreaming);
+                                const orbSeed = isCurrent && activeSessionId ? activeSessionId : session.liveSessionId ?? session.id;
+                                return (
+                                  <div key={session.path} className={`sb-conv-row ${isCurrent ? "active" : ""}`}>
+                                    <button
+                                      className="sb-conv"
+                                      onClick={() => onSwitchSession(workspace.id, session.path)}
+                                      title={session.path}
+                                    >
+                                      <AgentOrb
+                                        seed={orbSeed}
+                                        running={running}
+                                        size={14}
+                                      />
+                                      <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
+                                      <span className="sb-conv-time">{relativeTime(session.modified)}</span>
+                                    </button>
+                                    <button
+                                      className="sb-conv-del"
+                                      title="Delete conversation"
+                                      aria-label="Delete conversation"
+                                      onClick={(event) => { event.stopPropagation(); confirmDelete(workspace.id, session); }}
+                                    >
+                                      <IconClose size={12} />
+                                    </button>
+                                  </div>
+                                );
+                              })}
                               {hiddenCount > 0 && (
                                 <button className="sb-show-more" onClick={() => toggleExpanded(workspace.id)}>
                                   Show {hiddenCount} more
@@ -2712,28 +2505,429 @@ function SettingsDialog({
   );
 }
 
-function RightSidebar({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+function gitStatusLabel(file: GitFileStatus) {
+  const labels: Record<GitFileStatus["status"], string> = {
+    added: "A",
+    modified: "M",
+    deleted: "D",
+    renamed: "R",
+    untracked: "?",
+    copied: "C",
+    typechange: "T",
+    unknown: "•",
+  };
+  return labels[file.status];
+}
+
+function diffLineClass(line: string) {
+  if (line.startsWith("+++") || line.startsWith("---")) return "diffMeta";
+  if (line.startsWith("@@")) return "diffHunk";
+  if (line.startsWith("+")) return "diffAdd";
+  if (line.startsWith("-")) return "diffDel";
+  return "diffCtx";
+}
+
+type EditorInfo = { id: string; label: string; hasIcon: boolean };
+
+function RightSidebar({
+  open,
+  onToggle,
+  git,
+  files,
+  workspaceName,
+  width,
+  onWidthChange,
+  editors,
+  onOpenInEditor,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  git: GitSnapshot | null;
+  files: string[];
+  workspaceName: string;
+  width: number;
+  onWidthChange: (next: number) => void;
+  editors: EditorInfo[];
+  onOpenInEditor: (editor: string, path: string) => void;
+}) {
+  const [tab, setTab] = useState<"diffs" | "files">("diffs");
+  // Clamp tracking for the resize handle. Min/max keep the sidebar useful
+  // (can't scrunch file paths into illegibility, can't eat the chat column).
+  const RIGHT_MIN = 220;
+  const RIGHT_MAX = 640;
+
+  function startResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    const onMove = (ev: MouseEvent) => {
+      // Handle is on the LEFT edge of the right sidebar; dragging the cursor
+      // left should make the sidebar wider, so subtract the delta.
+      const next = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, startW + (startX - ev.clientX)));
+      onWidthChange(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   return (
-    <aside className={`sidebar right ${open ? "open" : "closed"}`}>
-      <div className="sideInner">
+    <aside
+      className={`sidebar right ${open ? "open" : "closed"}`}
+      style={open ? { width } : undefined}
+    >
+      {open && (
+        <div
+          className="sidebar-resize"
+          onMouseDown={startResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          title="Drag to resize"
+        />
+      )}
+      <div className="sideInner" style={{ width }}>
         <div className="sideHead">
           <div className="sideHead-tabs">
-            <button className="sideHead-tab active">Diffs</button>
+            <button
+              className={`sideHead-tab ${tab === "diffs" ? "active" : ""}`}
+              onClick={() => setTab("diffs")}
+              aria-selected={tab === "diffs"}
+            >
+              Diffs
+            </button>
+            <button
+              className={`sideHead-tab ${tab === "files" ? "active" : ""}`}
+              onClick={() => setTab("files")}
+              aria-selected={tab === "files"}
+            >
+              Files
+            </button>
           </div>
-          <button className="sideHead-btn" onClick={onToggle} title="Hide diffs">
+          <button className="sideHead-btn" onClick={onToggle} title="Hide sidebar">
             <IconSidebarRight size={14} />
           </button>
         </div>
-        <div className="sb-empty-panel">
-          <span className="sb-empty-panel-glyph"><IconDiff size={16} /></span>
-          <div className="sb-empty-panel-title">No diffs yet</div>
-          <div className="sb-empty-panel-sub">File changes Pi makes during this session will show up here.</div>
-        </div>
+        {tab === "diffs"
+          ? <DiffsPanel git={git} editors={editors} onOpenInEditor={onOpenInEditor} />
+          : <FilesPanel files={files} workspaceName={workspaceName} editors={editors} onOpenInEditor={onOpenInEditor} />}
       </div>
     </aside>
   );
 }
 
+// Split a unified diff (concatenated across files) into per-file chunks keyed
+// by the b-side path. `git diff` emits one block per file headed by
+// `diff --git a/<path> b/<path>`; the b-path matches the new name on rename
+// or the unchanged name otherwise. Deletions land in the a-path lookup
+// below as a fallback. Quoted/escaped paths aren't handled — they're rare
+// enough that we'll cross that bridge if it shows up.
+function splitDiffByFile(diff: string): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!diff) return out;
+  const lines = diff.split("\n");
+  let currentKey: string | null = null;
+  let currentLines: string[] = [];
+  const flush = () => {
+    if (currentKey !== null) out.set(currentKey, currentLines.join("\n"));
+  };
+  for (const line of lines) {
+    const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (match) {
+      flush();
+      currentKey = match[2] === "/dev/null" ? match[1] : match[2];
+      currentLines = [line];
+    } else if (currentKey !== null) {
+      currentLines.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+function DiffsPanel({ git, editors, onOpenInEditor }: { git: GitSnapshot | null; editors: EditorInfo[]; onOpenInEditor: (editor: string, path: string) => void }) {
+  const changes = git?.files ?? [];
+  const branchLabel = git?.isRepo && git.branch
+    ? [git.branch, git.ahead ? `↑${git.ahead}` : "", git.behind ? `↓${git.behind}` : ""].filter(Boolean).join(" ")
+    : "";
+  // Memo the parse — splitting a multi-thousand-line diff on every render
+  // would be wasted work, the diff string only changes on git polls.
+  const diffByFile = useMemo(() => splitDiffByFile(git?.diff ?? ""), [git?.diff]);
+
+  if (!git) return <SidePanelEmpty title="Checking git…" body="Diffs will appear here for git workspaces." />;
+  if (git.error) return <SidePanelEmpty title="Git unavailable" body={git.error} />;
+  if (!git.isRepo) return <SidePanelEmpty title="Not a git repo" body="Open a workspace inside a git checkout to see diffs here." />;
+  if (git.clean) return <SidePanelEmpty title="Working tree clean" body={branchLabel || "No local changes."} />;
+
+  return (
+    <div className="sidePanel">
+      {branchLabel && (
+        <div className="sidePanel-head">
+          <span className="sidePanel-label">branch</span>
+          <span className="sidePanel-value">{branchLabel}</span>
+        </div>
+      )}
+      <div className="sidePanel-head">
+        <span className="sidePanel-label">{changes.length === 1 ? "1 changed file" : `${changes.length} changed files`}</span>
+      </div>
+      <ul className="diffFiles">
+        {changes.map((file) => (
+          <DiffFileRow
+            key={`${file.path}-${file.oldPath ?? ""}`}
+            file={file}
+            // Renames: b-path == file.path. Deletions: a-path stored in
+            // file.oldPath. Untracked: no diff entry at all.
+            diff={diffByFile.get(file.path) ?? (file.oldPath ? diffByFile.get(file.oldPath) : undefined)}
+            editors={editors}
+            onOpenInEditor={onOpenInEditor}
+          />
+        ))}
+      </ul>
+      {git.diffTruncated && <div className="sidePanel-note">Diff truncated. Refresh after committing or narrowing the change set.</div>}
+    </div>
+  );
+}
+
+function DiffFileRow({
+  file, diff, editors, onOpenInEditor,
+}: {
+  file: GitFileStatus;
+  diff?: string;
+  editors: EditorInfo[];
+  onOpenInEditor: (editor: string, path: string) => void;
+}) {
+  // Collapsed by default so a 30-file working tree doesn't dump itself open
+  // and immediately scroll the chat off-screen. One click per file the user
+  // actually cares about.
+  const [open, setOpen] = useState(false);
+  const hasDiff = !!diff;
+  const label = file.oldPath ? `${file.oldPath} → ${file.path}` : file.path;
+  const lines = hasDiff ? diff!.split("\n") : [];
+  return (
+    <li className={`diffFile status-${file.status}${open ? " open" : ""}`}>
+      <div className="diffFile-headRow">
+        <button
+          type="button"
+          className="diffFile-head"
+          onClick={() => { if (hasDiff) setOpen((v) => !v); }}
+          disabled={!hasDiff}
+          title={label}
+          aria-expanded={hasDiff ? open : undefined}
+        >
+          <span className="diffFile-chev" aria-hidden="true">{hasDiff ? (open ? "▾" : "▸") : "·"}</span>
+          <span className="sideList-badge">{gitStatusLabel(file)}</span>
+          <span className="sideList-name">{label}</span>
+        </button>
+        <OpenInEditorMenu path={file.path} editors={editors} onOpen={onOpenInEditor} />
+      </div>
+      {open && hasDiff && (
+        <pre className="diffFile-body" aria-label={`${file.path} diff`}>
+          {lines.map((line, index) => (
+            <div key={index} className={`diffLine ${diffLineClass(line)}`}>{line || " "}</div>
+          ))}
+        </pre>
+      )}
+    </li>
+  );
+}
+
+// Flat string[] -> grouped folder tree, sorted with directories before files at
+// each level. Rebuilt on each render: file lists are small enough
+// (single-workspace scope) that memoization isn't worth the readability cost.
+type FileNode = { name: string; isFile: boolean; path: string; children: FileNode[] };
+
+function buildFileTree(paths: string[]): FileNode {
+  const root: FileNode = { name: "", isFile: false, path: "", children: [] };
+  for (const p of paths) {
+    const parts = p.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const isLast = i === parts.length - 1;
+      const name = parts[i];
+      let child = cur.children.find((c) => c.name === name);
+      if (!child) {
+        child = { name, isFile: isLast, path: parts.slice(0, i + 1).join("/"), children: [] };
+        cur.children.push(child);
+      } else if (isLast) {
+        child.isFile = true;
+      }
+      cur = child;
+    }
+  }
+  const sort = (node: FileNode) => {
+    node.children.sort((a, b) => {
+      if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
+      return a.name.localeCompare(b.name);
+    });
+    node.children.forEach(sort);
+  };
+  sort(root);
+  return root;
+}
+
+function FilesPanel({ files, workspaceName, editors, onOpenInEditor }: { files: string[]; workspaceName: string; editors: EditorInfo[]; onOpenInEditor: (editor: string, path: string) => void }) {
+  if (files.length === 0) {
+    return (
+      <SidePanelEmpty
+        title="No files yet"
+        body={workspaceName ? `${workspaceName} is empty (or still loading).` : "File listing will appear here once the workspace finishes loading."}
+      />
+    );
+  }
+  const tree = buildFileTree(files);
+  return (
+    <div className="sidePanel">
+      {workspaceName && (
+        <div className="sidePanel-head">
+          <span className="sidePanel-label">workspace</span>
+          <span className="sidePanel-value">{workspaceName}</span>
+        </div>
+      )}
+      <div className="sidePanel-head">
+        <span className="sidePanel-label">{files.length === 1 ? "1 file" : `${files.length} files`}</span>
+      </div>
+      <ul className="fileTree" role="tree">
+        {tree.children.map((node) => <FileTreeNode key={node.path} node={node} depth={0} editors={editors} onOpenInEditor={onOpenInEditor} />)}
+      </ul>
+    </div>
+  );
+}
+
+function FileTreeNode({
+  node, depth, editors, onOpenInEditor,
+}: {
+  node: FileNode;
+  depth: number;
+  editors: EditorInfo[];
+  onOpenInEditor: (editor: string, path: string) => void;
+}) {
+  // Root-level folders open by default; nested folders collapsed so a deep
+  // monorepo doesn't dump thousands of rows up front.
+  const [open, setOpen] = useState(depth === 0 && !node.isFile);
+  const padding = 8 + depth * 12;
+  if (node.isFile) {
+    return (
+      <li className="fileTree-file fileTree-row" title={node.path}>
+        <span className="fileTree-rowMain" style={{ paddingLeft: padding }}>
+          <span className="fileTree-icon" aria-hidden="true">·</span>
+          <span className="fileTree-name">{node.name}</span>
+        </span>
+        <OpenInEditorMenu path={node.path} editors={editors} onOpen={onOpenInEditor} />
+      </li>
+    );
+  }
+  return (
+    <li className="fileTree-folder">
+      <button
+        type="button"
+        className="fileTree-folderHead"
+        style={{ paddingLeft: padding }}
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="fileTree-chev" aria-hidden="true">{open ? "▾" : "▸"}</span>
+        <span className="fileTree-name">{node.name}</span>
+      </button>
+      {open && (
+        <ul role="group">
+          {node.children.map((child) => <FileTreeNode key={child.path} node={child} depth={depth + 1} editors={editors} onOpenInEditor={onOpenInEditor} />)}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+// Hover-revealed popover with the list of detected editors. Stays out of the
+// way on idle rows and quietly appears when the user mouses over (or focuses)
+// the parent row. Click an option → fire the open command and dismiss.
+function OpenInEditorMenu({
+  path: filePath,
+  editors,
+  onOpen,
+}: {
+  path: string;
+  editors: EditorInfo[];
+  onOpen: (editor: string, path: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", onDocClick);
+    return () => window.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+  if (editors.length === 0) return null;
+  return (
+    <div className="openInEditor" ref={ref}>
+      <button
+        type="button"
+        className="openInEditor-trigger"
+        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Open in editor"
+      >
+        <IconCode size={12} />
+      </button>
+      {open && (
+        <div className="openInEditor-menu" role="menu">
+          {editors.map((ed) => (
+            <button
+              key={ed.id}
+              type="button"
+              role="menuitem"
+              className="openInEditor-item"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpen(ed.id, filePath);
+                setOpen(false);
+              }}
+              title={`Open in ${ed.label}`}
+              aria-label={`Open in ${ed.label}`}
+            >
+              {ed.hasIcon ? (
+                <img
+                  className="openInEditor-icon"
+                  src={`/api/editor-icon/${ed.id}`}
+                  alt=""
+                  /* alt empty because aria-label/title carries the name; the
+                     icon is decorative re: assistive tech. */
+                />
+              ) : (
+                // No .app icon extracted (Linux/Windows, or extraction
+                // failed). Fall back to a hairline glyph + uppercase first
+                // letter so the row is still legible.
+                <span className="openInEditor-iconFallback" aria-hidden="true">{ed.label.slice(0, 1)}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SidePanelEmpty({ title, body }: { title: string; body: string }) {
+  return (
+    <div className="sidePanel-empty">
+      <div className="sidePanel-empty-title">{title}</div>
+      {/* BalancedP runs the body through @chenglou/pretext so helper copy
+          shrink-wraps cleanly at whatever sidebar width the user picked. */}
+      <BalancedP text={body}>{body}</BalancedP>
+    </div>
+  );
+}
 function relativeTime(iso: string) {
   const then = new Date(iso).getTime();
   if (!Number.isFinite(then)) return "";
