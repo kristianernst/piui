@@ -1,8 +1,12 @@
 import express from "express";
 import http from "node:http";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+// Sync filesystem helpers — used at startup for editor detection and icon
+// extraction. Kept under a distinct namespace so the `fs` async API stays
+// the default everywhere else.
+import * as fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,6 +77,186 @@ end try`;
   });
 }
 
+// Editor opener — open a workspace file in an installed editor. Detection
+// can't lean on `process.env.PATH` alone: when piui is spawned from a GUI
+// context (Claude Code, launchd, etc.) the inherited PATH is the stripped-down
+// system one and misses `/usr/local/bin`, `/opt/homebrew/bin`, the codeium
+// install dir, etc. Instead we probe a candidate list of well-known absolute
+// paths AND the macOS `/Applications/*.app` bundles, falling back to launching
+// via `open -a "<App>"` when only the .app exists (no CLI shim installed).
+type EditorEntry = {
+  id: string;
+  label: string;
+  // List of likely CLI binary locations. First hit wins; if none match we
+  // fall back to the .app bundle if available.
+  cliCandidates: string[];
+  // macOS .app bundle name (sans the `.app` suffix). Looked up under both
+  // `/Applications` and `~/Applications`. Use undefined to skip.
+  appName?: string;
+  // Fixed-args strategy for the CLI (most editors just want a path).
+  cliArgs?: (absPath: string) => string[];
+};
+
+const HOME = os.homedir();
+const EDITOR_CATALOG: EditorEntry[] = [
+  {
+    id: "cursor",
+    label: "Cursor",
+    cliCandidates: ["/usr/local/bin/cursor", "/opt/homebrew/bin/cursor", `${HOME}/.local/bin/cursor`],
+    appName: "Cursor",
+  },
+  {
+    id: "vscode",
+    label: "VS Code",
+    cliCandidates: [
+      "/usr/local/bin/code",
+      "/opt/homebrew/bin/code",
+      "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    ],
+    appName: "Visual Studio Code",
+  },
+  {
+    id: "windsurf",
+    label: "Windsurf",
+    cliCandidates: [
+      "/usr/local/bin/windsurf",
+      "/opt/homebrew/bin/windsurf",
+      `${HOME}/.codeium/windsurf/bin/windsurf`,
+    ],
+    appName: "Windsurf",
+  },
+  {
+    id: "zed",
+    label: "Zed",
+    cliCandidates: [
+      "/usr/local/bin/zed",
+      "/opt/homebrew/bin/zed",
+      `${HOME}/.local/bin/zed`,
+    ],
+    appName: "Zed",
+  },
+];
+
+function existsAsFile(p: string): boolean {
+  try { return fsSync.statSync(p).isFile(); } catch { return false; }
+}
+function existsAsDir(p: string): boolean {
+  try { return fsSync.statSync(p).isDirectory(); } catch { return false; }
+}
+
+// Walk a candidate list — returns the first absolute path that exists as a
+// regular file. Symlinks resolve through statSync to their targets.
+function locateCli(candidates: string[]): string | null {
+  for (const c of candidates) {
+    if (existsAsFile(c)) return c;
+  }
+  return null;
+}
+
+// Look in the standard macOS app roots for `<appName>.app`. Returns the
+// absolute path to the bundle (a directory) or null.
+function locateApp(appName: string): string | null {
+  if (process.platform !== "darwin") return null;
+  for (const root of ["/Applications", `${HOME}/Applications`]) {
+    const candidate = `${root}/${appName}.app`;
+    if (existsAsDir(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Resolved opener: either spawn the CLI directly or fall back to `open -a`
+// on macOS using the discovered .app bundle. Stored at module scope so the
+// `open_in_editor` command handler can look up by id in O(1).
+type ResolvedOpener = { command: string; args: (absPath: string) => string[] };
+const resolvedOpeners = new Map<string, ResolvedOpener>();
+// Disk-cached PNG icons keyed by editor id. Extracted once at startup from
+// the .app bundle's CFBundleIconFile via `plutil` + `sips`, then served by
+// the daemon as `/api/editor-icon/:id`. Skipped silently when the helpers
+// aren't available (non-macOS, missing binaries) — the client falls back to
+// its generic glyph in that case.
+const editorIcons = new Map<string, string>();
+const iconCacheDir = path.join(agentDir, "piui-editor-icons");
+try { fsSync.mkdirSync(iconCacheDir, { recursive: true }); } catch { /* best-effort */ }
+
+function extractAppIcon(appPath: string, editorId: string): string | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const plist = path.join(appPath, "Contents/Info.plist");
+    const probe = spawnSync("plutil", ["-extract", "CFBundleIconFile", "raw", plist], { encoding: "utf-8" });
+    if (probe.status !== 0) return null;
+    let iconName = probe.stdout.trim();
+    if (!iconName) return null;
+    if (!iconName.toLowerCase().endsWith(".icns")) iconName += ".icns";
+    const icnsPath = path.join(appPath, "Contents/Resources", iconName);
+    if (!existsAsFile(icnsPath)) return null;
+    const outPath = path.join(iconCacheDir, `${editorId}.png`);
+    // Cache-busting key: source mtime. If the .app was upgraded since last
+    // boot we want a fresh icon, not yesterday's. Compare via stat.
+    const srcMtime = fsSync.statSync(icnsPath).mtimeMs;
+    if (existsAsFile(outPath) && fsSync.statSync(outPath).mtimeMs > srcMtime) return outPath;
+    // 64px is comfortable for a 16-22px button at 2× DPR; sips rasterizes
+    // the best-matching size from the multi-image .icns container.
+    const conv = spawnSync("sips", ["-s", "format", "png", icnsPath, "--out", outPath, "-Z", "64"], { encoding: "utf-8" });
+    if (conv.status !== 0) return null;
+    return outPath;
+  } catch {
+    return null;
+  }
+}
+
+function registerEditor(id: string, label: string, opener: ResolvedOpener, iconSource: string | null) {
+  resolvedOpeners.set(id, opener);
+  const icon = iconSource ? extractAppIcon(iconSource, id) : null;
+  if (icon) editorIcons.set(id, icon);
+  return { id, label, hasIcon: !!icon };
+}
+
+const availableEditors: Array<{ id: string; label: string; hasIcon: boolean }> = (() => {
+  const out: Array<{ id: string; label: string; hasIcon: boolean }> = [];
+  for (const entry of EDITOR_CATALOG) {
+    const cli = locateCli(entry.cliCandidates);
+    const app = entry.appName ? locateApp(entry.appName) : null;
+    if (cli) {
+      const argsFn = entry.cliArgs ?? ((p: string) => [p]);
+      out.push(registerEditor(entry.id, entry.label, { command: cli, args: argsFn }, app));
+      continue;
+    }
+    if (app && entry.appName) {
+      // `open -a "AppName" <file>` works for any registered .app whether
+      // or not the CLI shim is installed. We deliberately don't pass `-g`
+      // so the editor comes to the foreground.
+      const appName = entry.appName;
+      out.push(registerEditor(entry.id, entry.label, {
+        command: "open",
+        args: (p: string) => ["-a", appName, p],
+      }, app));
+    }
+  }
+  // macOS Finder reveal — always available via the built-in `open` binary;
+  // -R highlights the file in its containing folder rather than launching
+  // it with the default app. Pull the icon from the system Finder.app.
+  if (process.platform === "darwin") {
+    out.push(registerEditor("finder", "Finder",
+      { command: "open", args: (p: string) => ["-R", p] },
+      "/System/Library/CoreServices/Finder.app",
+    ));
+  }
+  return out;
+})();
+
+function openInEditor(editorId: string, absPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const opener = resolvedOpeners.get(editorId);
+    if (!opener) { reject(new Error(`Unknown editor: ${editorId}`)); return; }
+    const child = spawn(opener.command, opener.args(absPath), { stdio: "ignore", detached: true });
+    child.on("error", reject);
+    // Detach immediately — we don't want the agent server to babysit a GUI
+    // editor's lifecycle. `unref` lets node exit independently.
+    child.unref();
+    resolve();
+  });
+}
+
 initTheme();
 const themeColors: ThemeColor[] = [
   "accent", "border", "borderAccent", "borderMuted", "success", "error", "warning", "muted", "dim", "text", "thinkingText", "userMessageText", "customMessageText", "customMessageLabel", "toolTitle", "toolOutput", "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "mdQuote", "mdQuoteBorder", "mdHr", "mdListBullet", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "syntaxComment", "syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString", "syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation", "thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh", "bashMode",
@@ -96,14 +280,7 @@ const allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
-const writeCommands = new Set<ClientCommand["type"]>([
-  "open_workspace",
-  "switch_workspace",
-  "remove_workspace",
-  "switch_session",
-  "delete_session",
-  "continue_recent",
-  "new_session",
+const sessionWriteCommands = new Set<ClientCommand["type"]>([
   "reload_resources",
   "invoke_command",
   "prompt",
@@ -111,14 +288,13 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "follow_up",
   "abort",
   "compact",
+  "set_session_name",
   "export_html",
   "fork",
   "clone",
-  "set_session_name",
   "cycle_model",
   "set_model",
   "set_thinking_level",
-  "set_settings",
   "extension_ui_response",
   "trigger_shortcut",
   "extension_input",
@@ -165,9 +341,11 @@ type ClientCommand = {
     | "get_settings"
     | "set_settings"
     | "list_files"
+    | "get_git"
     | "extension_ui_response"
     | "trigger_shortcut"
-    | "extension_input";
+    | "extension_input"
+    | "open_in_editor";
   cwd?: string;
   name?: string;
   workspaceId?: string;
@@ -176,15 +354,20 @@ type ClientCommand = {
   customInstructions?: string;
   commandName?: string;
   message?: string;
+  clientMessageId?: string;
   streamingBehavior?: "steer" | "followUp";
   provider?: string;
   modelId?: string;
   level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   settings?: Partial<PiSettings>;
+  runtimeId?: string;
+  sessionId?: string;
   uiRequestId?: string;
   value?: unknown;
   key?: string;
   data?: string;
+  editor?: string;
+  path?: string;
 };
 
 type ModelRef = { provider: string; modelId: string };
@@ -213,15 +396,16 @@ type ServerPacket =
   | { type: "resources"; data: unknown }
   | { type: "models"; data: unknown }
   | { type: "settings"; data: unknown }
+  | { type: "git"; data: unknown }
   | { type: "files"; data: unknown }
   | { type: "tree"; data: unknown }
-  | { type: "extension_ui_request"; request: unknown }
+  | { type: "extension_ui_request"; data: unknown }
   | { type: "extension_ui_status"; data: unknown }
-  | { type: "extension_ui_widget"; data: { slot: string; lines?: string[]; removed?: true } }
-  | { type: "extension_reset" }
-  | { type: "shortcuts"; data: { shortcuts: Array<{ key: string; description?: string }> } }
+  | { type: "extension_ui_widget"; data: unknown }
+  | { type: "extension_reset"; data: unknown }
+  | { type: "shortcuts"; data: unknown }
   | { type: "notification"; data: { message: string; level?: "info" | "warning" | "error" } }
-  | { type: "event"; event: unknown }
+  | { type: "event"; data: unknown }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
 
 function send(ws: WebSocket, packet: ServerPacket) {
@@ -277,7 +461,7 @@ class WorkspaceStore {
   }
 
   list() {
-    return [...this.workspaces.values()].sort((a, b) => b.lastOpenedAt.localeCompare(a.lastOpenedAt));
+    return [...this.workspaces.values()];
   }
 
   get(id: string) {
@@ -422,8 +606,25 @@ function lockConflictError(sessionFile: string, lock?: SessionLock) {
 }
 
 type RuntimeHandle = {
+  id: string;
   workspace: Workspace;
   runtime: Awaited<ReturnType<typeof createRuntimeFor>>;
+  seq: number;
+  eventBuffer: Array<{ type: "event"; data: SessionRoute & { event: unknown; seq: number } }>;
+  unsubscribe?: () => void;
+  lockedSessionFile?: string;
+  readOnly: boolean;
+  pendingUi: Map<string, (value: unknown) => void>;
+  widgetHost: WidgetHost;
+  extensionUi: ExtensionUIContext;
+  titleInFlight: boolean;
+};
+
+type SessionRoute = {
+  runtimeId: string;
+  workspaceId: string;
+  sessionPath?: string;
+  sessionId: string;
 };
 
 async function createRuntimeFor(cwd: string, mode: "new" | "continue" | "open" = "new", sessionPath?: string) {
@@ -444,6 +645,55 @@ async function createRuntimeFor(cwd: string, mode: "new" | "continue" | "open" =
         : SessionManager.create(cwd);
 
   return createAgentSessionRuntime(factory, { cwd, agentDir, sessionManager });
+}
+
+function sessionKey(workspaceId: string, sessionPath: string) {
+  return `${workspaceId}\0${sessionPath}`;
+}
+
+function routeFor(handle: RuntimeHandle): SessionRoute {
+  const session = handle.runtime.session;
+  return {
+    runtimeId: handle.id,
+    workspaceId: handle.workspace.id,
+    sessionPath: session.sessionFile,
+    sessionId: session.sessionId,
+  };
+}
+
+function eventType(event: unknown) {
+  return event && typeof event === "object" && typeof (event as { type?: unknown }).type === "string"
+    ? (event as { type: string }).type
+    : undefined;
+}
+
+function scopedState(handle: RuntimeHandle, revision = handle.seq) {
+  const state = publicState(handle.workspace, handle.runtime.session);
+  return { ...routeFor(handle), ...state, state, revision };
+}
+
+function scopedMessages(handle: RuntimeHandle, revision = handle.seq) {
+  return { ...routeFor(handle), messages: handle.runtime.session.messages, revision };
+}
+
+function scopedResources(handle: RuntimeHandle) {
+  const resources = publicResources(handle.runtime.session);
+  return { ...routeFor(handle), ...resources, resources };
+}
+
+function scopedModels(handle: RuntimeHandle) {
+  return { ...routeFor(handle), models: publicModels(handle.runtime.session) };
+}
+
+function scopedTree(handle: RuntimeHandle) {
+  return { ...routeFor(handle), entries: publicTree(handle.runtime.session) };
+}
+
+function scopedEvent(handle: RuntimeHandle, event: unknown, seq: number) {
+  return {
+    type: "event" as const,
+    data: { ...routeFor(handle), event, seq },
+  };
 }
 
 function publicState(workspace: Workspace, session: AgentSession) {
@@ -482,18 +732,34 @@ function publicState(workspace: Workspace, session: AgentSession) {
   };
 }
 
-async function listSessions(cwd: string) {
+function sessionIsRunning(session: AgentSession) {
+  return session.isStreaming || session.isCompacting || session.isRetrying;
+}
+
+async function listSessions(cwd: string, liveSessions: AgentSession[] = []) {
   const sessions = await SessionManager.list(cwd);
-  return sessions.slice(0, 50).map((session) => ({
-    path: session.path,
-    id: session.id,
-    cwd: session.cwd,
-    name: session.name,
-    created: session.created,
-    modified: session.modified,
-    messageCount: session.messageCount,
-    firstMessage: session.firstMessage,
-  }));
+  return sessions.slice(0, 50).map((session) => {
+    const liveSession = liveSessions.find((candidate) => candidate.sessionFile === session.path);
+    return {
+      path: session.path,
+      id: session.id,
+      cwd: session.cwd,
+      name: session.name,
+      created: session.created,
+      modified: session.modified,
+      messageCount: session.messageCount,
+      firstMessage: session.firstMessage,
+      liveSessionId: liveSession?.sessionId,
+      isRunning: liveSession ? sessionIsRunning(liveSession) : undefined,
+    };
+  });
+}
+
+function workspaceFromCommand(store: WorkspaceStore, activeWorkspace: Workspace, workspaceId?: string) {
+  if (!workspaceId) return activeWorkspace;
+  const workspace = store.get(workspaceId);
+  if (!workspace) throw new Error(`Unknown workspace: ${workspaceId}`);
+  return workspace;
 }
 
 async function mostRecentSessionPath(cwd: string) {
@@ -502,6 +768,7 @@ async function mostRecentSessionPath(cwd: string) {
 }
 
 const FILE_LIST_LIMIT = 4000;
+const GIT_DIFF_LIMIT = 220_000;
 const FILE_WALK_EXCLUDE = new Set([
   ".git", "node_modules", "dist", "build", "out", ".next", ".vite",
   ".turbo", ".cache", ".venv", "venv", "__pycache__", ".mypy_cache",
@@ -512,18 +779,135 @@ const FILE_WALK_EXCLUDE = new Set([
 // is `git ls-files` (already gitignore-aware); falls back to a bounded
 // recursive walk that skips common heavy directories. Capped at FILE_LIST_LIMIT
 // so a monorepo doesn't ship a giant payload over the wire.
+function runGit(cwd: string, args: string[], opts: { maxBytes?: number } = {}): Promise<{ stdout: string; stderr: string; code: number; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", cwd, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const maxBytes = opts.maxBytes ?? 1024 * 1024;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let truncated = false;
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdoutBytes >= maxBytes) { truncated = true; return; }
+      const remaining = maxBytes - stdoutBytes;
+      stdout += chunk.subarray(0, remaining).toString();
+      stdoutBytes += Math.min(chunk.length, remaining);
+      if (chunk.length > remaining) truncated = true;
+    });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 0, truncated }));
+  });
+}
+
+async function gitText(cwd: string, args: string[], opts?: { maxBytes?: number }) {
+  const result = await runGit(cwd, args, opts);
+  if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args.join(" ")} exited ${result.code}`);
+  return result;
+}
+
+type GitFileStatus = {
+  path: string;
+  oldPath?: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "copied" | "typechange" | "unknown";
+  index: string;
+  worktree: string;
+};
+
+type GitSnapshot = {
+  isRepo: boolean;
+  root?: string;
+  branch?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  clean?: boolean;
+  files: GitFileStatus[];
+  diff?: string;
+  diffTruncated?: boolean;
+  error?: string;
+};
+
+function statusFromXY(index: string, worktree: string): GitFileStatus["status"] {
+  if (index === "?" && worktree === "?") return "untracked";
+  if (index === "R" || worktree === "R") return "renamed";
+  if (index === "C" || worktree === "C") return "copied";
+  if (index === "A" || worktree === "A") return "added";
+  if (index === "D" || worktree === "D") return "deleted";
+  if (index === "T" || worktree === "T") return "typechange";
+  if (index === "M" || worktree === "M") return "modified";
+  return "unknown";
+}
+
+function parseGitStatus(output: string): GitFileStatus[] {
+  const entries = output.split("\0").filter(Boolean);
+  const files: GitFileStatus[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const index = entry[0] ?? " ";
+    const worktree = entry[1] ?? " ";
+    const path = entry.slice(3);
+    const status = statusFromXY(index, worktree);
+    const file: GitFileStatus = { path, status, index, worktree };
+    if ((index === "R" || index === "C") && entries[i + 1]) file.oldPath = entries[++i];
+    files.push(file);
+  }
+  return files;
+}
+
+async function gitSnapshot(cwd: string): Promise<GitSnapshot> {
+  try {
+    const root = (await gitText(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
+    const branch = (await gitText(cwd, ["branch", "--show-current"])).stdout.trim()
+      || (await gitText(cwd, ["rev-parse", "--short", "HEAD"])).stdout.trim();
+    const statusOut = await gitText(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]);
+    const files = parseGitStatus(statusOut.stdout);
+
+    let upstream: string | undefined;
+    let ahead = 0;
+    let behind = 0;
+    try {
+      upstream = (await gitText(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])).stdout.trim() || undefined;
+      const counts = (await gitText(cwd, ["rev-list", "--left-right", "--count", "HEAD...@{u}"])).stdout.trim().split(/\s+/).map(Number);
+      ahead = Number.isFinite(counts[0]) ? counts[0] : 0;
+      behind = Number.isFinite(counts[1]) ? counts[1] : 0;
+    } catch {
+      // No upstream configured — local branch name is still useful.
+    }
+
+    const staged = await gitText(cwd, ["diff", "--cached", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"], { maxBytes: GIT_DIFF_LIMIT });
+    const remaining = Math.max(0, GIT_DIFF_LIMIT - Buffer.byteLength(staged.stdout));
+    const unstaged = remaining > 0
+      ? await gitText(cwd, ["diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"], { maxBytes: remaining })
+      : { stdout: "", truncated: true };
+    const chunks = [staged.stdout.trimEnd(), unstaged.stdout.trimEnd()].filter(Boolean);
+    return {
+      isRepo: true,
+      root,
+      branch,
+      upstream,
+      ahead,
+      behind,
+      clean: files.length === 0,
+      files,
+      diff: chunks.join("\n\n"),
+      diffTruncated: staged.truncated || unstaged.truncated,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not a git repository/i.test(message)) return { isRepo: false, files: [] };
+    return { isRepo: false, files: [], error: message };
+  }
+}
+
 async function listWorkspaceFiles(cwd: string): Promise<string[]> {
   // Prefer git when the workspace is a checkout — it respects .gitignore and
   // is dramatically faster on large repos.
   try {
     const out = await new Promise<string>((resolve, reject) => {
-      const child = spawn("git", ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard"], { stdio: ["ignore", "pipe", "pipe"] });
-      let buf = "";
-      let err = "";
-      child.stdout.on("data", (chunk) => { buf += chunk.toString(); });
-      child.stderr.on("data", (chunk) => { err += chunk.toString(); });
-      child.on("error", reject);
-      child.on("close", (code) => code === 0 ? resolve(buf) : reject(new Error(err.trim() || `git ls-files exited ${code}`)));
+      runGit(cwd, ["ls-files", "--cached", "--others", "--exclude-standard"])
+        .then((result) => result.code === 0 ? resolve(result.stdout) : reject(new Error(result.stderr.trim() || `git ls-files exited ${result.code}`)))
+        .catch(reject);
     });
     const files = out.split("\n").filter(Boolean).slice(0, FILE_LIST_LIMIT);
     if (files.length) return files;
@@ -640,10 +1024,12 @@ async function generateSessionTitle(session: AgentSession, titleModelRef: ModelR
 function publicResources(session: AgentSession) {
   const skills = session.resourceLoader.getSkills();
   const prompts = session.resourceLoader.getPrompts();
+  const extensions = session.resourceLoader.getExtensions();
   const extensionCommands = session.extensionRunner.getRegisteredCommands().map((command) => ({
     name: command.invocationName,
     description: command.description,
     source: "extension",
+    sourceInfo: command.sourceInfo,
   }));
   return {
     commands: [
@@ -661,9 +1047,27 @@ function publicResources(session: AgentSession) {
     activeTools: session.getActiveToolNames(),
     prompts: prompts.prompts,
     skills: skills.skills,
+    extensions: extensions.extensions.map((extension) => ({
+      name: resourceSourceLabel(extension.sourceInfo, extension.path),
+      path: extension.path,
+      resolvedPath: extension.resolvedPath,
+      sourceInfo: extension.sourceInfo,
+      commandCount: extension.commands.size,
+      toolCount: extension.tools.size,
+      shortcutCount: extension.shortcuts.size,
+      flagCount: extension.flags.size,
+      handlerCount: [...extension.handlers.values()].reduce((sum, handlers) => sum + handlers.length, 0),
+    })),
+    extensionErrors: extensions.errors,
     agentsFiles: session.resourceLoader.getAgentsFiles().agentsFiles.map((file) => ({ path: file.path })),
     diagnostics: [...skills.diagnostics, ...prompts.diagnostics],
   };
+}
+
+function resourceSourceLabel(sourceInfo: { source?: string; path?: string } | undefined, fallback: string) {
+  const raw = sourceInfo?.source && sourceInfo.source !== "local" ? sourceInfo.source : sourceInfo?.path ?? fallback;
+  const label = raw.split(/[\\/]/).filter(Boolean).pop() ?? raw;
+  return label.startsWith("npm:") ? label.slice(4) : label;
 }
 
 function publicModels(session: AgentSession) {
@@ -710,44 +1114,41 @@ function waitForIdle(session: AgentSession) {
   });
 }
 
-function createCommandActions(handle: RuntimeHandle, locks: LockStore, ownerId: string): ExtensionCommandContextActions {
+function disabledRuntimeReplacement(action: string): never {
+  throw new Error(`${action} is disabled in piui extension actions; use the piui runtime registry instead.`);
+}
+
+function createCommandActions(handle: RuntimeHandle): ExtensionCommandContextActions {
   return {
     waitForIdle: () => waitForIdle(handle.runtime.session),
-    newSession: async (options) => {
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.newSession(options);
-      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-      return result;
-    },
-    fork: async (entryId, options) => {
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.fork(entryId, options);
-      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-      return { cancelled: result.cancelled };
-    },
+    newSession: async () => disabledRuntimeReplacement("newSession"),
+    fork: async () => disabledRuntimeReplacement("fork"),
     navigateTree: async (targetId, options) => {
       const result = await handle.runtime.session.navigateTree(targetId, options);
       return { cancelled: result.cancelled };
     },
-    switchSession: async (sessionPath, options) => {
-      const lock = await locks.claim(sessionPath, handle.workspace, ownerId);
-      if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.switchSession(sessionPath, options);
-      if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
-      else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
-      return result;
-    },
+    switchSession: async () => disabledRuntimeReplacement("switchSession"),
     reload: async () => {
       await handle.runtime.session.reload();
     },
   };
 }
 
-function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost): ExtensionUIContext {
+function createExtensionUI(
+  ws: WebSocket,
+  route: () => SessionRoute,
+  pendingUi: Map<string, (value: unknown) => void>,
+  widgetHost: WidgetHost,
+  isActive: () => boolean,
+): ExtensionUIContext {
+  function sendIfActive(packet: ServerPacket) {
+    if (isActive()) send(ws, packet);
+  }
+
   function request<T>(kind: string, payload: Record<string, unknown>, opts?: { signal?: AbortSignal; timeout?: number }) {
     const requestId = crypto.randomUUID();
-    send(ws, { type: "extension_ui_request", request: { id: requestId, kind, ...payload } });
+    const request = { id: requestId, kind, ...payload };
+    send(ws, { type: "extension_ui_request", data: { ...route(), request } });
     return new Promise<T | undefined>((resolve) => {
       let timer: NodeJS.Timeout | undefined;
       const cleanup = () => {
@@ -792,27 +1193,28 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
     select: (title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("select", { title, options, opts }, opts),
     confirm: async (title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }) => Boolean(await request<boolean>("confirm", { title, message, opts }, opts)),
     input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("input", { title, placeholder, opts }, opts),
-    notify: (message: string, level?: "info" | "warning" | "error") => send(ws, { type: "notification", data: { message, level } }),
+    notify: (message: string, level?: "info" | "warning" | "error") => sendIfActive({ type: "notification", data: { message, level } }),
     onTerminalInput: () => () => undefined,
-    setStatus: (key: string, text: string | undefined) => send(ws, { type: "extension_ui_status", data: { key, text } }),
-    setWorkingMessage: (message?: string) => send(ws, { type: "extension_ui_status", data: { key: "workingMessage", text: message } }),
-    setWorkingVisible: (visible: boolean) => send(ws, { type: "extension_ui_status", data: { key: "workingVisible", value: visible } }),
-    setWorkingIndicator: (options?: unknown) => send(ws, { type: "extension_ui_status", data: { key: "workingIndicator", value: options } }),
-    setHiddenThinkingLabel: (label?: string) => send(ws, { type: "extension_ui_status", data: { key: "hiddenThinkingLabel", text: label } }),
+    setStatus: (key: string, text: string | undefined) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key, text } }),
+    setWorkingMessage: (message?: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingMessage", text: message } }),
+    setWorkingVisible: (visible: boolean) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingVisible", value: visible } }),
+    setWorkingIndicator: (options?: unknown) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingIndicator", value: options } }),
+    setHiddenThinkingLabel: (label?: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "hiddenThinkingLabel", text: label } }),
     setWidget: (key: string, content: unknown) => setSlot(`widget:${key}`, content, defaultExtensionTheme),
     setFooter: (factory: unknown) => setSlot("footer", factory, defaultExtensionTheme),
     setHeader: (factory: unknown) => setSlot("header", factory, defaultExtensionTheme),
-    setTitle: (title: string) => send(ws, { type: "extension_ui_status", data: { key: "title", text: title } }),
+    setTitle: (title: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "title", text: title } }),
     // Open a focused, scrollable overlay. The extension's factory returns a
     // Component with optional `handleInput` — keystrokes captured client-side
     // are forwarded back through `extension_input` and dispatched here.
     custom: async <T,>(factory: unknown) => {
       if (typeof factory !== "function") return undefined as T;
+      if (!isActive()) return undefined as T;
       const result = await widgetHost.setOverlay(factory as Parameters<WidgetHost["setOverlay"]>[0], defaultExtensionTheme);
       return result as T;
     },
-    pasteToEditor: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "pasteToEditor", text } }),
-    setEditorText: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "setEditorText", text } }),
+    pasteToEditor: (text: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "pasteToEditor", text } }),
+    setEditorText: (text: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "setEditorText", text } }),
     getEditorText: () => "",
     editor: (title: string, prefill?: string) => request<string>("editor", { title, prefill }),
     addAutocompleteProvider: () => undefined,
@@ -878,65 +1280,6 @@ function buildExtensionContext(handle: RuntimeHandle, ui: ExtensionUIContext) {
   };
 }
 
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost, uiContext: ExtensionUIContext, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void) {
-  unsubscribe?.();
-  const session = handle.runtime.session;
-  const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
-  if (lock.owner !== "other") {
-    // Wipe any widgets the previous session's extensions registered before we
-    // bind the new one — extension factories will re-register from scratch.
-    widgetHost.reset();
-    // Tell the client to clear residual extension status/title/working-message
-    // fields too. Slots are removed via widgetHost.reset() above, but the
-    // chrome state lives only on the client and needs an explicit reset so it
-    // doesn't bleed from one conversation into the next.
-    send(ws, { type: "extension_reset" });
-    await session.bindExtensions({
-      uiContext,
-      commandContextActions: createCommandActions(handle, locks, ownerId),
-    });
-    // Once extensions have re-registered, push their shortcut list down to the
-    // browser so it can capture matching keys and forward them to us.
-    send(ws, { type: "shortcuts", data: { shortcuts: listExtensionShortcuts(handle) } });
-  }
-  // Track in-flight title generation per session-file so we don't fire the
-  // model twice if `agent_end` lands while a previous request is still open.
-  let titleInFlight = false;
-  const nextUnsubscribe = session.subscribe((event) => {
-    send(ws, { type: "event", event });
-    if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
-      send(ws, { type: "state", data: publicState(handle.workspace, session) });
-    }
-    if (event.type === "agent_end" && !titleInFlight && !session.sessionManager.getSessionName()) {
-      titleInFlight = true;
-      const ownedSessionFile = session.sessionFile;
-      void (async () => {
-        try {
-          const title = await generateSessionTitle(session, settingsStore.get().titleModel);
-          // Bail out if the user has switched away from this session before we got a result.
-          if (!title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
-          session.setSessionName(title);
-          send(ws, { type: "state", data: publicState(handle.workspace, session) });
-          send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd) } });
-        } finally {
-          titleInFlight = false;
-        }
-      })();
-    }
-  });
-  send(ws, { type: "workspace", data: handle.workspace });
-  send(ws, { type: "state", data: publicState(handle.workspace, session) });
-  send(ws, { type: "messages", data: { messages: session.messages } });
-  send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd) } });
-  send(ws, { type: "resources", data: publicResources(session) });
-  send(ws, { type: "models", data: { models: publicModels(session) } });
-  send(ws, { type: "tree", data: { entries: publicTree(session) } });
-  if (lock.owner === "other") {
-    send(ws, { type: "notification", data: { level: "warning", message: `Session file is already owned by PID ${lock.lock.pid}; avoid writing from two runtimes.` } });
-  }
-  return { unsubscribe: nextUnsubscribe, readOnly: lock.owner === "other" };
-}
-
 async function main() {
   const store = new WorkspaceStore();
   const locks = new LockStore();
@@ -982,6 +1325,18 @@ async function main() {
     }
   });
 
+  // Serve the editor icons extracted from each detected `.app`'s
+  // CFBundleIconFile. Keyed by editor id; 404 when an icon couldn't be
+  // extracted (the client falls back to its generic IconCode glyph).
+  app.get("/api/editor-icon/:id", (req, res) => {
+    const file = editorIcons.get(req.params.id);
+    if (!file) { res.status(404).end(); return; }
+    // Long max-age + immutable; the cache key changes when the .app is
+    // upgraded because the source mtime triggers re-extraction at boot.
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.sendFile(file);
+  });
+
   if (isProduction) {
     const staticDir = path.resolve(__dirname, "../client");
     app.use(express.static(staticDir));
@@ -995,22 +1350,49 @@ async function main() {
   wss.on("connection", async (ws) => {
     let activeWorkspace = store.list()[0];
     let handle: RuntimeHandle | undefined;
-    let unsubscribe: (() => void) | undefined;
-    let readOnly = false;
+    let activeRuntimeId: string | null = null;
+    const runtimesById = new Map<string, RuntimeHandle>();
+    const runtimeIdBySessionKey = new Map<string, string>();
+    const openingRuntimeBySessionKey = new Map<string, Promise<RuntimeHandle>>();
+    const activeRuntimeByWorkspace = new Map<string, string>();
+    const sessionRefreshTimers = new Map<string, NodeJS.Timeout>();
     const ownerId = crypto.randomUUID();
-    const pendingUi = new Map<string, (value: unknown) => void>();
-    // One WidgetHost per WS connection; it's reset between sessions so a new
-    // session's extensions start with an empty slot table. The host emits
-    // ANSI lines straight to this socket whenever a registered Component
-    // requests a re-render.
-    const widgetHost = new WidgetHost({
-      emit: (slot, lines) => send(ws, { type: "extension_ui_widget", data: { slot, lines } }),
-      remove: (slot) => send(ws, { type: "extension_ui_widget", data: { slot, removed: true } }),
-    });
-    // The uiContext lives at WS-connection scope: all session binds and any
-    // shortcut-handler invocations share the same one, so when an extension
-    // calls ctx.ui.setWidget from a shortcut it routes back through this WS.
-    const extensionUi = createExtensionUI(ws, pendingUi, widgetHost);
+    const eventBufferLimit = 200;
+    const statusEvents = new Set([
+      "agent_start",
+      "agent_end",
+      "tool_execution_start",
+      "tool_execution_end",
+      "message_end",
+      "queue_update",
+      "compaction_start",
+      "compaction_end",
+      "auto_retry_start",
+      "auto_retry_end",
+      "session_info_changed",
+    ]);
+    let activationGeneration = 0;
+
+    function isActive(next: RuntimeHandle) {
+      return activeRuntimeId === next.id;
+    }
+
+    function isCurrentActivation(next: RuntimeHandle, generation: number) {
+      return isActive(next) && activationGeneration === generation;
+    }
+
+    function assertCommandRoute(next: RuntimeHandle, command: ClientCommand) {
+      const route = routeFor(next);
+      if (command.workspaceId && command.workspaceId !== route.workspaceId) {
+        throw new Error(`Runtime route mismatch: workspaceId ${command.workspaceId} does not match ${route.workspaceId}.`);
+      }
+      if (command.sessionId && command.sessionId !== route.sessionId) {
+        throw new Error(`Runtime route mismatch: sessionId ${command.sessionId} does not match ${route.sessionId}.`);
+      }
+      if (command.sessionPath !== undefined && command.sessionPath !== route.sessionPath) {
+        throw new Error("Runtime route mismatch: sessionPath changed; refresh the active session before sending this command.");
+      }
+    }
 
     async function applySessionDefaults(session: AgentSession) {
       const settings = settingsStore.get();
@@ -1027,30 +1409,312 @@ async function main() {
       }
     }
 
-    async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
-      if (handle?.runtime.session.sessionFile) await locks.release(handle.runtime.session.sessionFile, ownerId);
-      await handle?.runtime.dispose();
-      activeWorkspace = await store.touch(workspace.id);
-      handle = { workspace: activeWorkspace, runtime: await createRuntimeFor(activeWorkspace.cwd, options?.mode, options?.sessionPath) };
-      // Apply settings-driven defaults to brand-new sessions only — resuming an
-      // existing session preserves whatever it was last using.
-      if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(handle.runtime.session);
-      handle.runtime.setRebindSession(async () => {
-        const binding = await bindSession(ws, handle!, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
-        unsubscribe = binding.unsubscribe;
-        readOnly = binding.readOnly;
-        send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
+    function handlesForWorkspace(workspaceId: string) {
+      return [...runtimesById.values()].filter((candidate) => candidate.workspace.id === workspaceId);
+    }
+
+    function liveSessionsFor(workspaceId: string) {
+      return handlesForWorkspace(workspaceId).map((candidate) => candidate.runtime.session);
+    }
+
+    function registerHandle(next: RuntimeHandle) {
+      runtimesById.set(next.id, next);
+      for (const [key, runtimeId] of runtimeIdBySessionKey) {
+        if (runtimeId === next.id) runtimeIdBySessionKey.delete(key);
+      }
+      if (next.runtime.session.sessionFile) {
+        runtimeIdBySessionKey.set(sessionKey(next.workspace.id, next.runtime.session.sessionFile), next.id);
+      }
+    }
+
+    async function sendWorkspaceSessions(workspace: Workspace) {
+      send(ws, {
+        type: "sessions",
+        data: {
+          workspaceId: workspace.id,
+          sessions: await listSessions(workspace.cwd, liveSessionsFor(workspace.id)),
+        },
       });
-      const binding = await bindSession(ws, handle, pendingUi, widgetHost, extensionUi, locks, ownerId, settingsStore, unsubscribe);
-      unsubscribe = binding.unsubscribe;
-      readOnly = binding.readOnly;
+    }
+
+    function scheduleWorkspaceSessions(workspace: Workspace) {
+      if (sessionRefreshTimers.has(workspace.id)) return;
+      const timer = setTimeout(() => {
+        sessionRefreshTimers.delete(workspace.id);
+        void sendWorkspaceSessions(workspace).catch((error) => {
+          console.warn("Failed to refresh workspace sessions:", error);
+        });
+      }, 120);
+      timer.unref();
+      sessionRefreshTimers.set(workspace.id, timer);
+    }
+
+    function pushEventBuffer(next: RuntimeHandle, packet: { type: "event"; data: SessionRoute & { event: unknown; seq: number } }) {
+      next.eventBuffer.push(packet);
+      if (next.eventBuffer.length > eventBufferLimit) next.eventBuffer.splice(0, next.eventBuffer.length - eventBufferLimit);
+    }
+
+    function clearPendingUi(next: RuntimeHandle) {
+      for (const resolve of next.pendingUi.values()) resolve(undefined);
+      next.pendingUi.clear();
+    }
+
+    async function claimRuntimeLock(next: RuntimeHandle) {
+      const sessionFile = next.runtime.session.sessionFile;
+      const previous = next.lockedSessionFile;
+      if (previous === sessionFile) return;
+
+      if (sessionFile) {
+        const lock = await locks.claim(sessionFile, next.workspace, ownerId);
+        next.readOnly = lock.owner === "other";
+        if (lock.owner === "other" && isActive(next)) {
+          send(ws, { type: "notification", data: { level: "warning", message: `Session file is already owned by PID ${lock.lock.pid}; avoid writing from two runtimes.` } });
+        }
+      } else {
+        next.readOnly = false;
+      }
+
+      if (previous && previous !== sessionFile) await locks.release(previous, ownerId);
+      next.lockedSessionFile = sessionFile;
+    }
+
+    async function refreshSessionIdentity(next: RuntimeHandle) {
+      await claimRuntimeLock(next);
+      registerHandle(next);
+    }
+
+    function maybeGenerateTitle(next: RuntimeHandle) {
+      const session = next.runtime.session;
+      if (next.titleInFlight || session.sessionManager.getSessionName()) return;
+      next.titleInFlight = true;
+      const ownedSessionFile = session.sessionFile;
+      void (async () => {
+        try {
+          const title = await generateSessionTitle(session, settingsStore.get().titleModel);
+          if (!title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
+          session.setSessionName(title);
+          if (isActive(next)) send(ws, { type: "state", data: scopedState(next) });
+          await sendWorkspaceSessions(next.workspace);
+        } finally {
+          next.titleInFlight = false;
+        }
+      })().catch((error) => {
+        next.titleInFlight = false;
+        console.warn("Title generation failed:", error);
+      });
+    }
+
+    function attachRuntimeSubscription(next: RuntimeHandle) {
+      next.unsubscribe?.();
+      const session = next.runtime.session;
+      next.unsubscribe = session.subscribe((event) => {
+        const seq = ++next.seq;
+        const packet = scopedEvent(next, event, seq);
+        const type = eventType(event);
+        pushEventBuffer(next, packet);
+
+        if (type && statusEvents.has(type)) scheduleWorkspaceSessions(next.workspace);
+
+        if (isActive(next)) {
+          send(ws, packet);
+          if (type && ["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(type)) {
+            send(ws, { type: "state", data: scopedState(next) });
+          }
+          if (type && ["agent_end", "compaction_end", "message_end"].includes(type)) {
+            send(ws, { type: "messages", data: scopedMessages(next) });
+            send(ws, { type: "tree", data: scopedTree(next) });
+          }
+        }
+
+        if (type === "agent_end") maybeGenerateTitle(next);
+      });
+    }
+
+    async function bindForegroundExtensions(next: RuntimeHandle) {
+      clearPendingUi(next);
+      next.widgetHost.reset();
+      send(ws, { type: "extension_reset", data: routeFor(next) });
+      if (next.readOnly) {
+        send(ws, { type: "shortcuts", data: { ...routeFor(next), shortcuts: [] } });
+        return;
+      }
+      await next.runtime.session.bindExtensions({
+        uiContext: next.extensionUi,
+        commandContextActions: createCommandActions(next),
+      });
+      send(ws, { type: "shortcuts", data: { ...routeFor(next), shortcuts: listExtensionShortcuts(next) } });
+    }
+
+    async function sendActivationSnapshot(next: RuntimeHandle, generation: number) {
+      const revision = next.seq;
+      if (!isCurrentActivation(next, generation)) return;
+      await bindForegroundExtensions(next);
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "workspace", data: next.workspace });
+      send(ws, { type: "state", data: scopedState(next, revision) });
+      send(ws, { type: "messages", data: scopedMessages(next, revision) });
+      const sessions = await listSessions(next.workspace.cwd, liveSessionsFor(next.workspace.id));
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "sessions", data: { workspaceId: next.workspace.id, sessions } });
+      send(ws, { type: "resources", data: scopedResources(next) });
+      send(ws, { type: "models", data: scopedModels(next) });
+      send(ws, { type: "tree", data: scopedTree(next) });
+      const snapshot = await gitSnapshot(next.workspace.cwd);
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "git", data: { ...snapshot, workspaceId: next.workspace.id, snapshot } });
+      for (const packet of next.eventBuffer) {
+        if (packet.data.seq > revision) send(ws, packet);
+      }
       send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
-      return handle;
+    }
+
+    async function createHandle(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
+      const runtime = await createRuntimeFor(workspace.cwd, options?.mode, options?.sessionPath);
+      let next!: RuntimeHandle;
+      const pendingUi = new Map<string, (value: unknown) => void>();
+      const widgetHost = new WidgetHost({
+        emit: (slot, lines) => {
+          if (isActive(next)) send(ws, { type: "extension_ui_widget", data: { ...routeFor(next), slot, lines } });
+        },
+        remove: (slot) => {
+          if (isActive(next)) send(ws, { type: "extension_ui_widget", data: { ...routeFor(next), slot, removed: true } });
+        },
+      });
+      const extensionUi = createExtensionUI(ws, () => routeFor(next), pendingUi, widgetHost, () => isActive(next));
+      next = {
+        id: crypto.randomUUID(),
+        workspace,
+        runtime,
+        seq: 0,
+        eventBuffer: [],
+        readOnly: false,
+        pendingUi,
+        widgetHost,
+        extensionUi,
+        titleInFlight: false,
+      };
+      if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(next.runtime.session);
+      await refreshSessionIdentity(next);
+      attachRuntimeSubscription(next);
+      next.runtime.setRebindSession(async () => {
+        await refreshSessionIdentity(next);
+        attachRuntimeSubscription(next);
+        if (isActive(next)) await sendActivationSnapshot(next, activationGeneration);
+        else await sendWorkspaceSessions(next.workspace);
+      });
+      next.runtime.setBeforeSessionInvalidate(() => {
+        clearPendingUi(next);
+        next.widgetHost.reset();
+      });
+      return next;
+    }
+
+    async function disposeRuntime(existing: RuntimeHandle) {
+      if (isActive(existing)) {
+        activeRuntimeId = null;
+        handle = undefined;
+      }
+      existing.unsubscribe?.();
+      clearPendingUi(existing);
+      await locks.release(existing.lockedSessionFile ?? existing.runtime.session.sessionFile, ownerId);
+      await existing.runtime.dispose();
+      runtimesById.delete(existing.id);
+      for (const [key, runtimeId] of runtimeIdBySessionKey) {
+        if (runtimeId === existing.id) runtimeIdBySessionKey.delete(key);
+      }
+      for (const [workspaceId, runtimeId] of activeRuntimeByWorkspace) {
+        if (runtimeId === existing.id) activeRuntimeByWorkspace.delete(workspaceId);
+      }
+    }
+
+    async function disposeWorkspace(workspaceId: string) {
+      await Promise.all(handlesForWorkspace(workspaceId).map(disposeRuntime));
+    }
+
+    async function openHandle(workspace: Workspace, sessionPath: string) {
+      const key = sessionKey(workspace.id, sessionPath);
+      const existingId = runtimeIdBySessionKey.get(key);
+      const existing = existingId ? runtimesById.get(existingId) : undefined;
+      if (existing) return existing;
+      const pending = openingRuntimeBySessionKey.get(key);
+      if (pending) return pending;
+
+      const opening = (async () => {
+        const lock = await locks.claim(sessionPath, workspace, ownerId);
+        if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
+        try {
+          const nowExistingId = runtimeIdBySessionKey.get(key);
+          const nowExisting = nowExistingId ? runtimesById.get(nowExistingId) : undefined;
+          return nowExisting ?? await createHandle(workspace, { mode: "open", sessionPath });
+        } catch (error) {
+          await locks.release(sessionPath, ownerId);
+          throw error;
+        } finally {
+          openingRuntimeBySessionKey.delete(key);
+        }
+      })();
+      openingRuntimeBySessionKey.set(key, opening);
+      return opening;
+    }
+
+    async function forkHandle(source: RuntimeHandle, entryId: string, position: "before" | "at") {
+      const sourceFile = source.runtime.session.sessionFile;
+      if (!sourceFile) throw new Error("Cannot fork an unsaved session yet.");
+
+      const liveManager = source.runtime.session.sessionManager;
+      const entry = liveManager.getEntry(entryId);
+      if (!entry) throw new Error("Invalid entry ID for forking");
+
+      let targetLeafId: string | null;
+      let selectedText: string | undefined;
+      if (position === "at") {
+        targetLeafId = entry.id;
+      } else {
+        if (entry.type !== "message" || entry.message.role !== "user") {
+          throw new Error("Invalid entry ID for forking");
+        }
+        targetLeafId = entry.parentId;
+        selectedText = plainTextFromMessage(entry.message as { content: unknown });
+      }
+
+      if (!targetLeafId) {
+        const next = await activateHandle(source.workspace, await createHandle(source.workspace));
+        return { cancelled: false, selectedText, runtimeId: next.id, sessionPath: next.runtime.session.sessionFile };
+      }
+
+      const sourceManager = SessionManager.open(sourceFile, liveManager.getSessionDir(), source.workspace.cwd);
+      const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
+      if (!forkedSessionPath) throw new Error("Failed to create forked session");
+      const next = await activateHandle(source.workspace, await openHandle(source.workspace, forkedSessionPath));
+      return { cancelled: false, selectedText, runtimeId: next.id, sessionPath: next.runtime.session.sessionFile };
+    }
+
+    async function activateHandle(workspace: Workspace, next: RuntimeHandle) {
+      if (handle && handle !== next) clearPendingUi(handle);
+      activeWorkspace = await store.touch(workspace.id);
+      next.workspace = activeWorkspace;
+      await refreshSessionIdentity(next);
+      activeRuntimeId = next.id;
+      const generation = ++activationGeneration;
+      activeRuntimeByWorkspace.set(activeWorkspace.id, next.id);
+      handle = next;
+      await sendActivationSnapshot(next, generation);
+      return next;
+    }
+
+    async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
+      activeWorkspace = await store.touch(workspace.id);
+      const cachedId = options?.mode === "open" && options.sessionPath
+        ? runtimeIdBySessionKey.get(sessionKey(activeWorkspace.id, options.sessionPath))
+        : activeRuntimeByWorkspace.get(activeWorkspace.id);
+      const cached = cachedId ? runtimesById.get(cachedId) : undefined;
+      const next = cached ?? await createHandle(activeWorkspace, options);
+      return activateHandle(activeWorkspace, next);
     }
 
     try {
       await activate(activeWorkspace);
-      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session), settings: settingsStore.get() } });
+      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: scopedState(handle!), settings: settingsStore.get(), editors: availableEditors } });
       send(ws, { type: "settings", data: settingsStore.get() });
     } catch (error) {
       send(ws, { type: "response", command: "connect", success: false, error: error instanceof Error ? error.message : String(error) });
@@ -1067,8 +1731,22 @@ async function main() {
       }
 
       const id = command.id;
+      const targetHandle = command.runtimeId ? runtimesById.get(command.runtimeId) : handle;
+      const commandRuntime = () => {
+        if (!targetHandle) throw new Error(command.runtimeId ? `Unknown runtimeId: ${command.runtimeId}` : "No active session");
+        return targetHandle;
+      };
       try {
-        if (readOnly && writeCommands.has(command.type)) {
+        if (command.runtimeId && !targetHandle) {
+          throw new Error(`Unknown runtimeId: ${command.runtimeId}`);
+        }
+        if (targetHandle && command.runtimeId) {
+          assertCommandRoute(targetHandle, command);
+        }
+        if (sessionWriteCommands.has(command.type) && !targetHandle) {
+          throw new Error("No active session");
+        }
+        if (targetHandle?.readOnly && sessionWriteCommands.has(command.type)) {
           throw new Error("This session is read-only because another Pi runtime owns its session file. Close the other runtime before changing this session.");
         }
         switch (command.type) {
@@ -1105,212 +1783,256 @@ async function main() {
             if (command.workspaceId === initialWorkspaceId) {
               throw new Error("This workspace is the launch directory and is pinned — it can't be removed.");
             }
-            if (command.workspaceId === activeWorkspace.id) await handle?.runtime.dispose();
+            await disposeWorkspace(command.workspaceId);
             await store.remove(command.workspaceId);
             const next = store.list()[0] ?? (await store.add(initialCwd));
             await activate(next);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
-          case "list_sessions":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { sessions: await listSessions(activeWorkspace.cwd) } });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+          case "list_sessions": {
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const sessions = await listSessions(workspace.cwd, liveSessionsFor(workspace.id));
+            send(ws, { type: "response", id, command: command.type, success: true, data: { sessions } });
+            send(ws, { type: "sessions", data: { workspaceId: workspace.id, sessions } });
             break;
+          }
           case "delete_session": {
             if (!command.sessionPath) throw new Error("Missing sessionPath");
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
             // Refuse to delete the session file we currently hold open.
-            if (handle?.runtime.session.sessionFile === command.sessionPath) {
+            if ([...runtimesById.values()].some((existing) => existing.runtime.session.sessionFile === command.sessionPath)) {
               throw new Error("This session is open. Switch to another conversation first, then delete it.");
             }
-            // Don't allow deletion of files outside the active workspace's session listing.
-            const sessionsForWs = await listSessions(activeWorkspace.cwd);
+            // Don't allow deletion of files outside the target workspace's session listing.
+            const sessionsForWs = await listSessions(workspace.cwd);
             if (!sessionsForWs.some((s) => s.path === command.sessionPath)) {
               throw new Error("Session not found in this workspace.");
             }
             await fs.unlink(command.sessionPath);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
+            await sendWorkspaceSessions(workspace);
             break;
           }
           case "switch_session":
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             {
-              const lock = await locks.claim(command.sessionPath, activeWorkspace, ownerId);
-              if (lock.owner === "other") throw lockConflictError(command.sessionPath, lock.lock);
-              const previousSessionFile = handle!.runtime.session.sessionFile;
-              const result = await handle!.runtime.switchSession(command.sessionPath, { cwdOverride: activeWorkspace.cwd });
-              if (!result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(previousSessionFile, ownerId);
-              else if (result.cancelled && previousSessionFile !== command.sessionPath) await locks.release(command.sessionPath, ownerId);
-              send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const next = await openHandle(workspace, command.sessionPath);
+              await activateHandle(workspace, next);
+              send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
             }
             break;
           case "continue_recent":
             {
-              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const sessionPath = await mostRecentSessionPath(workspace.cwd);
               if (sessionPath) {
-                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
-                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                const previousSessionFile = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
-                if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
-                else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
-                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "Session switch cancelled by extension." : undefined });
+                const next = await openHandle(workspace, sessionPath);
+                await activateHandle(workspace, next);
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
               } else {
-                const previousSessionFile = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.newSession();
-                if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-                send(ws, { type: "response", id, command: command.type, success: !result.cancelled, data: result, error: result.cancelled ? "New session cancelled by extension." : undefined });
+                const next = await activateHandle(workspace, await createHandle(workspace));
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
               }
             }
             break;
           case "new_session":
-            const previousSessionFile = handle!.runtime.session.sessionFile;
-            const newSessionResult = await handle!.runtime.newSession();
-            if (!newSessionResult.cancelled) await locks.release(previousSessionFile, ownerId);
-            send(ws, { type: "response", id, command: command.type, success: !newSessionResult.cancelled, data: newSessionResult, error: newSessionResult.cancelled ? "New session cancelled by extension." : undefined });
+            {
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const next = await activateHandle(workspace, await createHandle(workspace));
+              send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
+            }
             break;
           case "get_state":
-            send(ws, { type: "response", id, command: command.type, success: true, data: publicState(activeWorkspace, handle!.runtime.session) });
+            send(ws, { type: "response", id, command: command.type, success: true, data: scopedState(commandRuntime()) });
             break;
           case "get_messages":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { messages: handle!.runtime.session.messages } });
+            send(ws, { type: "response", id, command: command.type, success: true, data: scopedMessages(commandRuntime()) });
             break;
           case "get_resources":
-            send(ws, { type: "response", id, command: command.type, success: true, data: publicResources(handle!.runtime.session) });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedResources(active) });
+              if (isActive(active)) send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           case "reload_resources":
-            await handle!.runtime.session.reload();
-            send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            {
+              const active = commandRuntime();
+              await active.runtime.session.reload();
+              send(ws, { type: "response", id, command: command.type, success: true });
+              if (isActive(active)) send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           case "invoke_command": {
             if (!command.commandName) throw new Error("Missing commandName");
+            const active = commandRuntime();
+            const workspace = active.workspace;
             const name = command.commandName.replace(/^\//, "");
             if (name === "new") {
-              const previous = handle!.runtime.session.sessionFile;
-              const result = await handle!.runtime.newSession();
-              if (!result.cancelled) await locks.release(previous, ownerId);
+              await activateHandle(workspace, await createHandle(workspace));
             } else if (name === "resume") {
-              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              const sessionPath = await mostRecentSessionPath(workspace.cwd);
               if (sessionPath) {
-                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
-                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                const previous = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.switchSession(sessionPath, { cwdOverride: activeWorkspace.cwd });
-                if (!result.cancelled && previous !== sessionPath) await locks.release(previous, ownerId);
-                else if (result.cancelled && previous !== sessionPath) await locks.release(sessionPath, ownerId);
+                await activateHandle(workspace, await openHandle(workspace, sessionPath));
               }
             } else if (name === "clone") {
-              const leafId = handle!.runtime.session.sessionManager.getLeafId();
+              const leafId = active.runtime.session.sessionManager.getLeafId();
               if (leafId) {
-                const previous = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.fork(leafId, { position: "at" });
-                if (!result.cancelled) await locks.release(previous, ownerId);
+                await forkHandle(active, leafId, "at");
               }
-            } else if (name === "compact") await handle!.runtime.session.compact();
-            else if (name === "export") await handle!.runtime.session.exportToHtml();
-            else if (name === "reload") await handle!.runtime.session.reload();
-            else await handle!.runtime.session.prompt(`/${name}`);
+            } else if (name === "compact") await active.runtime.session.compact();
+            else if (name === "export") await active.runtime.session.exportToHtml();
+            else if (name === "reload") await active.runtime.session.reload();
+            else await active.runtime.session.prompt(`/${name}`);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           }
           case "get_models":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { models: publicModels(handle!.runtime.session) } });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedModels(active) });
+              if (isActive(active)) send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           case "get_tree":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { entries: publicTree(handle!.runtime.session) } });
-            send(ws, { type: "tree", data: { entries: publicTree(handle!.runtime.session) } });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedTree(active) });
+              if (isActive(active)) send(ws, { type: "tree", data: scopedTree(active) });
+            }
             break;
           case "prompt": {
-            const session = handle!.runtime.session;
+            const active = commandRuntime();
+            const session = active.runtime.session;
+            const workspace = active.workspace;
             if (!command.message?.trim()) throw new Error("Missing message");
             send(ws, { type: "response", id, command: command.type, success: true });
             await session.prompt(command.message, { streamingBehavior: command.streamingBehavior });
-            send(ws, { type: "state", data: publicState(activeWorkspace, session) });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
-            send(ws, { type: "tree", data: { entries: publicTree(session) } });
+            await refreshSessionIdentity(active);
+            if (isActive(active) && active.runtime.session === session) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "tree", data: scopedTree(active) });
+            }
+            await sendWorkspaceSessions(workspace);
             break;
           }
           case "steer":
             if (!command.message?.trim()) throw new Error("Missing message");
-            await handle!.runtime.session.steer(command.message);
+            await commandRuntime().runtime.session.steer(command.message);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "follow_up":
             if (!command.message?.trim()) throw new Error("Missing message");
-            await handle!.runtime.session.followUp(command.message);
+            await commandRuntime().runtime.session.followUp(command.message);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "abort":
-            await handle!.runtime.session.abort();
+            await commandRuntime().runtime.session.abort();
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "fork":
             if (!command.entryId) throw new Error("Missing entryId");
-            const previousForkSessionFile = handle!.runtime.session.sessionFile;
-            const forkResult = await handle!.runtime.fork(command.entryId, { position: "before" });
-            if (!forkResult.cancelled) await locks.release(previousForkSessionFile, ownerId);
+            const forkResult = await forkHandle(commandRuntime(), command.entryId, "before");
             send(ws, { type: "response", id, command: command.type, success: !forkResult.cancelled, data: { cancelled: forkResult.cancelled, selectedText: forkResult.selectedText }, error: forkResult.cancelled ? "Fork cancelled by extension." : undefined });
             break;
           case "clone": {
-            const leafId = handle!.runtime.session.sessionManager.getLeafId();
+            const active = commandRuntime();
+            const leafId = active.runtime.session.sessionManager.getLeafId();
             if (!leafId) throw new Error("No current session entry to clone");
-            const previousCloneSessionFile = handle!.runtime.session.sessionFile;
-            const cloneResult = await handle!.runtime.fork(leafId, { position: "at" });
-            if (!cloneResult.cancelled) await locks.release(previousCloneSessionFile, ownerId);
+            const cloneResult = await forkHandle(active, leafId, "at");
             send(ws, { type: "response", id, command: command.type, success: !cloneResult.cancelled, data: cloneResult, error: cloneResult.cancelled ? "Clone cancelled by extension." : undefined });
             break;
           }
           case "compact": {
-            const result = await handle!.runtime.session.compact(command.customInstructions);
+            const active = commandRuntime();
+            const result = await active.runtime.session.compact(command.customInstructions);
             send(ws, { type: "response", id, command: command.type, success: true, data: result });
-            send(ws, { type: "messages", data: { messages: handle!.runtime.session.messages } });
-            send(ws, { type: "tree", data: { entries: publicTree(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "messages", data: scopedMessages(active) });
+              send(ws, { type: "tree", data: scopedTree(active) });
+            }
             break;
           }
-          case "set_session_name":
-            handle!.runtime.session.setSessionName(command.name ?? "");
+          case "set_session_name": {
+            const active = commandRuntime();
+            active.runtime.session.setSessionName(command.name ?? "");
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "sessions", data: { workspaceId: activeWorkspace.id, sessions: await listSessions(activeWorkspace.cwd) } });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
+            await sendWorkspaceSessions(active.workspace);
+            if (isActive(active)) send(ws, { type: "state", data: scopedState(active) });
             break;
+          }
           case "export_html": {
-            const outputPath = await handle!.runtime.session.exportToHtml();
+            const outputPath = await commandRuntime().runtime.session.exportToHtml();
             send(ws, { type: "response", id, command: command.type, success: true, data: { outputPath } });
             send(ws, { type: "notification", data: { level: "info", message: `Exported session to ${outputPath}` } });
             break;
           }
           case "cycle_model": {
-            const result = await handle!.runtime.session.cycleModel();
+            const active = commandRuntime();
+            const result = await active.runtime.session.cycleModel();
             send(ws, { type: "response", id, command: command.type, success: true, data: result });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           }
           case "set_model": {
             if (!command.provider || !command.modelId) throw new Error("Missing provider/modelId");
-            const model = handle!.runtime.session.modelRegistry.find(command.provider, command.modelId);
+            const active = commandRuntime();
+            const model = active.runtime.session.modelRegistry.find(command.provider, command.modelId);
             if (!model) throw new Error(`Unknown model: ${command.provider}/${command.modelId}`);
-            await handle!.runtime.session.setModel(model);
+            await active.runtime.session.setModel(model);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           }
-          case "set_thinking_level":
+          case "set_thinking_level": {
             if (!command.level) throw new Error("Missing thinking level");
-            handle!.runtime.session.setThinkingLevel(command.level);
+            const active = commandRuntime();
+            active.runtime.session.setThinkingLevel(command.level);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
+            if (isActive(active)) send(ws, { type: "state", data: scopedState(active) });
             break;
+          }
           case "list_files": {
-            const files = await listWorkspaceFiles(activeWorkspace.cwd);
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const files = await listWorkspaceFiles(workspace.cwd);
             send(ws, { type: "response", id, command: command.type, success: true, data: { files } });
-            send(ws, { type: "files", data: { workspaceId: activeWorkspace.id, files } });
+            send(ws, { type: "files", data: { workspaceId: workspace.id, files } });
+            break;
+          }
+          case "open_in_editor": {
+            if (!command.editor || !command.path) throw new Error("Missing editor or path");
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            // Path comes from the client as workspace-relative (the same shape
+            // we ship in the `files` packet). Resolve against the target
+            // workspace so the editor opens the right absolute location.
+            const abs = path.resolve(workspace.cwd, command.path);
+            // Don't allow escaping the workspace via "../" — keep this strictly
+            // bounded so a misbehaving client can't `open -R /Users/.../id_rsa`.
+            const rel = path.relative(workspace.cwd, abs);
+            if (rel.startsWith("..") || path.isAbsolute(rel)) {
+              throw new Error("Path is outside the target workspace");
+            }
+            await openInEditor(command.editor, abs);
+            send(ws, { type: "response", id, command: command.type, success: true });
+            break;
+          }
+          case "get_git": {
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const snapshot = await gitSnapshot(workspace.cwd);
+            send(ws, { type: "response", id, command: command.type, success: true, data: snapshot });
+            send(ws, { type: "git", data: { ...snapshot, workspaceId: workspace.id, snapshot } });
             break;
           }
           case "get_settings":
@@ -1325,8 +2047,13 @@ async function main() {
           }
           case "extension_ui_response":
             if (!command.uiRequestId) throw new Error("Missing uiRequestId");
-            pendingUi.get(command.uiRequestId)?.(command.value);
-            pendingUi.delete(command.uiRequestId);
+            {
+              const uiHandle = command.runtimeId
+                ? runtimesById.get(command.runtimeId)
+                : [...runtimesById.values()].find((candidate) => candidate.pendingUi.has(command.uiRequestId!));
+              uiHandle?.pendingUi.get(command.uiRequestId)?.(command.value);
+              uiHandle?.pendingUi.delete(command.uiRequestId);
+            }
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "extension_input": {
@@ -1334,16 +2061,18 @@ async function main() {
             // (e.g. autoresearch's fullscreen dashboard). Silently dropped
             // when there's no overlay; that's fine — extra keystrokes after
             // close are racy anyway.
+            const inputHandle = command.runtimeId ? runtimesById.get(command.runtimeId) : handle;
             if (typeof command.data === "string" && command.data.length > 0) {
-              widgetHost.dispatchInput(command.data);
+              inputHandle?.widgetHost.dispatchInput(command.data);
             }
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
           case "trigger_shortcut": {
-            if (!command.key || !handle) throw new Error("Missing key or no active session");
+            const active = commandRuntime();
+            if (!command.key) throw new Error("Missing key");
             const target = canonicalKeyId(command.key);
-            const shortcuts = handle.runtime.session.extensionRunner.getShortcuts({});
+            const shortcuts = active.runtime.session.extensionRunner.getShortcuts({});
             const matchedHandler = (() => {
               for (const [registeredKey, sc] of shortcuts) {
                 if (canonicalKeyId(registeredKey) === target) return sc.handler;
@@ -1358,7 +2087,7 @@ async function main() {
             // don't want to block the WS message loop on a slow one. The cast
             // sidesteps the strict ExtensionContext shape; our buildExtension-
             // Context returns a structurally-compatible subset.
-            void Promise.resolve(matchedHandler(buildExtensionContext(handle, extensionUi) as Parameters<typeof matchedHandler>[0]))
+            void Promise.resolve(matchedHandler(buildExtensionContext(active, active.extensionUi) as Parameters<typeof matchedHandler>[0]))
               .catch((error) => send(ws, { type: "notification", data: { message: `Shortcut handler failed: ${error instanceof Error ? error.message : String(error)}`, level: "error" } }));
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
@@ -1374,17 +2103,17 @@ async function main() {
           success: false,
           error: error instanceof Error ? error.message : String(error),
         });
-        if (handle) send(ws, { type: "state", data: publicState(activeWorkspace, handle.runtime.session) });
+        if (handle) send(ws, { type: "state", data: scopedState(handle) });
       }
     });
 
     ws.on("close", async () => {
-      unsubscribe?.();
-      widgetHost.reset();
-      for (const resolve of pendingUi.values()) resolve(undefined);
-      pendingUi.clear();
-      await locks.release(handle?.runtime.session.sessionFile, ownerId);
-      await handle?.runtime.dispose();
+      for (const timer of sessionRefreshTimers.values()) clearTimeout(timer);
+      sessionRefreshTimers.clear();
+      await Promise.all([...runtimesById.values()].map(disposeRuntime));
+      runtimesById.clear();
+      runtimeIdBySessionKey.clear();
+      activeRuntimeByWorkspace.clear();
     });
   });
 

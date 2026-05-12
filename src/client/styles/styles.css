@@ -196,8 +196,31 @@ body.dark {
    palette[0] base color visible at the rim; the canvas inside fills 100% and
    uses pixelated rendering so the small grid stays chunky on retina instead
    of bilinear-blurring into a smudge. */
+.orb-shell {
+  display: inline-grid;
+  place-items: center;
+  position: relative;
+  vertical-align: middle;
+  line-height: 0;
+  flex-shrink: 0;
+}
+.orb-shell.running::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 999px;
+  background: radial-gradient(circle, oklch(from var(--orb-glow) l c h / 0.38) 0%, oklch(from var(--orb-glow) l c h / 0.20) 38%, transparent 72%);
+  filter: blur(2px);
+  opacity: 0.9;
+  transform: scale(0.96);
+  animation: orbSidebarGlow 1.9s var(--ease) infinite;
+}
 .orb {
-  display: inline-block;
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
   vertical-align: middle;
   border-radius: 50%;
   overflow: hidden;
@@ -209,6 +232,13 @@ body.dark {
   height: 100%;
   display: block;
   image-rendering: pixelated;
+}
+@keyframes orbSidebarGlow {
+  0%, 100% { opacity: 0.66; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .orb-shell.running::before { animation: none; opacity: 0.78; transform: none; }
 }
 .topbar .topbar-side { display: flex; align-items: center; gap: 4px; min-width: 24px; }
 .topbar .topbar-side.right { justify-content: flex-end; }
@@ -374,14 +404,10 @@ code {
   letter-spacing: -0.005em;
 }
 .reasoning > button:hover { color: var(--ink); }
-.reasoning .spinner {
-  width: 12px; height: 12px;
-  border-radius: 50%;
-  border: 1.5px solid var(--hairline-strong);
-  border-top-color: var(--accent);
-  animation: spin 1s linear infinite;
-  flex-shrink: 0;
-}
+/* Orb takes the slot the old `.spinner` lived in: same flex-row, same gap,
+   but it animates only while the turn is streaming and freezes to a static
+   identity badge when the turn settles. */
+.reasoning > button .orb-shell { flex-shrink: 0; }
 
 /* Unified timeline: thoughts and tools live in the same list, in order. */
 .timeline {
@@ -1219,6 +1245,25 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border: 1px solid var(--hairline) !important;
 }
 .metaBar-thinking:hover { border-color: var(--hairline-strong) !important; }
+.gitBranch {
+  /* Sits inline with the other metaBar tokens (model name, thinking level,
+     ctx %). No pill border — just an icon + name + optional ahead/behind. */
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  min-width: 0;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.gitBranch svg { color: var(--faint); flex-shrink: 0; }
+.gitBranch-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.gitBranch-trail { color: var(--faint); flex-shrink: 0; }
 .status { display: inline-flex; align-items: center; gap: 6px; }
 .status::before {
   content: '';
@@ -1263,7 +1308,13 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border-right: 0;
   border-left: 1px solid var(--hairline);
   width: 244px;
+  /* Width is driven by inline style when open so the drag handle has a live
+     value to update. The transition is dropped on the right sidebar while
+     dragging would otherwise lag the cursor; we only animate open/close. */
+  transition: border-color 0.3s var(--ease);
 }
+/* Restore the smooth open/close animation when the user toggles the rail. */
+.sidebar.right.closed { transition: width 0.42s var(--ease), border-color 0.3s var(--ease); }
 .sidebar.closed { width: 0; border-color: transparent; }
 
 .sideInner {
@@ -1274,8 +1325,23 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   padding: 10px 8px 8px;
   transition: opacity 0.32s var(--ease);
 }
+/* Right sidebar's inner width is driven by inline style (matches the aside),
+   so the static 244px fallback is only used during the closed-state transition. */
 .right .sideInner { width: 244px; }
 .sidebar.closed .sideInner { opacity: 0; pointer-events: none; }
+
+/* Drag handle on the left edge of the right sidebar. Sits as an absolute
+   strip over the border so the cursor flips to col-resize when hovered. */
+.sidebar-resize {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  margin-left: -2px;
+  cursor: col-resize;
+  z-index: 5;
+}
+.sidebar-resize:hover,
+.sidebar-resize:active { background: oklch(from var(--accent) l c h / 0.18); }
 
 /* Sidebar head */
 .sideHead {
@@ -1437,6 +1503,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
    delete button so we can position the latter absolutely on the right. */
 .sb-ws-row {
   position: relative;
+  display: flex;
+  align-items: center;
 }
 .sb-ws-del {
   position: absolute;
@@ -1464,11 +1532,11 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .sb-ws-count { transition: opacity 0.18s var(--ease); }
 .sb-ws-del:hover { background: oklch(from var(--bad) l c h / 0.12); color: var(--bad); }
 
+.sb-ws-toggle,
 .sb-ws-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
   padding: 5px 6px;
   background: transparent;
   border: 0;
@@ -1480,14 +1548,25 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   transition: background 0.15s var(--ease), color 0.15s var(--ease);
   text-align: left;
 }
+.sb-ws-toggle {
+  width: 24px;
+  justify-content: center;
+  padding-inline: 4px;
+}
+.sb-ws-head {
+  flex: 1;
+  min-width: 0;
+}
+.sb-ws-toggle:hover,
 .sb-ws-head:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.sb-ws-toggle svg,
 .sb-ws-head svg { flex-shrink: 0; }
-.sb-ws-head .sb-chev {
+.sb-ws-toggle .sb-chev {
   color: var(--faint);
   transition: transform 0.32s var(--ease);
 }
-.sb-ws.open .sb-ws-head .sb-chev { transform: rotate(0deg); }
-.sb-ws.closed .sb-ws-head .sb-chev { transform: rotate(-90deg); }
+.sb-ws.open .sb-ws-toggle .sb-chev { transform: rotate(0deg); }
+.sb-ws.closed .sb-ws-toggle .sb-chev { transform: rotate(-90deg); }
 .sb-ws-head .sb-folder { color: var(--muted); }
 .sb-ws.active .sb-ws-head { color: var(--ink); }
 .sb-ws.active .sb-ws-head .sb-folder { color: var(--accent); }
@@ -1528,6 +1607,7 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 }
 .sb-conv-row:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
 .sb-conv-row.active { background: oklch(from var(--ink) l c h / 0.06); color: var(--ink); }
+.sb-conv-row.unread .sb-conv-title { color: var(--ink); font-weight: 520; }
 body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 .sb-conv {
   flex: 1;
@@ -1559,6 +1639,23 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   flex-shrink: 0;
   opacity: 0;
   transition: opacity 0.18s var(--ease);
+}
+.sb-conv-alert {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--surface);
+  flex-shrink: 0;
+}
+.sb-conv-unread {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  border: 1.5px solid var(--ink-soft);
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--surface);
+  flex-shrink: 0;
 }
 .sb-conv-row:hover .sb-conv-time,
 .sb-conv-row.active .sb-conv-time { opacity: 1; }
@@ -1674,7 +1771,51 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 .sb-popover-row .extra { margin-left: auto; font: 10.5px var(--mono); color: var(--faint); }
 
 /* Right sidebar — Diffs panel */
-.sb-empty-panel {
+/* Right-sidebar panel system — shared by the Diffs and Files tabs. The
+   chrome is deliberately minimal: no card-in-card borders, no boxy panels;
+   small uppercase-free monospaced labels, hairline separators, and the rest
+   of the visual structure comes from the content itself (diff/file list).
+   This matches the rest of the app's typography conventions. */
+.sidePanel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sidePanel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+.sidePanel-head:first-child { padding-top: 4px; }
+.sidePanel-label {
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  flex-shrink: 0;
+}
+.sidePanel-value {
+  font: 11.5px var(--mono);
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sidePanel-note {
+  margin: 8px 10px;
+  padding: 0;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* Compact two-line empty state shared across both tabs. Pretext-balanced
+   body so the helper copy never leaves an orphan line. */
+.sidePanel-empty {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1682,29 +1823,265 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   justify-content: center;
   text-align: center;
   padding: 32px 18px;
-  color: var(--muted);
+  gap: 6px;
 }
-.sb-empty-panel-glyph {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  background: oklch(from var(--ink) l c h / 0.04);
-  color: var(--muted);
+.sidePanel-empty-title {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.sidePanel-empty p {
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.5;
+  max-width: 100%;
+}
+
+/* Generic list row — used by the diff file list. Status badge sits in a
+   fixed-width slot so paths align cleanly down the column. */
+.sideList {
+  list-style: none;
+  margin: 0;
+  padding: 4px 4px;
+  flex: 0 0 auto;
+  max-height: 36%;
+  overflow: auto;
+  border-bottom: 1px solid var(--hairline);
+}
+.sideList-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.sideList-row:hover { background: oklch(from var(--ink) l c h / 0.04); }
+.sideList-badge {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+  font: 10px var(--mono);
+  color: var(--faint);
+}
+.sideList-row.status-added .sideList-badge,
+.sideList-row.status-untracked .sideList-badge { color: var(--hljs-addition-fg); }
+.sideList-row.status-deleted .sideList-badge { color: var(--hljs-deletion-fg); }
+.sideList-row.status-renamed .sideList-badge,
+.sideList-row.status-copied .sideList-badge { color: var(--accent); }
+.sideList-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+/* Per-file diff list — each changed file is its own collapsible row. Click
+   the header to expand the file's hunks inline; the rest of the rows stay
+   compact so you can scan the change set first and drill in second. Same
+   diff coloring as the edit-tool diffs in chat for visual continuity. */
+.diffFiles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.diffFile {
+  border-bottom: 1px solid var(--hairline);
+}
+.diffFile:last-child { border-bottom: 0; }
+.diffFile-headRow {
+  display: flex;
+  align-items: center;
+}
+.diffFile-headRow > .diffFile-head { flex: 1; min-width: 0; }
+.diffFile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.diffFile-head:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.diffFile-head:disabled { cursor: default; color: var(--muted); }
+.diffFile-head:disabled:hover { background: transparent; }
+.diffFile.open .diffFile-head { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+.diffFile-chev {
+  flex: 0 0 auto;
+  width: 10px;
+  text-align: center;
+  font-size: 9px;
+  color: var(--faint);
+}
+.diffFile-body {
+  margin: 0;
+  padding: 4px 0 10px;
+  background: oklch(from var(--ink) l c h / 0.025);
+  font: 11px/1.5 var(--mono);
+  color: var(--hljs-fg);
+  white-space: pre;
+  overflow-x: auto;
+  border-top: 1px solid var(--hairline);
+}
+.diffFile-body .diffLine { padding: 0 14px; }
+
+/* File tree — flat ul/li with depth-indented padding. Buttons for folders
+   (toggle expand/collapse), li for files. Mono everywhere. */
+.fileTree, .fileTree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+.fileTree { padding: 4px 0 12px; }
+.fileTree-folderHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding-right: 8px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  background: transparent;
+  border: 0;
+  font: 12px var(--mono);
+  color: var(--ink-soft);
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+/* File rows pair the path with the open-in-editor menu trigger on hover.
+   The row is the hit target; the trigger only shows when the row is hovered
+   so the file list stays calm in its resting state. */
+.fileTree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 0;
+  font: 12px var(--mono);
+  color: var(--ink-soft);
+  border-radius: 4px;
+}
+.fileTree-rowMain {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+.fileTree-folderHead:hover,
+.fileTree-row:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.fileTree-chev {
+  flex: 0 0 auto;
+  width: 10px;
+  font-size: 9px;
+  color: var(--faint);
+  text-align: center;
+}
+.fileTree-icon {
+  flex: 0 0 auto;
+  width: 10px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 10px;
+}
+.fileTree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Open-in-editor — slim trigger button + floating popover. The trigger is
+   hidden until the parent row is hovered/focused; the popover anchors
+   bottom-right so it never collides with the path that just spawned it. */
+.openInEditor {
+  position: relative;
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.14s var(--ease);
+}
+.fileTree-row:hover .openInEditor,
+.fileTree-row:focus-within .openInEditor,
+.diffFile-headRow:hover .openInEditor,
+.diffFile-headRow:focus-within .openInEditor,
+.openInEditor:focus-within { opacity: 1; }
+.openInEditor-trigger {
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 12px;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
 }
-.sb-empty-panel-title {
-  font-size: 12px;
+.openInEditor-trigger:hover { color: var(--ink); }
+/* Editor picker — horizontal row of icons. Each item is a small square
+   button showing the editor's actual .app icon (extracted server-side from
+   the bundle's CFBundleIconFile). Name carried by title/aria-label so the
+   menu reads purely as icons in the visual register. */
+.openInEditor-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 10px;
+  box-shadow: 0 12px 28px oklch(0 0 0 / 0.18);
+  display: flex;
+  flex-direction: row;
+  gap: 2px;
+  z-index: 40;
+}
+.openInEditor-item {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 3px;
+}
+.openInEditor-item:hover { background: oklch(from var(--ink) l c h / 0.07); }
+.openInEditor-icon {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  /* The icons we extract are raster PNGs at 64px; on retina they're already
+     sharp at the 22px button. No additional smoothing needed. */
+}
+.openInEditor-iconFallback {
+  width: 100%;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: 12px var(--mono);
   color: var(--ink-soft);
-  margin-bottom: 4px;
-  font-weight: 500;
-}
-.sb-empty-panel-sub {
-  font-size: 11px;
-  color: var(--faint);
-  line-height: 1.5;
-  max-width: 200px;
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
 }
 
 /* ------- Notices / queue / dialogs (kept minimal) ------- */
@@ -1796,20 +2173,116 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 }
 .dialogActions .danger:hover { background: oklch(from var(--bad) l c h / 0.16); color: var(--bad); }
 
-/* Settings dialog */
-.settingsDialog { width: min(520px, 100%); max-height: min(calc(100vh - 40px), 720px); overflow-y: auto; }
-.settingsDialog .dialogHeader {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+/* Settings screen */
+.settingsShell {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--ink);
+  animation: settingsEnter 0.18s var(--ease);
 }
-.settingsDialog .iconBtn {
-  background: transparent;
+.settingsSide {
+  min-width: 0;
+  border-right: 1px solid var(--hairline);
+  background: var(--surface);
+  padding: 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.settingsSide-top { display: grid; gap: 14px; }
+.settingsBack {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  width: 100%;
   border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  padding: 7px 8px;
   cursor: pointer;
-  padding: 4px;
-  border-radius: 6px;
-  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease), transform 0.12s var(--ease);
 }
-.settingsDialog .iconBtn:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+.settingsBack:hover { background: oklch(from var(--ink) l c h / 0.045); color: var(--ink); }
+.settingsBack:active { transform: scale(0.985); }
+.settingsSide-title {
+  padding: 0 8px;
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.2;
+  font-weight: 620;
+}
+.settingsNav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.settingsNav-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  padding: 7px 8px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.settingsNav-item svg,
+.settingsBack svg { color: var(--muted); flex-shrink: 0; }
+.settingsNav-item:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.settingsNav-item.active {
+  background: oklch(from var(--ink) l c h / 0.065);
+  color: var(--ink);
+}
+body.dark .settingsNav-item.active { background: oklch(0.26 0.006 270); }
+.settingsNav-item.active svg { color: var(--ink-soft); }
+.settingsMain {
+  min-width: 0;
+  overflow: auto;
+}
+.settingsMain-inner {
+  width: min(1040px, calc(100vw - 312px));
+  margin: 0 auto;
+  padding: 68px 40px 80px;
+}
+.settingsPageHeader {
+  margin-bottom: 24px;
+  display: grid;
+  gap: 6px;
+}
+.settingsPageHeader h1 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 24px;
+  line-height: 1.15;
+  font-weight: 650;
+}
+.settingsPageHeader p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.settingsPanel {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--hairline);
+}
 /* Each section is itself a 2-col grid so every label aligns to the widest
    one in that section, and selects fill whatever's left. `display: contents`
    on the row lets its label + control participate directly in the parent
@@ -1883,6 +2356,131 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
 }
 .settingsToggle:hover { background: var(--card); border-color: var(--hairline-strong); }
+.settingsSectionTitle {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settingsSectionTitle span {
+  font: 10.5px var(--mono);
+  color: var(--faint);
+}
+.settingsSection.settingsResources {
+  grid-template-columns: 1fr;
+  row-gap: 10px;
+  min-height: calc(100vh - 220px);
+}
+.settingsResourceGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+.resourceGroup {
+  min-width: 0;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: min(520px, calc(100vh - 290px));
+}
+.resourceGroup-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+.resourceGroup-title {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 540;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.resourceGroup-count {
+  margin-left: auto;
+  color: var(--faint);
+  font: 10.5px var(--mono);
+}
+.resourceList {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  max-height: none;
+  flex: 1;
+  overflow: auto;
+}
+.resourceItem {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  padding: 6px;
+  border-radius: 7px;
+  color: var(--ink-soft);
+}
+.resourceItem:hover { background: oklch(from var(--ink) l c h / 0.04); color: var(--ink); }
+.resourceStatus {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--faint);
+  margin-top: 4px;
+}
+.resourceStatus.active { background: var(--ok); box-shadow: 0 0 0 2px oklch(from var(--ok) l c h / 0.16); }
+.resourceStatus.error { background: var(--bad); box-shadow: 0 0 0 2px oklch(from var(--bad) l c h / 0.14); }
+.resourceText {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.resourceName {
+  color: currentColor;
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.resourceDetail {
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.resourceMeta {
+  grid-column: 2;
+  color: var(--faint);
+  font: 10.5px var(--mono);
+  white-space: nowrap;
+  align-self: start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.resourceEmpty {
+  padding: 18px 12px;
+  color: var(--faint);
+  font-size: 11.5px;
+  text-align: center;
+}
+@keyframes settingsEnter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settingsShell { animation: none; }
+  .settingsBack,
+  .settingsNav-item { transition: none; }
+}
 
 /* ------- Animations ------- */
 .fadeUp {
@@ -2068,6 +2666,10 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
 @media (max-width: 900px) {
   .sidebar.right { display: none; }
   .app { padding: 0 18px; }
+  .settingsMain-inner {
+    width: min(900px, calc(100vw - 280px));
+    padding: 56px 28px 72px;
+  }
 }
 @media (max-width: 720px) {
   .sidebar.left {
@@ -2078,4 +2680,42 @@ body.dark .sb-conv-row.active { background: oklch(0.26 0.006 270); }
   .sidebar.left.closed { width: 0; }
   .bubble { max-width: 92%; }
   .ctx { display: none; }
+  .settingsShell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .settingsSide {
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
+    padding: 10px 12px;
+    gap: 10px;
+  }
+  .settingsSide-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .settingsBack { width: auto; min-height: 32px; }
+  .settingsSide-title { padding: 0; font-size: 15px; }
+  .settingsNav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 1px;
+  }
+  .settingsNav-item {
+    width: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .settingsMain-inner {
+    width: auto;
+    padding: 28px 20px 56px;
+  }
+  .settingsSection { grid-template-columns: 1fr; }
+  .settingsResourceGrid { grid-template-columns: 1fr; }
+  .settingsSection.settingsResources { min-height: 0; }
+  .resourceGroup { min-height: 0; }
+  .resourceList { max-height: 300px; flex: 0 1 auto; }
+  .settingsRow > select,
+  .settingsRow > .settingsToggle { width: 100%; justify-self: stretch; }
 }

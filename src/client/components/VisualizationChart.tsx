@@ -18,7 +18,7 @@ import {
   YAxis,
   ZAxis,
 } from "recharts";
-import type { ToolResultDetails } from "./piSocket";
+import type { ToolResultDetails } from "../lib/piSocket";
 
 type VisualizationDetails = Extract<ToolResultDetails, { kind: "analytics_visualization" }>;
 type Mode = VisualizationDetails["chartType"];

@@ -17,6 +17,8 @@ export type PiSessionInfo = {
   modified: string;
   messageCount: number;
   firstMessage: string;
+  liveSessionId?: string;
+  isRunning?: boolean;
 };
 
 export type PiState = {
@@ -35,12 +37,32 @@ export type PiState = {
   usage?: { tokens?: number; contextWindow?: number; percent?: number | null; cost?: number } | null;
 };
 
+export type PiSourceInfo = {
+  path: string;
+  source: string;
+  scope?: "user" | "project" | "temporary";
+  origin?: "package" | "top-level";
+  baseDir?: string;
+};
+
 export type PiResourceSummary = {
-  commands: Array<{ name: string; description?: string; source: string }>;
-  tools: Array<{ name: string; description?: string; source?: unknown }>;
+  commands: Array<{ name: string; description?: string; source: string; sourceInfo?: PiSourceInfo }>;
+  tools: Array<{ name: string; description?: string; sourceInfo?: PiSourceInfo }>;
   activeTools: string[];
   prompts: Array<{ name: string; description?: string }>;
-  skills: Array<{ name: string; description?: string }>;
+  skills: Array<{ name: string; description?: string; sourceInfo?: PiSourceInfo }>;
+  extensions: Array<{
+    name: string;
+    path: string;
+    resolvedPath?: string;
+    sourceInfo?: PiSourceInfo;
+    commandCount: number;
+    toolCount: number;
+    shortcutCount: number;
+    flagCount: number;
+    handlerCount: number;
+  }>;
+  extensionErrors: Array<{ path: string; error: string }>;
   agentsFiles: Array<{ path: string }>;
   diagnostics: Array<{ type?: string; message?: string }>;
 };
@@ -65,6 +87,28 @@ export type PiSettings = {
   showStarterPrompts: boolean;
 };
 
+export type GitFileStatus = {
+  path: string;
+  oldPath?: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "copied" | "typechange" | "unknown";
+  index: string;
+  worktree: string;
+};
+
+export type GitSnapshot = {
+  isRepo: boolean;
+  root?: string;
+  branch?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  clean?: boolean;
+  files: GitFileStatus[];
+  diff?: string;
+  diffTruncated?: boolean;
+  error?: string;
+};
+
 export type PiTreeEntry = {
   id: string;
   parentId: string | null;
@@ -75,32 +119,109 @@ export type PiTreeEntry = {
   text?: string;
 };
 
+export type SessionRoute = {
+  runtimeId: string;
+  workspaceId: string;
+  sessionPath?: string;
+  sessionId: string;
+};
+
+export type SessionScoped<T extends object> = T & SessionRoute;
+
+export function hasSessionRoute(value: unknown): value is SessionRoute {
+  if (!value || typeof value !== "object") return false;
+  const route = value as Partial<SessionRoute>;
+  return (
+    typeof route.runtimeId === "string" &&
+    typeof route.workspaceId === "string" &&
+    typeof route.sessionId === "string" &&
+    (route.sessionPath === undefined || typeof route.sessionPath === "string")
+  );
+}
+
+export function sessionRouteKey(route: Pick<SessionRoute, "runtimeId" | "workspaceId" | "sessionPath">): string {
+  return route.sessionPath ? `${route.workspaceId}\0${route.sessionPath}` : `runtime:${route.runtimeId}`;
+}
+
 export type ExtensionUiRequest =
   | { id: string; kind: "select"; title: string; options: string[]; opts?: unknown }
   | { id: string; kind: "confirm"; title: string; message: string; opts?: unknown }
   | { id: string; kind: "input"; title: string; placeholder?: string; opts?: unknown }
   | { id: string; kind: string; title?: string; message?: string; options?: string[]; placeholder?: string; [key: string]: unknown };
 
+export type SessionStateSnapshot = SessionScoped<{ state: PiState; revision: number }>;
+export type SessionMessagesSnapshot = SessionScoped<{ messages: AgentMessage[]; revision: number }>;
+export type SessionResourcesSnapshot = SessionScoped<{ resources: PiResourceSummary }>;
+export type SessionModelsSnapshot = SessionScoped<{ models: PiModelSummary[] }>;
+export type SessionTreeSnapshot = SessionScoped<{ entries: PiTreeEntry[] }>;
+export type SessionEventPacket = SessionScoped<{ event: AgentEvent; seq: number }>;
+export type SessionExtensionRequest = SessionScoped<{ request: ExtensionUiRequest }>;
+export type SessionExtensionStatus = SessionScoped<{ key: string; text?: string; value?: unknown }>;
+export type SessionExtensionWidget = SessionScoped<{ slot: string; lines?: string[]; removed?: true }>;
+export type SessionShortcuts = SessionScoped<{ shortcuts: Array<{ key: string; description?: string }> }>;
+
 export type PiPacket =
-  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: PiState; settings?: PiSettings } }
+  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: SessionStateSnapshot; settings?: PiSettings; editors?: Array<{ id: string; label: string; hasIcon: boolean }> } }
   | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string } }
   | { type: "workspace"; data: Workspace }
   | { type: "sessions"; data: { workspaceId: string; sessions: PiSessionInfo[] } }
-  | { type: "state"; data: PiState }
-  | { type: "messages"; data: { messages: AgentMessage[] } }
-  | { type: "resources"; data: PiResourceSummary }
-  | { type: "models"; data: { models: PiModelSummary[] } }
+  | { type: "state"; data: SessionStateSnapshot }
+  | { type: "messages"; data: SessionMessagesSnapshot }
+  | { type: "resources"; data: SessionResourcesSnapshot }
+  | { type: "models"; data: SessionModelsSnapshot }
   | { type: "settings"; data: PiSettings }
+  | { type: "git"; data: { workspaceId: string; snapshot: GitSnapshot } }
   | { type: "files"; data: { workspaceId: string; files: string[] } }
-  | { type: "tree"; data: { entries: PiTreeEntry[] } }
-  | { type: "extension_ui_request"; request: ExtensionUiRequest }
-  | { type: "extension_ui_status"; data: { key: string; text?: string; value?: unknown } }
-  | { type: "extension_ui_widget"; data: { slot: string; lines?: string[]; removed?: true } }
-  | { type: "extension_reset" }
-  | { type: "shortcuts"; data: { shortcuts: Array<{ key: string; description?: string }> } }
+  | { type: "tree"; data: SessionTreeSnapshot }
+  | { type: "extension_ui_request"; data: SessionExtensionRequest }
+  | { type: "extension_ui_status"; data: SessionExtensionStatus }
+  | { type: "extension_ui_widget"; data: SessionExtensionWidget }
+  | { type: "extension_reset"; data: SessionRoute }
+  | { type: "shortcuts"; data: SessionShortcuts }
   | { type: "notification"; data: { message: string; level?: "info" | "warning" | "error" } }
-  | { type: "event"; event: AgentEvent }
+  | { type: "event"; data: SessionEventPacket }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
+
+type RoutedCommand<T extends object> = T & SessionRoute;
+
+export type PiWorkspaceCommand =
+  | { id?: string; type: "list_workspaces" }
+  | { id?: string; type: "open_workspace"; cwd?: string; name?: string }
+  | { id?: string; type: "switch_workspace"; workspaceId: string }
+  | { id?: string; type: "remove_workspace"; workspaceId: string }
+  | { id?: string; type: "list_sessions"; workspaceId: string }
+  | { id?: string; type: "switch_session"; workspaceId: string; sessionPath: string }
+  | { id?: string; type: "delete_session"; workspaceId: string; sessionPath: string }
+  | { id?: string; type: "continue_recent"; workspaceId: string }
+  | { id?: string; type: "new_session"; workspaceId: string }
+  | { id?: string; type: "list_files"; workspaceId: string }
+  | { id?: string; type: "get_git"; workspaceId: string }
+  | { id?: string; type: "set_settings"; settings: Partial<PiSettings> }
+  | { id?: string; type: "open_in_editor"; workspaceId: string; editor: string; path: string };
+
+export type PiSessionCommand =
+  | RoutedCommand<{ id?: string; type: "get_state" | "get_messages" | "get_resources" | "get_models" | "get_tree" }>
+  | RoutedCommand<{ id?: string; type: "reload_resources" | "abort" | "clone" | "export_html" }>
+  | RoutedCommand<{ id?: string; type: "compact"; customInstructions?: string }>
+  | RoutedCommand<{ id?: string; type: "fork"; entryId: string }>
+  | RoutedCommand<{ id?: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp"; clientMessageId?: string }>
+  | RoutedCommand<{ id?: string; type: "steer" | "follow_up"; message: string }>
+  | RoutedCommand<{ id?: string; type: "invoke_command"; commandName: string }>
+  | RoutedCommand<{ id?: string; type: "set_session_name"; name: string }>
+  | RoutedCommand<{ id?: string; type: "cycle_model" }>
+  | RoutedCommand<{ id?: string; type: "set_model"; provider: string; modelId: string }>
+  | RoutedCommand<{ id?: string; type: "set_thinking_level"; level: PiThinkingLevel }>
+  | RoutedCommand<{ id?: string; type: "extension_ui_response"; uiRequestId: string; value: unknown }>
+  | RoutedCommand<{ id?: string; type: "trigger_shortcut"; key: string }>
+  | RoutedCommand<{ id?: string; type: "extension_input"; data: string }>;
+
+export type PiSessionCommandBody = PiSessionCommand extends infer Command
+  ? Command extends SessionRoute
+    ? Omit<Command, keyof SessionRoute>
+    : never
+  : never;
+
+export type PiClientCommand = PiWorkspaceCommand | PiSessionCommand;
 
 export type ToolResultDetails =
   | {
@@ -186,7 +307,7 @@ export type AgentEvent = {
 
 export function connectPi(onPacket: (packet: PiPacket) => void, onStatus: (status: "connecting" | "open" | "closed") => void) {
   let ws: WebSocket | null = null;
-  const pending: Record<string, unknown>[] = [];
+  const pending: PiClientCommand[] = [];
   onStatus("connecting");
 
   void fetch("/api/health")
@@ -204,7 +325,7 @@ export function connectPi(onPacket: (packet: PiPacket) => void, onStatus: (statu
     .catch(() => onStatus("closed"));
 
   return {
-    send(command: Record<string, unknown>) {
+    send(command: PiClientCommand) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(command));
       else pending.push(command);
     },
