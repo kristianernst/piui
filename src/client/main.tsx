@@ -5,8 +5,10 @@ import { Toaster, toast } from "sonner";
 import { measureLineStats, prepareWithSegments, type PreparedTextWithSegments } from "@chenglou/pretext";
 import hljs from "highlight.js/lib/common";
 import {
+  IconArrowLeftSlim,
   IconArrowUpSlim,
   IconBranch,
+  IconBolt,
   IconChev,
   IconChart,
   IconClose,
@@ -33,12 +35,29 @@ import {
   type ExtensionUiRequest,
   type GitFileStatus,
   type GitSnapshot,
+  hasSessionRoute,
+  type PiClientCommand,
+  type PiSessionCommandBody,
   type PiModelSummary,
   type PiResourceSummary,
+  type PiSourceInfo,
   type PiSessionInfo,
   type PiSettings,
   type PiState,
   type PiThinkingLevel,
+  type PiTreeEntry,
+  type SessionRoute,
+  type SessionEventPacket,
+  type SessionExtensionRequest,
+  type SessionExtensionStatus,
+  type SessionExtensionWidget,
+  type SessionMessagesSnapshot,
+  type SessionModelsSnapshot,
+  type SessionResourcesSnapshot,
+  type SessionShortcuts,
+  type SessionStateSnapshot,
+  type SessionTreeSnapshot,
+  sessionRouteKey,
   type ToolResultDetails,
   type Workspace,
 } from "./lib/piSocket";
@@ -67,9 +86,11 @@ type UiBlock =
 
 type UiMessage = {
   id: string;
+  clientId?: string;
   role: "user" | "assistant";
   text: string;          // user role only
   blocks?: UiBlock[];    // assistant role only — chronological
+  optimistic?: boolean;
   streaming?: boolean;
   startedAt?: number;    // assistant only — for duration metadata
   endedAt?: number;
@@ -87,6 +108,23 @@ type ExtensionRun = {
   hiddenThinkingLabel?: string;
   status: Record<string, string>;
   slots: ExtensionSlot[]; // ordered by first-seen insertion
+};
+
+type Shortcut = { key: string; description?: string };
+
+type SessionCache = {
+  route: SessionRoute;
+  state: PiState | null;
+  messages: UiMessage[];
+  draft: string;
+  lastRevision: number;
+  lastSeq: number;
+  models: PiModelSummary[];
+  resources: PiResourceSummary | null;
+  tree: PiTreeEntry[];
+  extension: ExtensionRun | null;
+  uiRequest: ExtensionUiRequest | null;
+  shortcuts: Shortcut[];
 };
 
 type AppErrorBoundaryState = { error?: Error };
@@ -207,21 +245,232 @@ function coerceToolResultDetails(value: unknown): ToolResultDetails | undefined 
   return undefined;
 }
 
+function emptySessionCache(route: SessionRoute): SessionCache {
+  return {
+    route,
+    state: null,
+    messages: [],
+    draft: "",
+    lastRevision: 0,
+    lastSeq: 0,
+    models: [],
+    resources: null,
+    tree: [],
+    extension: null,
+    uiRequest: null,
+    shortcuts: [],
+  };
+}
+
+function routeFromData(data: unknown): SessionRoute | null {
+  if (hasSessionRoute(data)) return data;
+  return null;
+}
+
+function routesMatch(a: SessionRoute | null, b: SessionRoute | null): boolean {
+  if (!a || !b) return false;
+  if (a.runtimeId === b.runtimeId) return true;
+  return !!a.sessionPath && a.workspaceId === b.workspaceId && a.sessionPath === b.sessionPath;
+}
+
+function updateCache(
+  prev: Record<string, SessionCache>,
+  route: SessionRoute,
+  update: (cache: SessionCache) => SessionCache,
+): Record<string, SessionCache> {
+  const routeKey = sessionRouteKey(route);
+  const existingKey =
+    prev[routeKey] ? routeKey : Object.keys(prev).find((candidate) => routesMatch(prev[candidate].route, route)) ?? routeKey;
+  const key = route.sessionPath || !prev[existingKey] ? routeKey : existingKey;
+  const current = prev[existingKey] ?? emptySessionCache(route);
+  const next = update({ ...current, route });
+  if (next === current && existingKey === key) return prev;
+  const out = { ...prev };
+  if (existingKey !== key) delete out[existingKey];
+  out[key] = next;
+  return out;
+}
+
+function cacheMessages(messages: AgentMessage[], route: SessionRoute): UiMessage[] {
+  return hydrateToolOutputs(messages, asMessages(messages, `m-${route.runtimeId}`));
+}
+
+function preserveLiveAssistantSnapshot(snapshot: UiMessage[], cache: SessionCache): UiMessage[] {
+  const previous = cache.messages[cache.messages.length - 1];
+  const previousAssistant = previous?.role === "assistant" ? previous : null;
+  const shouldStayLive = !!cache.state?.isStreaming || !!previousAssistant?.streaming;
+  if (!shouldStayLive) return snapshot;
+
+  const next = snapshot.slice();
+  const index = next.length - 1;
+  if (next[index]?.role === "assistant") {
+    next[index] = {
+      ...next[index],
+      streaming: true,
+      startedAt: previousAssistant?.startedAt ?? next[index].startedAt,
+      endedAt: undefined,
+    };
+    return next;
+  }
+  return previousAssistant?.streaming ? [...next, previousAssistant] : next;
+}
+
+function applyEvent(previous: UiMessage[], event: AgentEvent): UiMessage[] {
+  if (event.type === "message_start" && event.message && event.message.role === "user") {
+    const ui = uiMessageFromAgent(event.message, `e-${event.message.timestamp ?? previous.length}`);
+    if (!ui) return previous;
+    const clientId = clientMessageIdFromEvent(event);
+    if (clientId) {
+      const index = previous.findIndex((message) => message.clientId === clientId);
+      if (index >= 0) {
+        const next = previous.slice();
+        next[index] = { ...ui, clientId };
+        return next;
+      }
+    }
+    const optimisticIndex = previous.findIndex((message) => message.role === "user" && message.optimistic);
+    if (optimisticIndex >= 0) {
+      const next = previous.slice();
+      next[optimisticIndex] = ui;
+      return next;
+    }
+    const last = previous[previous.length - 1];
+    if (last?.role === "assistant" && last.streaming) return [...previous.slice(0, -1), ui, last];
+    return [...previous, ui];
+  }
+
+  if (event.type === "agent_start") {
+    const last = previous[previous.length - 1];
+    if (last?.role === "assistant" && last.streaming) {
+      return previous.map((message, index) =>
+        index === previous.length - 1
+          ? { ...message, streaming: true, startedAt: message.startedAt ?? eventTimestamp(event), endedAt: undefined }
+          : message,
+      );
+    }
+    return [
+      ...previous,
+      { id: `a-${previous.length}`, role: "assistant", text: "", blocks: [], streaming: true, startedAt: eventTimestamp(event) },
+    ];
+  }
+
+  if (event.type === "message_update" && event.assistantMessageEvent) {
+    const delta = event.assistantMessageEvent;
+    const kind = delta.type === "thinking_delta" ? "thought" : delta.type === "text_delta" ? "text" : null;
+    const piece = delta.delta ?? "";
+    if (!kind || !piece) return previous;
+    return updateCurrentAssistant(previous, (message) => appendChunk(message, kind, piece));
+  }
+
+  if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
+    const tool: UiTool = { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" };
+    return updateCurrentAssistant(previous, (message) => ({
+      ...message,
+      blocks: [...(message.blocks ?? []), { kind: "tool", tool }],
+    }));
+  }
+
+  if ((event.type === "tool_execution_update" || event.type === "tool_execution_end") && event.toolCallId) {
+    const output = contentToText(event.result?.content ?? event.partialResult?.content ?? "");
+    const details = coerceToolResultDetails(event.result?.details);
+    const status = event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running";
+    return updateCurrentAssistant(previous, (message) => ({
+      ...message,
+      blocks: (message.blocks ?? []).map((block) =>
+        block.kind === "tool" && block.tool.id === event.toolCallId
+          ? { ...block, tool: { ...block.tool, output, details: details ?? block.tool.details, status } }
+          : block,
+      ),
+    }));
+  }
+
+  if (event.type === "agent_end" || (event.type === "message_end" && event.message?.role === "assistant")) {
+    return updateCurrentAssistant(previous, (message) => ({
+      ...message,
+      streaming: event.type === "message_end" ? message.streaming : false,
+      endedAt: event.type === "agent_end" ? eventTimestamp(event) : message.endedAt,
+    }), false);
+  }
+
+  return previous;
+}
+
+function clientMessageIdFromEvent(event: AgentEvent): string | undefined {
+  const fromEvent = (event as { clientMessageId?: unknown }).clientMessageId;
+  if (typeof fromEvent === "string") return fromEvent;
+  const fromMessage = (event.message as { clientMessageId?: unknown } | undefined)?.clientMessageId;
+  return typeof fromMessage === "string" ? fromMessage : undefined;
+}
+
+function eventTimestamp(event: AgentEvent): number | undefined {
+  return typeof event.message?.timestamp === "number" ? event.message.timestamp : undefined;
+}
+
+function appendChunk(message: UiMessage, kind: "thought" | "text", piece: string): UiMessage {
+  const blocks = [...(message.blocks ?? [])];
+  const last = blocks[blocks.length - 1];
+  if (last && last.kind === kind) {
+    blocks[blocks.length - 1] = { kind, text: last.text + piece };
+  } else {
+    blocks.push({ kind, text: piece });
+  }
+  return { ...message, blocks };
+}
+
+function updateCurrentAssistant(messages: UiMessage[], updater: (message: UiMessage) => UiMessage, createIfMissing = true): UiMessage[] {
+  const next = [...messages];
+  const index = next.length - 1;
+  if (next[index]?.role === "assistant") {
+    next[index] = updater({ ...next[index] });
+    return next;
+  }
+  if (!createIfMissing) return messages;
+  next.push(updater({ id: `a-${messages.length}`, role: "assistant", text: "", blocks: [], streaming: true }));
+  return next;
+}
+
+function applyExtensionStatusToRun(prev: ExtensionRun | null, data: { key: string; text?: string; value?: unknown }): ExtensionRun | null {
+  const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
+  const next: ExtensionRun = { ...base, status: { ...base.status }, slots: base.slots.slice() };
+  if (data.key === "title") next.title = data.text;
+  else if (data.key === "workingMessage") next.workingMessage = data.text;
+  else if (data.key === "workingVisible") next.workingVisible = !!data.value;
+  else if (data.key === "hiddenThinkingLabel") next.hiddenThinkingLabel = data.text;
+  else if (data.key === "workingIndicator") { /* reserved for parity with Pi TUI */ }
+  else if (typeof data.text === "string") next.status[data.key] = data.text;
+  else if (data.text === undefined && data.value === undefined) delete next.status[data.key];
+  return next;
+}
+
+function applyExtensionWidgetToRun(prev: ExtensionRun | null, data: { slot: string; lines?: string[]; removed?: true }): ExtensionRun | null {
+  const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
+  const slots = base.slots.slice();
+  const idx = slots.findIndex((slot) => slot.slot === data.slot);
+  if (data.removed) {
+    if (idx >= 0) slots.splice(idx, 1);
+  } else if (idx >= 0) {
+    slots[idx] = { slot: data.slot, lines: data.lines ?? [] };
+  } else {
+    slots.push({ slot: data.slot, lines: data.lines ?? [] });
+  }
+  return { ...base, status: { ...base.status }, slots };
+}
+
 function App() {
   const [connection, setConnection] = useState<"connecting" | "open" | "closed">("connecting");
-  const [state, setState] = useState<PiState | null>(null);
+  const [activeRoute, setActiveRouteState] = useState<SessionRoute | null>(null);
+  const [sessionCaches, setSessionCaches] = useState<Record<string, SessionCache>>({});
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessionsByWorkspace, setSessionsByWorkspace] = useState<Record<string, PiSessionInfo[]>>({});
-  const [messages, setMessages] = useState<UiMessage[]>([]);
-  const [models, setModels] = useState<PiModelSummary[]>([]);
+  const [unreadDoneByRouteKey, setUnreadDoneByRouteKey] = useState<Set<string>>(() => new Set());
   const [settings, setSettings] = useState<PiSettings | null>(null);
   const [editors, setEditors] = useState<Array<{ id: string; label: string; hasIcon: boolean }>>([]);
-  const [resources, setResources] = useState<PiResourceSummary | null>(null);
-  const [git, setGit] = useState<GitSnapshot | null>(null);
-  const [files, setFiles] = useState<string[]>([]);
+  const [gitByWorkspace, setGitByWorkspace] = useState<Record<string, GitSnapshot | null>>({});
+  const [filesByWorkspace, setFilesByWorkspace] = useState<Record<string, string[]>>({});
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // Persisted right-sidebar width — clamped to a sane range so dragging can't
   // collapse it off-screen or grow it past half the viewport.
   const RIGHT_MIN = 220;
@@ -237,11 +486,11 @@ function App() {
     }
   }, [rightWidth]);
   const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
-  const [draft, setDraft] = useState("");
-  const [uiRequest, setUiRequest] = useState<ExtensionUiRequest | null>(null);
-  const [extension, setExtension] = useState<ExtensionRun | null>(null);
-  const [shortcuts, setShortcuts] = useState<Array<{ key: string; description?: string }>>([]);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
+  const activeRouteRef = useRef<SessionRoute | null>(null);
+  const activeWorkspaceIdRef = useRef<string | null>(null);
+  const sessionsByWorkspaceRef = useRef<Record<string, PiSessionInfo[]>>({});
+  const clientMessageSeqRef = useRef<Record<string, number>>({});
   const threadRef = useRef<HTMLDivElement>(null);
   // Autoscroll is "sticky" — we follow new content to the bottom unless the
   // user has manually scrolled away. Once they scroll back near the bottom we
@@ -249,6 +498,51 @@ function App() {
   // metrics settling, code-block reflows) from being mistaken for a scroll-up.
   const stickToBottomRef = useRef(true);
   const SCROLL_STICK_THRESHOLD_PX = 80;
+  const activeCache = activeRoute
+    ? sessionCaches[sessionRouteKey(activeRoute)] ?? Object.values(sessionCaches).find((cache) => routesMatch(cache.route, activeRoute)) ?? null
+    : null;
+  const state = activeCache?.state ?? null;
+  const messages = activeCache?.messages ?? [];
+  const draft = activeCache?.draft ?? "";
+  const models = activeCache?.models ?? [];
+  const resources = activeCache?.resources ?? null;
+  const extension = activeCache?.extension ?? null;
+  const uiRequest = activeCache?.uiRequest ?? null;
+  const uiRequestRoute = uiRequest ? activeCache?.route ?? null : null;
+  const shortcuts = activeCache?.shortcuts ?? [];
+  const pendingUiByRouteKey = useMemo(() => {
+    const keys = new Set<string>();
+    for (const cache of Object.values(sessionCaches)) {
+      if (cache.uiRequest) keys.add(sessionRouteKey(cache.route));
+    }
+    return keys;
+  }, [sessionCaches]);
+  const sidecarWorkspaceId = activeWorkspaceId ?? state?.workspace.id ?? null;
+  const git = sidecarWorkspaceId ? gitByWorkspace[sidecarWorkspaceId] ?? null : null;
+  const files = sidecarWorkspaceId ? filesByWorkspace[sidecarWorkspaceId] ?? [] : [];
+
+  function setActiveRoute(route: SessionRoute | null) {
+    activeRouteRef.current = route;
+    setActiveRouteState(route);
+  }
+
+  function setActiveWorkspace(workspaceId: string | null) {
+    activeWorkspaceIdRef.current = workspaceId;
+    setActiveWorkspaceId(workspaceId);
+  }
+
+  function isActiveRoute(route: SessionRoute | null) {
+    return routesMatch(activeRouteRef.current, route);
+  }
+
+  function updateDraft(value: string | ((previous: string) => string)) {
+    const route = activeRouteRef.current;
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      draft: typeof value === "function" ? value(cache.draft) : value,
+    })));
+  }
 
   useEffect(() => {
     document.body.classList.toggle("dark", dark);
@@ -257,33 +551,86 @@ function App() {
   useEffect(() => {
     const socket = connectPi((packet) => {
       if (packet.type === "ready") {
-        setState(packet.data.state);
         setWorkspaces(packet.data.workspaces);
-        setActiveWorkspaceId(packet.data.activeWorkspaceId);
+        setActiveWorkspace(packet.data.activeWorkspaceId);
+        applyStateSnapshot(packet.data.state, true);
         if (packet.data.settings) setSettings(packet.data.settings);
         if (packet.data.editors) setEditors(packet.data.editors);
+        return;
       }
       if (packet.type === "workspaces") {
         setWorkspaces(packet.data.workspaces);
-        setActiveWorkspaceId(packet.data.activeWorkspaceId);
+        setActiveWorkspace(packet.data.activeWorkspaceId);
+        return;
       }
-      if (packet.type === "state") setState(packet.data);
+      if (packet.type === "workspace") {
+        setActiveWorkspace(packet.data.id);
+        return;
+      }
+      if (packet.type === "state") {
+        applyStateSnapshot(packet.data, true);
+        return;
+      }
       if (packet.type === "sessions") {
-        setSessionsByWorkspace((prev) => ({ ...prev, [packet.data.workspaceId]: packet.data.sessions }));
+        applySessionsSnapshot(packet.data.workspaceId, packet.data.sessions);
+        return;
       }
-      if (packet.type === "models") setModels(packet.data.models);
-      if (packet.type === "settings") setSettings(packet.data);
-      if (packet.type === "resources") setResources(packet.data);
-      if (packet.type === "git") setGit(packet.data);
-      if (packet.type === "files") setFiles(packet.data.files);
-      if (packet.type === "messages") setMessages(hydrateToolOutputs(packet.data.messages, asMessages(packet.data.messages)));
-      if (packet.type === "extension_ui_request") setUiRequest(packet.request);
-      if (packet.type === "extension_ui_status") applyExtensionStatus(packet.data);
-      if (packet.type === "extension_ui_widget") applyExtensionWidget(packet.data);
-      if (packet.type === "extension_reset") setExtension(null);
-      if (packet.type === "shortcuts") setShortcuts(packet.data.shortcuts);
-      if (packet.type === "notification") pushNotice(packet.data.message, packet.data.level);
-      if (packet.type === "event") applyEvent(packet.event);
+      if (packet.type === "models") {
+        applyModelsSnapshot(packet.data);
+        return;
+      }
+      if (packet.type === "settings") {
+        setSettings(packet.data);
+        return;
+      }
+      if (packet.type === "resources") {
+        applyResourcesSnapshot(packet.data);
+        return;
+      }
+      if (packet.type === "git") {
+        applyGitSnapshot(packet.data);
+        return;
+      }
+      if (packet.type === "files") {
+        setFilesByWorkspace((prev) => ({ ...prev, [packet.data.workspaceId]: packet.data.files }));
+        return;
+      }
+      if (packet.type === "messages") {
+        applyMessagesSnapshot(packet.data);
+        return;
+      }
+      if (packet.type === "tree") {
+        applyTreeSnapshot(packet.data);
+        return;
+      }
+      if (packet.type === "extension_ui_request") {
+        applyExtensionRequest(packet.data);
+        return;
+      }
+      if (packet.type === "extension_ui_status") {
+        applyExtensionStatus(packet.data);
+        return;
+      }
+      if (packet.type === "extension_ui_widget") {
+        applyExtensionWidget(packet.data);
+        return;
+      }
+      if (packet.type === "extension_reset") {
+        applyExtensionReset(packet.data);
+        return;
+      }
+      if (packet.type === "shortcuts") {
+        applyShortcuts(packet.data);
+        return;
+      }
+      if (packet.type === "notification") {
+        pushNotice(packet.data.message, packet.data.level);
+        return;
+      }
+      if (packet.type === "event") {
+        applyEventPacket(packet.data);
+        return;
+      }
       if (packet.type === "response" && !packet.success) {
         pushNotice(packet.error ?? "Unknown Pi error", "error");
       }
@@ -320,14 +667,14 @@ function App() {
         if (key && known.has(key)) {
           e.preventDefault();
           e.stopPropagation();
-          socketRef.current?.send({ type: "trigger_shortcut", key });
+          sendSessionCommand({ type: "trigger_shortcut", key });
           return;
         }
         const data = browserEventToTerminalInput(e);
         if (data) {
           e.preventDefault();
           e.stopPropagation();
-          socketRef.current?.send({ type: "extension_input", data });
+          sendSessionCommand({ type: "extension_input", data });
         }
         return;
       }
@@ -335,7 +682,7 @@ function App() {
       if (!key || !known.has(key)) return;
       e.preventDefault();
       e.stopPropagation();
-      socketRef.current?.send({ type: "trigger_shortcut", key });
+      sendSessionCommand({ type: "trigger_shortcut", key });
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -346,11 +693,11 @@ function App() {
   // listings drift quickly during active development.
   useEffect(() => {
     if (!activeWorkspaceId) return;
-    setFiles([]);
-    setGit(null);
+    setFilesByWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: [] }));
+    setGitByWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: null }));
     socketRef.current?.send({ type: "list_sessions", workspaceId: activeWorkspaceId });
-    socketRef.current?.send({ type: "list_files" });
-    socketRef.current?.send({ type: "get_git" });
+    socketRef.current?.send({ type: "list_files", workspaceId: activeWorkspaceId });
+    socketRef.current?.send({ type: "get_git", workspaceId: activeWorkspaceId });
   }, [activeWorkspaceId]);
 
   function handleThreadScroll() {
@@ -366,172 +713,233 @@ function App() {
     else toast(message);
   }
 
-  function applyExtensionStatus(data: { key: string; text?: string; value?: unknown }) {
-    // A few keys are routed straight at the composer textarea — the extension
-    // is asking us to mutate the user's draft, not the dock surface.
-    if (data.key === "pasteToEditor" && typeof data.text === "string") {
-      setDraft((d) => d + data.text!);
-      return;
+  function applyStateSnapshot(data: SessionStateSnapshot, makeActive: boolean) {
+    const route = routeFromData(data);
+    if (!route) return;
+    if (makeActive) {
+      setActiveRoute(route);
+      setActiveWorkspace(route.workspaceId);
+      clearUnreadDone(route);
     }
-    if (data.key === "setEditorText" && typeof data.text === "string") {
-      setDraft(data.text!);
-      return;
-    }
-    setExtension((prev) => {
-      const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
-      const next: ExtensionRun = { ...base, status: { ...base.status }, slots: base.slots.slice() };
-      if (data.key === "title") next.title = data.text;
-      else if (data.key === "workingMessage") next.workingMessage = data.text;
-      else if (data.key === "workingVisible") next.workingVisible = !!data.value;
-      else if (data.key === "hiddenThinkingLabel") next.hiddenThinkingLabel = data.text;
-      else if (data.key === "workingIndicator") { /* reserved — no-op for v1 */ }
-      else if (typeof data.text === "string") {
-        next.status[data.key] = data.text;
-      } else if (data.text === undefined && data.value === undefined) {
-        delete next.status[data.key];
-      }
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      state: data.state,
+      lastRevision: data.revision,
+      lastSeq: Math.max(cache.lastSeq, data.revision),
+    })));
+  }
+
+  function applyMessagesSnapshot(data: SessionMessagesSnapshot) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => {
+      if (data.revision < cache.lastRevision) return cache;
+      const messages = preserveLiveAssistantSnapshot(cacheMessages(data.messages, route), cache);
+      return {
+        ...cache,
+        messages,
+        lastRevision: data.revision,
+        lastSeq: Math.max(cache.lastSeq, data.revision),
+      };
+    }));
+  }
+
+  function applyResourcesSnapshot(data: SessionResourcesSnapshot) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, resources: data.resources })));
+  }
+
+  function applyModelsSnapshot(data: SessionModelsSnapshot) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, models: data.models })));
+  }
+
+  function applyTreeSnapshot(data: SessionTreeSnapshot) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, tree: data.entries })));
+  }
+
+  function applyGitSnapshot(data: { workspaceId: string; snapshot: GitSnapshot }) {
+    setGitByWorkspace((prev) => ({ ...prev, [data.workspaceId]: data.snapshot }));
+  }
+
+  function sessionListRouteKey(workspaceId: string, session: PiSessionInfo) {
+    return sessionRouteKey({ runtimeId: session.liveSessionId ?? session.id, workspaceId, sessionPath: session.path });
+  }
+
+  function sessionMatchesRoute(workspaceId: string, session: PiSessionInfo, route: SessionRoute | null) {
+    if (!route || route.workspaceId !== workspaceId) return false;
+    if (route.sessionPath && session.path === route.sessionPath) return true;
+    return session.id === route.sessionId || session.liveSessionId === route.sessionId;
+  }
+
+  function clearUnreadDone(route: SessionRoute) {
+    const key = sessionRouteKey(route);
+    setUnreadDoneByRouteKey((prev) => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
       return next;
     });
   }
 
-  function applyExtensionWidget(data: { slot: string; lines?: string[]; removed?: true }) {
-    setExtension((prev) => {
-      const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
-      const slots = base.slots.slice();
-      const idx = slots.findIndex((s) => s.slot === data.slot);
-      if (data.removed) {
-        if (idx >= 0) slots.splice(idx, 1);
-      } else if (idx >= 0) {
-        slots[idx] = { slot: data.slot, lines: data.lines ?? [] };
-      } else {
-        slots.push({ slot: data.slot, lines: data.lines ?? [] });
+  function applySessionsSnapshot(workspaceId: string, sessions: PiSessionInfo[]) {
+    const previous = sessionsByWorkspaceRef.current[workspaceId] ?? [];
+    const wasRunningByKey = new Map(previous.map((session) => [sessionListRouteKey(workspaceId, session), !!session.isRunning]));
+    const active = activeRouteRef.current;
+
+    setUnreadDoneByRouteKey((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const session of sessions) {
+        const key = sessionListRouteKey(workspaceId, session);
+        const running = !!session.isRunning;
+        const activeSession = sessionMatchesRoute(workspaceId, session, active);
+        if (running || activeSession) {
+          if (next.delete(key)) changed = true;
+        } else if (wasRunningByKey.get(key)) {
+          if (!next.has(key)) {
+            next.add(key);
+            changed = true;
+          }
+        }
       }
-      return { ...base, status: { ...base.status }, slots };
+      return changed ? next : prev;
     });
+
+    sessionsByWorkspaceRef.current = { ...sessionsByWorkspaceRef.current, [workspaceId]: sessions };
+    setSessionsByWorkspace((prev) => ({ ...prev, [workspaceId]: sessions }));
   }
 
+  function applyExtensionRequest(data: SessionExtensionRequest) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, uiRequest: data.request })));
+  }
 
-  function applyEvent(event: AgentEvent) {
-    if (event.type === "tool_execution_end" || event.type === "agent_end") {
-      socketRef.current?.send({ type: "get_git" });
+  function applyExtensionStatus(data: SessionExtensionStatus) {
+    const route = routeFromData(data);
+    if (!route) return;
+    const editsComposer = data.key === "pasteToEditor" || data.key === "setEditorText";
+    if (editsComposer && !isActiveRoute(route)) return;
+    if (isActiveRoute(route)) {
+      if (data.key === "pasteToEditor" && typeof data.text === "string") {
+        updateDraft((draft) => draft + data.text!);
+        return;
+      }
+      if (data.key === "setEditorText" && typeof data.text === "string") {
+        updateDraft(data.text!);
+        return;
+      }
     }
-    if (event.type === "message_start" && event.message && event.message.role === "user") {
-      setMessages((prev) => {
-        const ui = uiMessageFromAgent(event.message!, `e-${Date.now()}`);
-        if (!ui) return prev;
-        // Dedup against any optimistic copy we already pushed locally.
-        if (prev.some((m) => m.role === "user" && m.text === ui.text)) return prev;
-        // `agent_start` may arrive before the server-side user message_start,
-        // leaving a streaming assistant at the tail. Splice the user message in
-        // before it so the chronological order matches reality.
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant" && last.streaming) {
-          return [...prev.slice(0, -1), ui, last];
-        }
-        return [...prev, ui];
-      });
-      return;
-    }
-    if (event.type === "agent_start") {
-      const now = Date.now();
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        // If the previous turn is still an assistant (e.g. on reconnect) we
-        // continue extending it instead of starting a new visual block.
-        if (last?.role === "assistant") {
-          return prev.map((message, index) =>
-            index === prev.length - 1
-              ? { ...message, streaming: true, startedAt: message.startedAt ?? now, endedAt: undefined }
-              : message,
-          );
-        }
-        return [...prev, { id: `a-${now}`, role: "assistant", text: "", blocks: [], streaming: true, startedAt: now }];
-      });
-      // Dismiss any lingering error toasts when a new turn starts.
-      toast.dismiss();
-      return;
-    }
-    if (event.type === "message_update" && event.assistantMessageEvent) {
-      const delta = event.assistantMessageEvent;
-      const kind = delta.type === "thinking_delta" ? "thought" : delta.type === "text_delta" ? "text" : null;
-      const piece = delta.delta ?? "";
-      if (!kind || !piece) return;
-      setMessages((prev) => updateLastAssistant(prev, (message) => appendChunk(message, kind, piece)));
-      return;
-    }
-    if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
-      const tool: UiTool = { id: event.toolCallId, name: event.toolName, args: event.args, status: "running" };
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({
-        ...message,
-        blocks: [...(message.blocks ?? []), { kind: "tool", tool }],
-      })));
-      return;
-    }
-    if ((event.type === "tool_execution_update" || event.type === "tool_execution_end") && event.toolCallId) {
-      const output = contentToText(event.result?.content ?? event.partialResult?.content ?? "");
-      const details = coerceToolResultDetails(event.result?.details);
-      const status = event.type === "tool_execution_end" ? (event.isError ? "error" : "done") : "running";
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({
-        ...message,
-        blocks: (message.blocks ?? []).map((block) =>
-          block.kind === "tool" && block.tool.id === event.toolCallId
-            ? { ...block, tool: { ...block.tool, output, details: details ?? block.tool.details, status } }
-            : block,
-        ),
-      })));
-      return;
-    }
-    if (event.type === "agent_end" || (event.type === "message_end" && event.message?.role === "assistant")) {
-      setMessages((prev) => updateLastAssistant(prev, (message) => ({
-        ...message,
-        streaming: event.type === "message_end" ? message.streaming : false,
-        endedAt: event.type === "agent_end" ? Date.now() : message.endedAt,
-      })));
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      extension: applyExtensionStatusToRun(cache.extension, data),
+    })));
+  }
+
+  function applyExtensionWidget(data: SessionExtensionWidget) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      extension: applyExtensionWidgetToRun(cache.extension, data),
+    })));
+  }
+
+  function applyExtensionReset(data: SessionRoute) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      extension: null,
+      uiRequest: null,
+      shortcuts: [],
+    })));
+  }
+
+  function applyShortcuts(data: SessionShortcuts) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, shortcuts: data.shortcuts })));
+  }
+
+  function applyEventPacket(data: SessionEventPacket) {
+    const route = routeFromData(data);
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => {
+      if (data.seq <= Math.max(cache.lastSeq, cache.lastRevision)) return cache;
+      return {
+        ...cache,
+        messages: applyEvent(cache.messages, data.event),
+        lastSeq: data.seq,
+      };
+    }));
+    if (isActiveRoute(route) && data.event.type === "agent_start") toast.dismiss();
+    if (data.event.type === "tool_execution_end" || data.event.type === "agent_end") {
+      socketRef.current?.send({ type: "get_git", workspaceId: route.workspaceId });
     }
   }
 
-  function appendChunk(message: UiMessage, kind: "thought" | "text", piece: string): UiMessage {
-    const blocks = [...(message.blocks ?? [])];
-    const last = blocks[blocks.length - 1];
-    if (last && last.kind === kind) {
-      blocks[blocks.length - 1] = { kind, text: last.text + piece };
-    } else {
-      blocks.push({ kind, text: piece });
+  function sendSessionCommand(command: PiSessionCommandBody) {
+    const route = activeRouteRef.current;
+    if (!route) {
+      pushNotice("No active Pi session.", "warning");
+      return;
     }
-    return { ...message, blocks };
+    socketRef.current?.send({ ...route, ...command } as PiClientCommand);
+  }
+
+  function activeWorkspaceForCommand(): string | null {
+    return activeWorkspaceIdRef.current ?? activeRouteRef.current?.workspaceId ?? null;
   }
 
   function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
+    const route = activeRouteRef.current;
+    if (!route) {
+      pushNotice("No active Pi session.", "warning");
+      return;
+    }
     // The user is engaging with the conversation again — re-engage autoscroll
     // even if they had scrolled up to read earlier content.
     stickToBottomRef.current = true;
-    // Optimistically render the user's turn so it never appears below the
-    // streaming assistant if `agent_start` lands first on the wire.
-    setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: "user", text }]);
-    socketRef.current?.send({ type: "prompt", message: text, streamingBehavior });
+    const key = sessionRouteKey(route);
+    const seq = (clientMessageSeqRef.current[key] ?? 0) + 1;
+    clientMessageSeqRef.current[key] = seq;
+    const clientMessageId = `${route.runtimeId}:${seq}`;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      messages: [...cache.messages, { id: `u-${clientMessageId}`, clientId: clientMessageId, role: "user", text, optimistic: true }],
+    })));
+    socketRef.current?.send({ ...route, type: "prompt", message: text, streamingBehavior, clientMessageId });
   }
 
   function queuePrompt(text: string, mode: "steer" | "follow_up") {
-    socketRef.current?.send({ type: mode, message: text });
+    sendSessionCommand({ type: mode, message: text });
   }
 
   function abort() {
-    socketRef.current?.send({ type: "abort" });
+    sendSessionCommand({ type: "abort" });
   }
 
   function newSession() {
-    setMessages([]);
-    socketRef.current?.send({ type: "new_session" });
+    const workspaceId = activeWorkspaceForCommand();
+    if (!workspaceId) return;
+    setActiveRoute(null);
+    socketRef.current?.send({ type: "new_session", workspaceId });
   }
 
   function openWorkspace() {
     // Ask the server to pop a native folder picker; cwd is filled in there.
-    setMessages([]);
+    setActiveRoute(null);
     socketRef.current?.send({ type: "open_workspace" });
   }
 
   function switchWorkspace(workspaceId: string) {
-    setMessages([]);
+    setActiveRoute(null);
     socketRef.current?.send({ type: "switch_workspace", workspaceId });
   }
 
@@ -544,7 +952,14 @@ function App() {
   }
 
   function switchSession(workspaceId: string, sessionPath: string) {
-    setMessages([]);
+    setActiveRoute(null);
+    setUnreadDoneByRouteKey((prev) => {
+      const key = sessionRouteKey({ runtimeId: "", workspaceId, sessionPath });
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
     socketRef.current?.send({ type: "switch_session", workspaceId, sessionPath });
   }
 
@@ -563,6 +978,30 @@ function App() {
   const sessionTitle = state?.workspace.name ? state.workspace.name : "Pi";
   const headerTitle = messages[0]?.text.slice(0, 64) || sessionTitle;
 
+  if (settingsOpen) {
+    return (
+      <div className="settingsShell">
+        <SettingsScreen
+          onBack={() => setSettingsOpen(false)}
+          dark={dark}
+          onToggleDark={() => setDark((v) => !v)}
+          models={models}
+          currentModel={state?.model ?? null}
+          resources={resources}
+          settings={settings}
+          onUpdateSettings={updateSettings}
+        />
+        <Toaster
+          theme={dark ? "dark" : "light"}
+          position="bottom-right"
+          richColors
+          closeButton
+          toastOptions={{ duration: 5000 }}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="shell">
       <LeftSidebar
@@ -578,15 +1017,12 @@ function App() {
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
         sessionsByWorkspace={sessionsByWorkspace}
+        pendingUiByRouteKey={pendingUiByRouteKey}
+        unreadDoneByRouteKey={unreadDoneByRouteKey}
         activeSessionFile={state?.sessionFile}
         activeSessionId={state?.sessionId}
         activeIsStreaming={!!state?.isStreaming}
-        dark={dark}
-        onToggleDark={() => setDark((v) => !v)}
-        models={models}
-        currentModel={state?.model ?? null}
-        settings={settings}
-        onUpdateSettings={updateSettings}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
       <main className="app">
         <header className="topbar">
@@ -617,14 +1053,14 @@ function App() {
           state={state}
           connection={connection}
           value={draft}
-          onValueChange={setDraft}
+          onValueChange={updateDraft}
           onSend={sendPrompt}
           onSteer={(text) => queuePrompt(text, "steer")}
           onFollowUp={(text) => queuePrompt(text, "follow_up")}
           onAbort={abort}
-          onThinking={(level) => socketRef.current?.send({ type: "set_thinking_level", level })}
+          onThinking={(level) => sendSessionCommand({ type: "set_thinking_level", level })}
           models={models}
-          onSetModel={(provider, modelId) => socketRef.current?.send({ type: "set_model", provider, modelId })}
+          onSetModel={(provider, modelId) => sendSessionCommand({ type: "set_model", provider, modelId })}
           resources={resources}
           files={files}
           git={git}
@@ -640,14 +1076,17 @@ function App() {
         width={rightWidth}
         onWidthChange={setRightWidth}
         editors={editors}
-        onOpenInEditor={(editor, p) => socketRef.current?.send({ type: "open_in_editor", editor, path: p })}
+        onOpenInEditor={(editor, p) => {
+          const workspaceId = activeWorkspaceForCommand();
+          if (workspaceId) socketRef.current?.send({ type: "open_in_editor", workspaceId, editor, path: p });
+        }}
       />
-      {uiRequest && (
+      {uiRequest && uiRequestRoute && (
         <ExtensionDialog
           request={uiRequest}
           onResolve={(value) => {
-            socketRef.current?.send({ type: "extension_ui_response", uiRequestId: uiRequest.id, value });
-            setUiRequest(null);
+            socketRef.current?.send({ ...uiRequestRoute, type: "extension_ui_response", uiRequestId: uiRequest.id, value });
+            setSessionCaches((prev) => updateCache(prev, uiRequestRoute, (cache) => ({ ...cache, uiRequest: null })));
           }}
         />
       )}
@@ -753,15 +1192,6 @@ function orderedSlots(slots: ExtensionSlot[]): ExtensionSlot[] {
   return [...head, ...body, ...foot];
 }
 
-function updateLastAssistant(messages: UiMessage[], updater: (message: UiMessage) => UiMessage): UiMessage[] {
-  const next = [...messages];
-  let index = next.length - 1;
-  while (index >= 0 && next[index].role !== "assistant") index--;
-  if (index === -1) next.push(updater({ id: `a-${Date.now()}`, role: "assistant", text: "", blocks: [], streaming: true }));
-  else next[index] = updater({ ...next[index] });
-  return next;
-}
-
 // Pi logo from https://pi.dev/logo.svg, inlined and re-fitted to use
 // `currentColor` so it picks up the heading's color (black in light mode,
 // near-white in dark mode) without a second asset round-trip.
@@ -807,7 +1237,7 @@ function MessageView({ message, seed }: { message: UiMessage; seed?: string }) {
   }
   const timeline = answerIndex === -1 ? blocks : blocks.slice(0, answerIndex);
   const answer = answerIndex === -1 ? null : (blocks[answerIndex] as Extract<UiBlock, { kind: "text" }>).text;
-  const isWorking = !!message.streaming && answerIndex === -1;
+  const isWorking = !!message.streaming;
   const toolCount = timeline.reduce((sum, block) => sum + (block.kind === "tool" ? 1 : 0), 0);
   const durationMs = message.startedAt && message.endedAt ? message.endedAt - message.startedAt : undefined;
 
@@ -859,11 +1289,14 @@ function Reasoning({
   // the panel shut on someone who deliberately opened it mid-stream.
   const [userToggled, setUserToggled] = useState(false);
   useEffect(() => {
-    if (!userToggled && !active && blocks.length > REASONING_AUTO_COLLAPSE_THRESHOLD) {
+    if (active) {
+      setOpen(true);
+    } else if (!userToggled && blocks.length > REASONING_AUTO_COLLAPSE_THRESHOLD) {
       setOpen(false);
     }
   }, [active, blocks.length, userToggled]);
   function toggle() {
+    if (active) return;
     setUserToggled(true);
     setOpen((v) => !v);
   }
@@ -2132,15 +2565,12 @@ function LeftSidebar({
   workspaces,
   activeWorkspaceId,
   sessionsByWorkspace,
+  pendingUiByRouteKey,
+  unreadDoneByRouteKey,
   activeSessionFile,
   activeSessionId,
   activeIsStreaming,
-  dark,
-  onToggleDark,
-  models,
-  currentModel,
-  settings,
-  onUpdateSettings,
+  onOpenSettings,
 }: {
   open: boolean;
   onToggle: () => void;
@@ -2154,19 +2584,15 @@ function LeftSidebar({
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   sessionsByWorkspace: Record<string, PiSessionInfo[]>;
+  pendingUiByRouteKey: Set<string>;
+  unreadDoneByRouteKey: Set<string>;
   activeSessionFile?: string;
   activeSessionId?: string;
   activeIsStreaming: boolean;
-  dark: boolean;
-  onToggleDark: () => void;
-  models: PiModelSummary[];
-  currentModel: PiState["model"];
-  settings: PiSettings | null;
-  onUpdateSettings: (patch: Partial<PiSettings>) => void;
+  onOpenSettings: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [openWorkspaces, setOpenWorkspaces] = useState<Set<string>>(() => new Set());
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
@@ -2308,8 +2734,18 @@ function LeftSidebar({
                                 const isCurrent = session.path === activeSessionFile || session.id === activeSessionId;
                                 const running = !!session.isRunning || (isCurrent && activeIsStreaming);
                                 const orbSeed = isCurrent && activeSessionId ? activeSessionId : session.liveSessionId ?? session.id;
+                                const hasPendingUi = pendingUiByRouteKey.has(sessionRouteKey({
+                                  runtimeId: session.liveSessionId ?? session.id,
+                                  workspaceId: workspace.id,
+                                  sessionPath: session.path,
+                                }));
+                                const hasUnreadDone = unreadDoneByRouteKey.has(sessionRouteKey({
+                                  runtimeId: session.liveSessionId ?? session.id,
+                                  workspaceId: workspace.id,
+                                  sessionPath: session.path,
+                                }));
                                 return (
-                                  <div key={session.path} className={`sb-conv-row ${isCurrent ? "active" : ""}`}>
+                                  <div key={session.path} className={`sb-conv-row ${isCurrent ? "active" : ""} ${hasUnreadDone ? "unread" : ""}`}>
                                     <button
                                       className="sb-conv"
                                       onClick={() => onSwitchSession(workspace.id, session.path)}
@@ -2319,8 +2755,11 @@ function LeftSidebar({
                                         seed={orbSeed}
                                         running={running}
                                         size={14}
+                                        glow
                                       />
                                       <span className="sb-conv-title">{session.name || session.firstMessage || "Untitled"}</span>
+                                      {hasUnreadDone && <span className="sb-conv-unread" title="Finished while away" aria-label="Finished while away" />}
+                                      {hasPendingUi && <span className="sb-conv-alert" title="Waiting for extension input" aria-label="Waiting for extension input" />}
                                       <span className="sb-conv-time">{relativeTime(session.modified)}</span>
                                     </button>
                                     <button
@@ -2357,46 +2796,39 @@ function LeftSidebar({
         </div>
 
         <div className="sb-foot">
-          <button className="sb-foot-btn" onClick={() => setSettingsOpen(true)}>
+          <button className="sb-foot-btn" onClick={onOpenSettings}>
             <IconSettings size={14} />
             <span>Settings</span>
           </button>
         </div>
       </div>
 
-      {settingsOpen && (
-        <SettingsDialog
-          onClose={() => setSettingsOpen(false)}
-          dark={dark}
-          onToggleDark={onToggleDark}
-          models={models}
-          currentModel={currentModel}
-          settings={settings}
-          onUpdateSettings={onUpdateSettings}
-        />
-      )}
-
     </aside>
   );
 }
 
-function SettingsDialog({
-  onClose,
+type SettingsTab = "appearance" | "connections";
+
+function SettingsScreen({
+  onBack,
   dark,
   onToggleDark,
   models,
   currentModel,
+  resources,
   settings,
   onUpdateSettings,
 }: {
-  onClose: () => void;
+  onBack: () => void;
   dark: boolean;
   onToggleDark: () => void;
   models: PiModelSummary[];
   currentModel: PiState["model"];
+  resources: PiResourceSummary | null;
   settings: PiSettings | null;
   onUpdateSettings: (patch: Partial<PiSettings>) => void;
 }) {
+  const [activeTab, setActiveTab] = useState<SettingsTab>("appearance");
   const availableModels = models.filter((m) => m.available);
   const fallbackModels = currentModel ? [{ provider: currentModel.provider, id: currentModel.id, name: currentModel.name, available: true, current: true } as PiModelSummary] : [];
   const modelOptions = availableModels.length ? availableModels : fallbackModels;
@@ -2417,92 +2849,316 @@ function SettingsDialog({
 
   const thinkingLevels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onBack();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onBack]);
+
   return (
-    <div className="modalShade" onClick={onClose}>
-      <div className="dialog settingsDialog" onClick={(event) => event.stopPropagation()}>
-        <div className="dialogHeader">
-          <h2>Settings</h2>
-          <button className="iconBtn" onClick={onClose} aria-label="Close settings"><IconClose size={14} /></button>
+    <>
+      <aside className="settingsSide">
+        <div className="settingsSide-top">
+          <button className="settingsBack" onClick={onBack}>
+            <IconArrowLeftSlim size={14} />
+            <span>Go back</span>
+          </button>
+          <div className="settingsSide-title">Settings</div>
         </div>
+        <nav className="settingsNav" aria-label="Settings sections">
+          <button
+            className={`settingsNav-item ${activeTab === "appearance" ? "active" : ""}`}
+            onClick={() => setActiveTab("appearance")}
+            aria-current={activeTab === "appearance" ? "page" : undefined}
+          >
+            <IconMoon size={13} />
+            <span>Appearance & Models</span>
+          </button>
+          <button
+            className={`settingsNav-item ${activeTab === "connections" ? "active" : ""}`}
+            onClick={() => setActiveTab("connections")}
+            aria-current={activeTab === "connections" ? "page" : undefined}
+          >
+            <IconBolt size={13} />
+            <span>Connections & Plugins</span>
+          </button>
+        </nav>
+      </aside>
 
-        <section className="settingsSection">
-          <h3>Appearance</h3>
-          <div className="settingsRow">
-            <label className="settingsLabel">Theme</label>
-            <button className="settingsToggle" onClick={onToggleDark}>
-              {dark ? <IconSun size={13} /> : <IconMoon size={13} />}
-              <span>{dark ? "Light mode" : "Dark mode"}</span>
-            </button>
-          </div>
-        </section>
+      <main className="settingsMain">
+        <div className="settingsMain-inner">
+          <header className="settingsPageHeader">
+            <h1>{activeTab === "appearance" ? "Appearance & Models" : "Connections & Plugins"}</h1>
+            <p>{activeTab === "appearance" ? "Local display preferences and defaults for new chats." : "Runtime resources discovered from the active Pi session."}</p>
+          </header>
 
-        <section className="settingsSection">
-          <h3>Chat defaults</h3>
+          {activeTab === "appearance" ? (
+            <div className="settingsPanel">
+              <section className="settingsSection">
+                <h3>Appearance</h3>
+                <div className="settingsRow">
+                  <label className="settingsLabel">Theme</label>
+                  <button className="settingsToggle" onClick={onToggleDark}>
+                    {dark ? <IconSun size={13} /> : <IconMoon size={13} />}
+                    <span>{dark ? "Light mode" : "Dark mode"}</span>
+                  </button>
+                </div>
+              </section>
 
-          <div className="settingsRow">
-            <label className="settingsLabel" htmlFor="def-model">Default model (new chats)</label>
-            <select
-              id="def-model"
-              value={defaultKey}
-              onChange={(event) => {
-                const ref = parseModelKey(event.target.value);
-                onUpdateSettings({ defaultModel: ref });
-              }}
-            >
-              <option value="">Use current selection</option>
-              {modelOptions.map((model) => (
-                <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
-                  {model.name ?? model.id} ({model.provider})
-                </option>
-              ))}
-            </select>
-          </div>
+              <section className="settingsSection">
+                <h3>Chat defaults</h3>
 
-          <div className="settingsRow">
-            <label className="settingsLabel" htmlFor="def-thinking">Default reasoning (new chats)</label>
-            <select
-              id="def-thinking"
-              value={settings?.defaultThinkingLevel ?? ""}
-              onChange={(event) => {
-                const value = event.target.value;
-                onUpdateSettings({ defaultThinkingLevel: value ? (value as PiThinkingLevel) : null });
-              }}
-            >
-              <option value="">Use current selection</option>
-              {thinkingLevels.map((level) => <option key={level} value={level}>{level}</option>)}
-            </select>
-          </div>
-        </section>
+                <div className="settingsRow">
+                  <label className="settingsLabel" htmlFor="def-model">Default model (new chats)</label>
+                  <select
+                    id="def-model"
+                    value={defaultKey}
+                    onChange={(event) => {
+                      const ref = parseModelKey(event.target.value);
+                      onUpdateSettings({ defaultModel: ref });
+                    }}
+                  >
+                    <option value="">Use current selection</option>
+                    {modelOptions.map((model) => (
+                      <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+                        {model.name ?? model.id} ({model.provider})
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-        <section className="settingsSection">
-          <h3>Conversation titles</h3>
-          <p className="settingsHint">Pick which model writes the short title shown in your chat history. Default is whichever model the chat is using.</p>
-          <div className="settingsRow">
-            <label className="settingsLabel" htmlFor="title-model">Title model</label>
-            <select
-              id="title-model"
-              value={titleKey}
-              onChange={(event) => {
-                const ref = parseModelKey(event.target.value);
-                onUpdateSettings({ titleModel: ref });
-              }}
-            >
-              <option value="">Same as chat model</option>
-              {modelOptions.map((model) => (
-                <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
-                  {model.name ?? model.id} ({model.provider})
-                </option>
-              ))}
-            </select>
-          </div>
-        </section>
+                <div className="settingsRow">
+                  <label className="settingsLabel" htmlFor="def-thinking">Default reasoning (new chats)</label>
+                  <select
+                    id="def-thinking"
+                    value={settings?.defaultThinkingLevel ?? ""}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      onUpdateSettings({ defaultThinkingLevel: value ? (value as PiThinkingLevel) : null });
+                    }}
+                  >
+                    <option value="">Use current selection</option>
+                    {thinkingLevels.map((level) => <option key={level} value={level}>{level}</option>)}
+                  </select>
+                </div>
+              </section>
 
-        <div className="dialogActions">
-          <button className="primary" onClick={onClose}>Done</button>
+              <section className="settingsSection">
+                <h3>Conversation titles</h3>
+                <p className="settingsHint">Pick which model writes the short title shown in your chat history. Default is whichever model the chat is using.</p>
+                <div className="settingsRow">
+                  <label className="settingsLabel" htmlFor="title-model">Title model</label>
+                  <select
+                    id="title-model"
+                    value={titleKey}
+                    onChange={(event) => {
+                      const ref = parseModelKey(event.target.value);
+                      onUpdateSettings({ titleModel: ref });
+                    }}
+                  >
+                    <option value="">Same as chat model</option>
+                    {modelOptions.map((model) => (
+                      <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+                        {model.name ?? model.id} ({model.provider})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </section>
+            </div>
+          ) : (
+            <RuntimeResourcesPanel resources={resources} />
+          )}
         </div>
+      </main>
+    </>
+  );
+}
+
+type RuntimeResourceItem = {
+  key: string;
+  title: string;
+  detail?: string;
+  meta?: string;
+  status: "active" | "idle" | "error";
+};
+
+function RuntimeResourcesPanel({ resources }: { resources: PiResourceSummary | null }) {
+  const mcpConnections = buildActiveMcpConnections(resources);
+  const skillItems = (resources?.skills ?? [])
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((skill): RuntimeResourceItem => ({
+      key: skill.name,
+      title: skill.name,
+      detail: skill.description,
+      meta: resourceScope(skill.sourceInfo),
+      status: "idle",
+    }));
+  const extensionItems: RuntimeResourceItem[] = [
+    ...(resources?.extensions ?? [])
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((extension): RuntimeResourceItem => ({
+        key: extension.path,
+        title: extension.name,
+        detail: resourcePathLabel(extension.sourceInfo, extension.path),
+        meta: compactFeatureCount([
+          [extension.commandCount, "command"],
+          [extension.toolCount, "tool"],
+          [extension.shortcutCount, "shortcut"],
+        ]),
+        status: "active",
+      })),
+    ...(resources?.extensionErrors ?? []).map((error): RuntimeResourceItem => ({
+      key: `error:${error.path}`,
+      title: basename(error.path),
+      detail: error.error,
+      meta: "error",
+      status: "error",
+    })),
+  ];
+
+  return (
+    <section className="settingsSection settingsResources">
+      <div className="settingsSectionTitle">
+        <h3>Runtime resources</h3>
+        <span>{resources ? "active session" : "loading"}</span>
       </div>
+      <div className="settingsResourceGrid">
+        <RuntimeResourceGroup
+          title="MCP connections"
+          count={mcpConnections.length}
+          empty={resources ? "No active MCP connections." : "Waiting for Pi resources."}
+          items={mcpConnections}
+        />
+        <RuntimeResourceGroup
+          title="Skills"
+          count={skillItems.length}
+          empty={resources ? "No skills discovered." : "Waiting for Pi resources."}
+          items={skillItems}
+        />
+        <RuntimeResourceGroup
+          title="Extensions"
+          count={extensionItems.length}
+          empty={resources ? "No extensions loaded." : "Waiting for Pi resources."}
+          items={extensionItems}
+        />
+      </div>
+    </section>
+  );
+}
+
+function RuntimeResourceGroup({
+  title,
+  count,
+  empty,
+  items,
+}: {
+  title: string;
+  count: number;
+  empty: string;
+  items: RuntimeResourceItem[];
+}) {
+  return (
+    <div className="resourceGroup">
+      <div className="resourceGroup-head">
+        <span className="resourceGroup-title">{title}</span>
+        <span className="resourceGroup-count">{count}</span>
+      </div>
+      {items.length === 0 ? (
+        <p className="resourceEmpty">{empty}</p>
+      ) : (
+        <ul className="resourceList">
+          {items.map((item) => (
+            <li key={item.key} className={`resourceItem ${item.status}`}>
+              <span className={`resourceStatus ${item.status}`} />
+              <span className="resourceText">
+                <span className="resourceName">{item.title}</span>
+                {item.detail && <span className="resourceDetail">{item.detail}</span>}
+              </span>
+              {item.meta && <span className="resourceMeta">{item.meta}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
+}
+
+function buildActiveMcpConnections(resources: PiResourceSummary | null): RuntimeResourceItem[] {
+  if (!resources) return [];
+  const activeTools = new Set(resources.activeTools);
+  const groups = new Map<string, { title: string; sourceInfo?: PiSourceInfo; active: number; total: number }>();
+  for (const tool of resources.tools) {
+    if (!isMcpTool(tool)) continue;
+    const key = resourceKey(tool.sourceInfo, tool.name);
+    const group = groups.get(key) ?? {
+      title: resourceDisplayName(tool.sourceInfo, tool.name),
+      sourceInfo: tool.sourceInfo,
+      active: 0,
+      total: 0,
+    };
+    group.total += 1;
+    if (activeTools.has(tool.name)) group.active += 1;
+    groups.set(key, group);
+  }
+
+  return [...groups.entries()]
+    .filter(([, group]) => group.active > 0)
+    .sort(([, a], [, b]) => b.active - a.active || a.title.localeCompare(b.title))
+    .map(([key, group]): RuntimeResourceItem => ({
+      key,
+      title: group.title,
+      detail: resourcePathLabel(group.sourceInfo, group.title),
+      meta: `${group.active}/${group.total} tools`,
+      status: "active",
+    }));
+}
+
+function isMcpTool(tool: { name: string; description?: string; sourceInfo?: PiSourceInfo }) {
+  const text = [
+    tool.name,
+    tool.description,
+    tool.sourceInfo?.source,
+    tool.sourceInfo?.path,
+    tool.sourceInfo?.baseDir,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /\bmcp\b|model context protocol/.test(text);
+}
+
+function resourceKey(sourceInfo: PiSourceInfo | undefined, fallback: string) {
+  return sourceInfo ? `${sourceInfo.scope ?? ""}:${sourceInfo.source}:${sourceInfo.path}` : fallback;
+}
+
+function resourceDisplayName(sourceInfo: PiSourceInfo | undefined, fallback: string) {
+  if (!sourceInfo) return fallback;
+  const raw = sourceInfo.source && sourceInfo.source !== "local" ? sourceInfo.source : basename(sourceInfo.path) || fallback;
+  return raw.startsWith("npm:") ? raw.slice(4) : raw;
+}
+
+function resourcePathLabel(sourceInfo: PiSourceInfo | undefined, fallback: string) {
+  if (!sourceInfo) return fallback;
+  if (sourceInfo.scope && sourceInfo.source && sourceInfo.source !== "local") return `${sourceInfo.scope} / ${sourceInfo.source}`;
+  return sourceInfo.path;
+}
+
+function resourceScope(sourceInfo: PiSourceInfo | undefined) {
+  if (!sourceInfo) return undefined;
+  return sourceInfo.scope ?? sourceInfo.source;
+}
+
+function compactFeatureCount(parts: Array<[number, string]>) {
+  const labels = parts
+    .filter(([count]) => count > 0)
+    .map(([count, label]) => `${count} ${label}${count === 1 ? "" : "s"}`);
+  return labels.length ? labels.join(" · ") : "loaded";
+}
+
+function basename(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
 function gitStatusLabel(file: GitFileStatus) {

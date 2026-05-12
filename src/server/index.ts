@@ -280,14 +280,7 @@ const allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
-const writeCommands = new Set<ClientCommand["type"]>([
-  "open_workspace",
-  "switch_workspace",
-  "remove_workspace",
-  "switch_session",
-  "delete_session",
-  "continue_recent",
-  "new_session",
+const sessionWriteCommands = new Set<ClientCommand["type"]>([
   "reload_resources",
   "invoke_command",
   "prompt",
@@ -295,18 +288,16 @@ const writeCommands = new Set<ClientCommand["type"]>([
   "follow_up",
   "abort",
   "compact",
+  "set_session_name",
   "export_html",
   "fork",
   "clone",
-  "set_session_name",
   "cycle_model",
   "set_model",
   "set_thinking_level",
-  "set_settings",
   "extension_ui_response",
   "trigger_shortcut",
   "extension_input",
-  "open_in_editor",
 ]);
 
 type Workspace = {
@@ -363,11 +354,14 @@ type ClientCommand = {
   customInstructions?: string;
   commandName?: string;
   message?: string;
+  clientMessageId?: string;
   streamingBehavior?: "steer" | "followUp";
   provider?: string;
   modelId?: string;
   level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   settings?: Partial<PiSettings>;
+  runtimeId?: string;
+  sessionId?: string;
   uiRequestId?: string;
   value?: unknown;
   key?: string;
@@ -405,13 +399,13 @@ type ServerPacket =
   | { type: "git"; data: unknown }
   | { type: "files"; data: unknown }
   | { type: "tree"; data: unknown }
-  | { type: "extension_ui_request"; request: unknown }
+  | { type: "extension_ui_request"; data: unknown }
   | { type: "extension_ui_status"; data: unknown }
-  | { type: "extension_ui_widget"; data: { slot: string; lines?: string[]; removed?: true } }
-  | { type: "extension_reset" }
-  | { type: "shortcuts"; data: { shortcuts: Array<{ key: string; description?: string }> } }
+  | { type: "extension_ui_widget"; data: unknown }
+  | { type: "extension_reset"; data: unknown }
+  | { type: "shortcuts"; data: unknown }
   | { type: "notification"; data: { message: string; level?: "info" | "warning" | "error" } }
-  | { type: "event"; event: unknown }
+  | { type: "event"; data: unknown }
   | { type: "response"; id?: string; command: string; success: boolean; data?: unknown; error?: string };
 
 function send(ws: WebSocket, packet: ServerPacket) {
@@ -612,8 +606,25 @@ function lockConflictError(sessionFile: string, lock?: SessionLock) {
 }
 
 type RuntimeHandle = {
+  id: string;
   workspace: Workspace;
   runtime: Awaited<ReturnType<typeof createRuntimeFor>>;
+  seq: number;
+  eventBuffer: Array<{ type: "event"; data: SessionRoute & { event: unknown; seq: number } }>;
+  unsubscribe?: () => void;
+  lockedSessionFile?: string;
+  readOnly: boolean;
+  pendingUi: Map<string, (value: unknown) => void>;
+  widgetHost: WidgetHost;
+  extensionUi: ExtensionUIContext;
+  titleInFlight: boolean;
+};
+
+type SessionRoute = {
+  runtimeId: string;
+  workspaceId: string;
+  sessionPath?: string;
+  sessionId: string;
 };
 
 async function createRuntimeFor(cwd: string, mode: "new" | "continue" | "open" = "new", sessionPath?: string) {
@@ -634,6 +645,55 @@ async function createRuntimeFor(cwd: string, mode: "new" | "continue" | "open" =
         : SessionManager.create(cwd);
 
   return createAgentSessionRuntime(factory, { cwd, agentDir, sessionManager });
+}
+
+function sessionKey(workspaceId: string, sessionPath: string) {
+  return `${workspaceId}\0${sessionPath}`;
+}
+
+function routeFor(handle: RuntimeHandle): SessionRoute {
+  const session = handle.runtime.session;
+  return {
+    runtimeId: handle.id,
+    workspaceId: handle.workspace.id,
+    sessionPath: session.sessionFile,
+    sessionId: session.sessionId,
+  };
+}
+
+function eventType(event: unknown) {
+  return event && typeof event === "object" && typeof (event as { type?: unknown }).type === "string"
+    ? (event as { type: string }).type
+    : undefined;
+}
+
+function scopedState(handle: RuntimeHandle, revision = handle.seq) {
+  const state = publicState(handle.workspace, handle.runtime.session);
+  return { ...routeFor(handle), ...state, state, revision };
+}
+
+function scopedMessages(handle: RuntimeHandle, revision = handle.seq) {
+  return { ...routeFor(handle), messages: handle.runtime.session.messages, revision };
+}
+
+function scopedResources(handle: RuntimeHandle) {
+  const resources = publicResources(handle.runtime.session);
+  return { ...routeFor(handle), ...resources, resources };
+}
+
+function scopedModels(handle: RuntimeHandle) {
+  return { ...routeFor(handle), models: publicModels(handle.runtime.session) };
+}
+
+function scopedTree(handle: RuntimeHandle) {
+  return { ...routeFor(handle), entries: publicTree(handle.runtime.session) };
+}
+
+function scopedEvent(handle: RuntimeHandle, event: unknown, seq: number) {
+  return {
+    type: "event" as const,
+    data: { ...routeFor(handle), event, seq },
+  };
 }
 
 function publicState(workspace: Workspace, session: AgentSession) {
@@ -964,10 +1024,12 @@ async function generateSessionTitle(session: AgentSession, titleModelRef: ModelR
 function publicResources(session: AgentSession) {
   const skills = session.resourceLoader.getSkills();
   const prompts = session.resourceLoader.getPrompts();
+  const extensions = session.resourceLoader.getExtensions();
   const extensionCommands = session.extensionRunner.getRegisteredCommands().map((command) => ({
     name: command.invocationName,
     description: command.description,
     source: "extension",
+    sourceInfo: command.sourceInfo,
   }));
   return {
     commands: [
@@ -985,9 +1047,27 @@ function publicResources(session: AgentSession) {
     activeTools: session.getActiveToolNames(),
     prompts: prompts.prompts,
     skills: skills.skills,
+    extensions: extensions.extensions.map((extension) => ({
+      name: resourceSourceLabel(extension.sourceInfo, extension.path),
+      path: extension.path,
+      resolvedPath: extension.resolvedPath,
+      sourceInfo: extension.sourceInfo,
+      commandCount: extension.commands.size,
+      toolCount: extension.tools.size,
+      shortcutCount: extension.shortcuts.size,
+      flagCount: extension.flags.size,
+      handlerCount: [...extension.handlers.values()].reduce((sum, handlers) => sum + handlers.length, 0),
+    })),
+    extensionErrors: extensions.errors,
     agentsFiles: session.resourceLoader.getAgentsFiles().agentsFiles.map((file) => ({ path: file.path })),
     diagnostics: [...skills.diagnostics, ...prompts.diagnostics],
   };
+}
+
+function resourceSourceLabel(sourceInfo: { source?: string; path?: string } | undefined, fallback: string) {
+  const raw = sourceInfo?.source && sourceInfo.source !== "local" ? sourceInfo.source : sourceInfo?.path ?? fallback;
+  const label = raw.split(/[\\/]/).filter(Boolean).pop() ?? raw;
+  return label.startsWith("npm:") ? label.slice(4) : label;
 }
 
 function publicModels(session: AgentSession) {
@@ -1034,44 +1114,41 @@ function waitForIdle(session: AgentSession) {
   });
 }
 
-function createCommandActions(handle: RuntimeHandle, locks: LockStore, ownerId: string): ExtensionCommandContextActions {
+function disabledRuntimeReplacement(action: string): never {
+  throw new Error(`${action} is disabled in piui extension actions; use the piui runtime registry instead.`);
+}
+
+function createCommandActions(handle: RuntimeHandle): ExtensionCommandContextActions {
   return {
     waitForIdle: () => waitForIdle(handle.runtime.session),
-    newSession: async (options) => {
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.newSession(options);
-      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-      return result;
-    },
-    fork: async (entryId, options) => {
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.fork(entryId, options);
-      if (!result.cancelled) await locks.release(previousSessionFile, ownerId);
-      return { cancelled: result.cancelled };
-    },
+    newSession: async () => disabledRuntimeReplacement("newSession"),
+    fork: async () => disabledRuntimeReplacement("fork"),
     navigateTree: async (targetId, options) => {
       const result = await handle.runtime.session.navigateTree(targetId, options);
       return { cancelled: result.cancelled };
     },
-    switchSession: async (sessionPath, options) => {
-      const lock = await locks.claim(sessionPath, handle.workspace, ownerId);
-      if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-      const previousSessionFile = handle.runtime.session.sessionFile;
-      const result = await handle.runtime.switchSession(sessionPath, options);
-      if (!result.cancelled && previousSessionFile !== sessionPath) await locks.release(previousSessionFile, ownerId);
-      else if (result.cancelled && previousSessionFile !== sessionPath) await locks.release(sessionPath, ownerId);
-      return result;
-    },
+    switchSession: async () => disabledRuntimeReplacement("switchSession"),
     reload: async () => {
       await handle.runtime.session.reload();
     },
   };
 }
 
-function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost): ExtensionUIContext {
+function createExtensionUI(
+  ws: WebSocket,
+  route: () => SessionRoute,
+  pendingUi: Map<string, (value: unknown) => void>,
+  widgetHost: WidgetHost,
+  isActive: () => boolean,
+): ExtensionUIContext {
+  function sendIfActive(packet: ServerPacket) {
+    if (isActive()) send(ws, packet);
+  }
+
   function request<T>(kind: string, payload: Record<string, unknown>, opts?: { signal?: AbortSignal; timeout?: number }) {
     const requestId = crypto.randomUUID();
-    send(ws, { type: "extension_ui_request", request: { id: requestId, kind, ...payload } });
+    const request = { id: requestId, kind, ...payload };
+    send(ws, { type: "extension_ui_request", data: { ...route(), request } });
     return new Promise<T | undefined>((resolve) => {
       let timer: NodeJS.Timeout | undefined;
       const cleanup = () => {
@@ -1116,27 +1193,28 @@ function createExtensionUI(ws: WebSocket, pendingUi: Map<string, (value: unknown
     select: (title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("select", { title, options, opts }, opts),
     confirm: async (title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }) => Boolean(await request<boolean>("confirm", { title, message, opts }, opts)),
     input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal; timeout?: number }) => request<string>("input", { title, placeholder, opts }, opts),
-    notify: (message: string, level?: "info" | "warning" | "error") => send(ws, { type: "notification", data: { message, level } }),
+    notify: (message: string, level?: "info" | "warning" | "error") => sendIfActive({ type: "notification", data: { message, level } }),
     onTerminalInput: () => () => undefined,
-    setStatus: (key: string, text: string | undefined) => send(ws, { type: "extension_ui_status", data: { key, text } }),
-    setWorkingMessage: (message?: string) => send(ws, { type: "extension_ui_status", data: { key: "workingMessage", text: message } }),
-    setWorkingVisible: (visible: boolean) => send(ws, { type: "extension_ui_status", data: { key: "workingVisible", value: visible } }),
-    setWorkingIndicator: (options?: unknown) => send(ws, { type: "extension_ui_status", data: { key: "workingIndicator", value: options } }),
-    setHiddenThinkingLabel: (label?: string) => send(ws, { type: "extension_ui_status", data: { key: "hiddenThinkingLabel", text: label } }),
+    setStatus: (key: string, text: string | undefined) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key, text } }),
+    setWorkingMessage: (message?: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingMessage", text: message } }),
+    setWorkingVisible: (visible: boolean) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingVisible", value: visible } }),
+    setWorkingIndicator: (options?: unknown) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "workingIndicator", value: options } }),
+    setHiddenThinkingLabel: (label?: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "hiddenThinkingLabel", text: label } }),
     setWidget: (key: string, content: unknown) => setSlot(`widget:${key}`, content, defaultExtensionTheme),
     setFooter: (factory: unknown) => setSlot("footer", factory, defaultExtensionTheme),
     setHeader: (factory: unknown) => setSlot("header", factory, defaultExtensionTheme),
-    setTitle: (title: string) => send(ws, { type: "extension_ui_status", data: { key: "title", text: title } }),
+    setTitle: (title: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "title", text: title } }),
     // Open a focused, scrollable overlay. The extension's factory returns a
     // Component with optional `handleInput` — keystrokes captured client-side
     // are forwarded back through `extension_input` and dispatched here.
     custom: async <T,>(factory: unknown) => {
       if (typeof factory !== "function") return undefined as T;
+      if (!isActive()) return undefined as T;
       const result = await widgetHost.setOverlay(factory as Parameters<WidgetHost["setOverlay"]>[0], defaultExtensionTheme);
       return result as T;
     },
-    pasteToEditor: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "pasteToEditor", text } }),
-    setEditorText: (text: string) => send(ws, { type: "extension_ui_status", data: { key: "setEditorText", text } }),
+    pasteToEditor: (text: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "pasteToEditor", text } }),
+    setEditorText: (text: string) => sendIfActive({ type: "extension_ui_status", data: { ...route(), key: "setEditorText", text } }),
     getEditorText: () => "",
     editor: (title: string, prefill?: string) => request<string>("editor", { title, prefill }),
     addAutocompleteProvider: () => undefined,
@@ -1200,67 +1278,6 @@ function buildExtensionContext(handle: RuntimeHandle, ui: ExtensionUIContext) {
     compact: (opts?: { customInstructions?: string }) => { void session.compact(opts?.customInstructions); },
     getSystemPrompt: () => "",
   };
-}
-
-async function bindSession(ws: WebSocket, handle: RuntimeHandle, pendingUi: Map<string, (value: unknown) => void>, widgetHost: WidgetHost, uiContext: ExtensionUIContext, locks: LockStore, ownerId: string, settingsStore: SettingsStore, unsubscribe?: () => void, isCurrent: () => boolean = () => true) {
-  unsubscribe?.();
-  const session = handle.runtime.session;
-  const lock = await locks.claim(session.sessionFile, handle.workspace, ownerId);
-  if (lock.owner !== "other") {
-    // Wipe any widgets the previous session's extensions registered before we
-    // bind the new one — extension factories will re-register from scratch.
-    widgetHost.reset();
-    // Tell the client to clear residual extension status/title/working-message
-    // fields too. Slots are removed via widgetHost.reset() above, but the
-    // chrome state lives only on the client and needs an explicit reset so it
-    // doesn't bleed from one conversation into the next.
-    send(ws, { type: "extension_reset" });
-    await session.bindExtensions({
-      uiContext,
-      commandContextActions: createCommandActions(handle, locks, ownerId),
-    });
-    // Once extensions have re-registered, push their shortcut list down to the
-    // browser so it can capture matching keys and forward them to us.
-    send(ws, { type: "shortcuts", data: { shortcuts: listExtensionShortcuts(handle) } });
-  }
-  // Track in-flight title generation per session-file so we don't fire the
-  // model twice if `agent_end` lands while a previous request is still open.
-  let titleInFlight = false;
-  const nextUnsubscribe = session.subscribe((event) => {
-    if (!isCurrent()) return;
-    send(ws, { type: "event", event });
-    if (["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(event.type)) {
-      send(ws, { type: "state", data: publicState(handle.workspace, session) });
-    }
-    if (event.type === "agent_end" && !titleInFlight && !session.sessionManager.getSessionName()) {
-      titleInFlight = true;
-      const ownedSessionFile = session.sessionFile;
-      void (async () => {
-        try {
-          const title = await generateSessionTitle(session, settingsStore.get().titleModel);
-          // Bail out if the user has switched away from this session before we got a result.
-          if (!isCurrent() || !title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
-          session.setSessionName(title);
-          send(ws, { type: "state", data: publicState(handle.workspace, session) });
-          send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd, [session]) } });
-        } finally {
-          titleInFlight = false;
-        }
-      })();
-    }
-  });
-  send(ws, { type: "workspace", data: handle.workspace });
-  send(ws, { type: "state", data: publicState(handle.workspace, session) });
-  send(ws, { type: "messages", data: { messages: session.messages } });
-  send(ws, { type: "sessions", data: { workspaceId: handle.workspace.id, sessions: await listSessions(handle.workspace.cwd, [session]) } });
-  send(ws, { type: "resources", data: publicResources(session) });
-  send(ws, { type: "models", data: { models: publicModels(session) } });
-  send(ws, { type: "tree", data: { entries: publicTree(session) } });
-  send(ws, { type: "git", data: await gitSnapshot(handle.workspace.cwd) });
-  if (lock.owner === "other") {
-    send(ws, { type: "notification", data: { level: "warning", message: `Session file is already owned by PID ${lock.lock.pid}; avoid writing from two runtimes.` } });
-  }
-  return { unsubscribe: nextUnsubscribe, readOnly: lock.owner === "other" };
 }
 
 async function main() {
@@ -1333,25 +1350,49 @@ async function main() {
   wss.on("connection", async (ws) => {
     let activeWorkspace = store.list()[0];
     let handle: RuntimeHandle | undefined;
-    let unsubscribe: (() => void) | undefined;
-    let readOnly = false;
-    const handles = new Map<string, RuntimeHandle>();
-    const activeHandleByWorkspace = new Map<string, RuntimeHandle>();
-    const statusUnsubscribes = new Map<string, () => void>();
+    let activeRuntimeId: string | null = null;
+    const runtimesById = new Map<string, RuntimeHandle>();
+    const runtimeIdBySessionKey = new Map<string, string>();
+    const openingRuntimeBySessionKey = new Map<string, Promise<RuntimeHandle>>();
+    const activeRuntimeByWorkspace = new Map<string, string>();
+    const sessionRefreshTimers = new Map<string, NodeJS.Timeout>();
     const ownerId = crypto.randomUUID();
-    const pendingUi = new Map<string, (value: unknown) => void>();
-    // One WidgetHost per WS connection; it's reset between sessions so a new
-    // session's extensions start with an empty slot table. The host emits
-    // ANSI lines straight to this socket whenever a registered Component
-    // requests a re-render.
-    const widgetHost = new WidgetHost({
-      emit: (slot, lines) => send(ws, { type: "extension_ui_widget", data: { slot, lines } }),
-      remove: (slot) => send(ws, { type: "extension_ui_widget", data: { slot, removed: true } }),
-    });
-    // The uiContext lives at WS-connection scope: all session binds and any
-    // shortcut-handler invocations share the same one, so when an extension
-    // calls ctx.ui.setWidget from a shortcut it routes back through this WS.
-    const extensionUi = createExtensionUI(ws, pendingUi, widgetHost);
+    const eventBufferLimit = 200;
+    const statusEvents = new Set([
+      "agent_start",
+      "agent_end",
+      "tool_execution_start",
+      "tool_execution_end",
+      "message_end",
+      "queue_update",
+      "compaction_start",
+      "compaction_end",
+      "auto_retry_start",
+      "auto_retry_end",
+      "session_info_changed",
+    ]);
+    let activationGeneration = 0;
+
+    function isActive(next: RuntimeHandle) {
+      return activeRuntimeId === next.id;
+    }
+
+    function isCurrentActivation(next: RuntimeHandle, generation: number) {
+      return isActive(next) && activationGeneration === generation;
+    }
+
+    function assertCommandRoute(next: RuntimeHandle, command: ClientCommand) {
+      const route = routeFor(next);
+      if (command.workspaceId && command.workspaceId !== route.workspaceId) {
+        throw new Error(`Runtime route mismatch: workspaceId ${command.workspaceId} does not match ${route.workspaceId}.`);
+      }
+      if (command.sessionId && command.sessionId !== route.sessionId) {
+        throw new Error(`Runtime route mismatch: sessionId ${command.sessionId} does not match ${route.sessionId}.`);
+      }
+      if (command.sessionPath !== undefined && command.sessionPath !== route.sessionPath) {
+        throw new Error("Runtime route mismatch: sessionPath changed; refresh the active session before sending this command.");
+      }
+    }
 
     async function applySessionDefaults(session: AgentSession) {
       const settings = settingsStore.get();
@@ -1368,16 +1409,8 @@ async function main() {
       }
     }
 
-    function handleKey(workspaceId: string, sessionFile?: string) {
-      return `${workspaceId}:${sessionFile ?? "new"}`;
-    }
-
-    function keyForHandle(next: RuntimeHandle) {
-      return handleKey(next.workspace.id, next.runtime.session.sessionFile);
-    }
-
     function handlesForWorkspace(workspaceId: string) {
-      return [...handles.values()].filter((candidate) => candidate.workspace.id === workspaceId);
+      return [...runtimesById.values()].filter((candidate) => candidate.workspace.id === workspaceId);
     }
 
     function liveSessionsFor(workspaceId: string) {
@@ -1385,16 +1418,13 @@ async function main() {
     }
 
     function registerHandle(next: RuntimeHandle) {
-      const nextKey = keyForHandle(next);
-      for (const [key, candidate] of handles) {
-        if (candidate === next && key !== nextKey) {
-          handles.delete(key);
-          statusUnsubscribes.get(key)?.();
-          statusUnsubscribes.delete(key);
-        }
+      runtimesById.set(next.id, next);
+      for (const [key, runtimeId] of runtimeIdBySessionKey) {
+        if (runtimeId === next.id) runtimeIdBySessionKey.delete(key);
       }
-      handles.set(nextKey, next);
-      activeHandleByWorkspace.set(next.workspace.id, next);
+      if (next.runtime.session.sessionFile) {
+        runtimeIdBySessionKey.set(sessionKey(next.workspace.id, next.runtime.session.sessionFile), next.id);
+      }
     }
 
     async function sendWorkspaceSessions(workspace: Workspace) {
@@ -1407,96 +1437,284 @@ async function main() {
       });
     }
 
-    function bindWorkspaceStatus(next: RuntimeHandle) {
-      const key = keyForHandle(next);
-      statusUnsubscribes.get(key)?.();
-      const session = next.runtime.session;
-      statusUnsubscribes.set(key, session.subscribe((event) => {
-        if (["agent_start", "agent_end", "compaction_start", "compaction_end", "session_info_changed"].includes(event.type)) {
-          void sendWorkspaceSessions(next.workspace).catch((error) => {
-            console.warn("Failed to refresh workspace sessions:", error);
-          });
-        }
-      }));
+    function scheduleWorkspaceSessions(workspace: Workspace) {
+      if (sessionRefreshTimers.has(workspace.id)) return;
+      const timer = setTimeout(() => {
+        sessionRefreshTimers.delete(workspace.id);
+        void sendWorkspaceSessions(workspace).catch((error) => {
+          console.warn("Failed to refresh workspace sessions:", error);
+        });
+      }, 120);
+      timer.unref();
+      sessionRefreshTimers.set(workspace.id, timer);
     }
 
-    async function bindActive(next: RuntimeHandle) {
-      const binding = await bindSession(
-        ws,
-        next,
-        pendingUi,
-        widgetHost,
-        extensionUi,
-        locks,
-        ownerId,
-        settingsStore,
-        unsubscribe,
-        () => handle === next && activeWorkspace.id === next.workspace.id,
-      );
-      unsubscribe = binding.unsubscribe;
-      readOnly = binding.readOnly;
+    function pushEventBuffer(next: RuntimeHandle, packet: { type: "event"; data: SessionRoute & { event: unknown; seq: number } }) {
+      next.eventBuffer.push(packet);
+      if (next.eventBuffer.length > eventBufferLimit) next.eventBuffer.splice(0, next.eventBuffer.length - eventBufferLimit);
+    }
+
+    function clearPendingUi(next: RuntimeHandle) {
+      for (const resolve of next.pendingUi.values()) resolve(undefined);
+      next.pendingUi.clear();
+    }
+
+    async function claimRuntimeLock(next: RuntimeHandle) {
+      const sessionFile = next.runtime.session.sessionFile;
+      const previous = next.lockedSessionFile;
+      if (previous === sessionFile) return;
+
+      if (sessionFile) {
+        const lock = await locks.claim(sessionFile, next.workspace, ownerId);
+        next.readOnly = lock.owner === "other";
+        if (lock.owner === "other" && isActive(next)) {
+          send(ws, { type: "notification", data: { level: "warning", message: `Session file is already owned by PID ${lock.lock.pid}; avoid writing from two runtimes.` } });
+        }
+      } else {
+        next.readOnly = false;
+      }
+
+      if (previous && previous !== sessionFile) await locks.release(previous, ownerId);
+      next.lockedSessionFile = sessionFile;
+    }
+
+    async function refreshSessionIdentity(next: RuntimeHandle) {
+      await claimRuntimeLock(next);
+      registerHandle(next);
+    }
+
+    function maybeGenerateTitle(next: RuntimeHandle) {
+      const session = next.runtime.session;
+      if (next.titleInFlight || session.sessionManager.getSessionName()) return;
+      next.titleInFlight = true;
+      const ownedSessionFile = session.sessionFile;
+      void (async () => {
+        try {
+          const title = await generateSessionTitle(session, settingsStore.get().titleModel);
+          if (!title || session.sessionFile !== ownedSessionFile || session.sessionManager.getSessionName()) return;
+          session.setSessionName(title);
+          if (isActive(next)) send(ws, { type: "state", data: scopedState(next) });
+          await sendWorkspaceSessions(next.workspace);
+        } finally {
+          next.titleInFlight = false;
+        }
+      })().catch((error) => {
+        next.titleInFlight = false;
+        console.warn("Title generation failed:", error);
+      });
+    }
+
+    function attachRuntimeSubscription(next: RuntimeHandle) {
+      next.unsubscribe?.();
+      const session = next.runtime.session;
+      next.unsubscribe = session.subscribe((event) => {
+        const seq = ++next.seq;
+        const packet = scopedEvent(next, event, seq);
+        const type = eventType(event);
+        pushEventBuffer(next, packet);
+
+        if (type && statusEvents.has(type)) scheduleWorkspaceSessions(next.workspace);
+
+        if (isActive(next)) {
+          send(ws, packet);
+          if (type && ["agent_start", "agent_end", "queue_update", "compaction_start", "compaction_end", "message_end", "tool_execution_end", "thinking_level_changed", "session_info_changed"].includes(type)) {
+            send(ws, { type: "state", data: scopedState(next) });
+          }
+          if (type && ["agent_end", "compaction_end", "message_end"].includes(type)) {
+            send(ws, { type: "messages", data: scopedMessages(next) });
+            send(ws, { type: "tree", data: scopedTree(next) });
+          }
+        }
+
+        if (type === "agent_end") maybeGenerateTitle(next);
+      });
+    }
+
+    async function bindForegroundExtensions(next: RuntimeHandle) {
+      clearPendingUi(next);
+      next.widgetHost.reset();
+      send(ws, { type: "extension_reset", data: routeFor(next) });
+      if (next.readOnly) {
+        send(ws, { type: "shortcuts", data: { ...routeFor(next), shortcuts: [] } });
+        return;
+      }
+      await next.runtime.session.bindExtensions({
+        uiContext: next.extensionUi,
+        commandContextActions: createCommandActions(next),
+      });
+      send(ws, { type: "shortcuts", data: { ...routeFor(next), shortcuts: listExtensionShortcuts(next) } });
+    }
+
+    async function sendActivationSnapshot(next: RuntimeHandle, generation: number) {
+      const revision = next.seq;
+      if (!isCurrentActivation(next, generation)) return;
+      await bindForegroundExtensions(next);
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "workspace", data: next.workspace });
+      send(ws, { type: "state", data: scopedState(next, revision) });
+      send(ws, { type: "messages", data: scopedMessages(next, revision) });
+      const sessions = await listSessions(next.workspace.cwd, liveSessionsFor(next.workspace.id));
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "sessions", data: { workspaceId: next.workspace.id, sessions } });
+      send(ws, { type: "resources", data: scopedResources(next) });
+      send(ws, { type: "models", data: scopedModels(next) });
+      send(ws, { type: "tree", data: scopedTree(next) });
+      const snapshot = await gitSnapshot(next.workspace.cwd);
+      if (!isCurrentActivation(next, generation)) return;
+      send(ws, { type: "git", data: { ...snapshot, workspaceId: next.workspace.id, snapshot } });
+      for (const packet of next.eventBuffer) {
+        if (packet.data.seq > revision) send(ws, packet);
+      }
       send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
     }
 
     async function createHandle(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
-      const next: RuntimeHandle = { workspace, runtime: await createRuntimeFor(workspace.cwd, options?.mode, options?.sessionPath) };
-      registerHandle(next);
-      // Apply settings-driven defaults to brand-new sessions only — resuming an
-      // existing session preserves whatever it was last using.
+      const runtime = await createRuntimeFor(workspace.cwd, options?.mode, options?.sessionPath);
+      let next!: RuntimeHandle;
+      const pendingUi = new Map<string, (value: unknown) => void>();
+      const widgetHost = new WidgetHost({
+        emit: (slot, lines) => {
+          if (isActive(next)) send(ws, { type: "extension_ui_widget", data: { ...routeFor(next), slot, lines } });
+        },
+        remove: (slot) => {
+          if (isActive(next)) send(ws, { type: "extension_ui_widget", data: { ...routeFor(next), slot, removed: true } });
+        },
+      });
+      const extensionUi = createExtensionUI(ws, () => routeFor(next), pendingUi, widgetHost, () => isActive(next));
+      next = {
+        id: crypto.randomUUID(),
+        workspace,
+        runtime,
+        seq: 0,
+        eventBuffer: [],
+        readOnly: false,
+        pendingUi,
+        widgetHost,
+        extensionUi,
+        titleInFlight: false,
+      };
       if (options?.mode !== "open" && options?.mode !== "continue") await applySessionDefaults(next.runtime.session);
-      bindWorkspaceStatus(next);
+      await refreshSessionIdentity(next);
+      attachRuntimeSubscription(next);
       next.runtime.setRebindSession(async () => {
-        registerHandle(next);
-        bindWorkspaceStatus(next);
-        if (handle !== next) return;
-        await bindActive(next);
+        await refreshSessionIdentity(next);
+        attachRuntimeSubscription(next);
+        if (isActive(next)) await sendActivationSnapshot(next, activationGeneration);
+        else await sendWorkspaceSessions(next.workspace);
+      });
+      next.runtime.setBeforeSessionInvalidate(() => {
+        clearPendingUi(next);
+        next.widgetHost.reset();
       });
       return next;
     }
 
-    async function disposeHandle(workspaceId: string) {
-      const existingHandles = handlesForWorkspace(workspaceId);
-      for (const existing of existingHandles) {
-        if (handle === existing) {
-          unsubscribe?.();
-          unsubscribe = undefined;
-          handle = undefined;
-        }
-        await locks.release(existing.runtime.session.sessionFile, ownerId);
-        await existing.runtime.dispose();
-        const key = keyForHandle(existing);
-        statusUnsubscribes.get(key)?.();
-        statusUnsubscribes.delete(key);
-        handles.delete(key);
+    async function disposeRuntime(existing: RuntimeHandle) {
+      if (isActive(existing)) {
+        activeRuntimeId = null;
+        handle = undefined;
       }
-      activeHandleByWorkspace.delete(workspaceId);
+      existing.unsubscribe?.();
+      clearPendingUi(existing);
+      await locks.release(existing.lockedSessionFile ?? existing.runtime.session.sessionFile, ownerId);
+      await existing.runtime.dispose();
+      runtimesById.delete(existing.id);
+      for (const [key, runtimeId] of runtimeIdBySessionKey) {
+        if (runtimeId === existing.id) runtimeIdBySessionKey.delete(key);
+      }
+      for (const [workspaceId, runtimeId] of activeRuntimeByWorkspace) {
+        if (runtimeId === existing.id) activeRuntimeByWorkspace.delete(workspaceId);
+      }
+    }
+
+    async function disposeWorkspace(workspaceId: string) {
+      await Promise.all(handlesForWorkspace(workspaceId).map(disposeRuntime));
     }
 
     async function openHandle(workspace: Workspace, sessionPath: string) {
-      return handles.get(handleKey(workspace.id, sessionPath)) ?? await createHandle(workspace, { mode: "open", sessionPath });
+      const key = sessionKey(workspace.id, sessionPath);
+      const existingId = runtimeIdBySessionKey.get(key);
+      const existing = existingId ? runtimesById.get(existingId) : undefined;
+      if (existing) return existing;
+      const pending = openingRuntimeBySessionKey.get(key);
+      if (pending) return pending;
+
+      const opening = (async () => {
+        const lock = await locks.claim(sessionPath, workspace, ownerId);
+        if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
+        try {
+          const nowExistingId = runtimeIdBySessionKey.get(key);
+          const nowExisting = nowExistingId ? runtimesById.get(nowExistingId) : undefined;
+          return nowExisting ?? await createHandle(workspace, { mode: "open", sessionPath });
+        } catch (error) {
+          await locks.release(sessionPath, ownerId);
+          throw error;
+        } finally {
+          openingRuntimeBySessionKey.delete(key);
+        }
+      })();
+      openingRuntimeBySessionKey.set(key, opening);
+      return opening;
+    }
+
+    async function forkHandle(source: RuntimeHandle, entryId: string, position: "before" | "at") {
+      const sourceFile = source.runtime.session.sessionFile;
+      if (!sourceFile) throw new Error("Cannot fork an unsaved session yet.");
+
+      const liveManager = source.runtime.session.sessionManager;
+      const entry = liveManager.getEntry(entryId);
+      if (!entry) throw new Error("Invalid entry ID for forking");
+
+      let targetLeafId: string | null;
+      let selectedText: string | undefined;
+      if (position === "at") {
+        targetLeafId = entry.id;
+      } else {
+        if (entry.type !== "message" || entry.message.role !== "user") {
+          throw new Error("Invalid entry ID for forking");
+        }
+        targetLeafId = entry.parentId;
+        selectedText = plainTextFromMessage(entry.message as { content: unknown });
+      }
+
+      if (!targetLeafId) {
+        const next = await activateHandle(source.workspace, await createHandle(source.workspace));
+        return { cancelled: false, selectedText, runtimeId: next.id, sessionPath: next.runtime.session.sessionFile };
+      }
+
+      const sourceManager = SessionManager.open(sourceFile, liveManager.getSessionDir(), source.workspace.cwd);
+      const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
+      if (!forkedSessionPath) throw new Error("Failed to create forked session");
+      const next = await activateHandle(source.workspace, await openHandle(source.workspace, forkedSessionPath));
+      return { cancelled: false, selectedText, runtimeId: next.id, sessionPath: next.runtime.session.sessionFile };
     }
 
     async function activateHandle(workspace: Workspace, next: RuntimeHandle) {
+      if (handle && handle !== next) clearPendingUi(handle);
       activeWorkspace = await store.touch(workspace.id);
       next.workspace = activeWorkspace;
-      registerHandle(next);
+      await refreshSessionIdentity(next);
+      activeRuntimeId = next.id;
+      const generation = ++activationGeneration;
+      activeRuntimeByWorkspace.set(activeWorkspace.id, next.id);
       handle = next;
-      await bindActive(next);
+      await sendActivationSnapshot(next, generation);
       return next;
     }
 
     async function activate(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
       activeWorkspace = await store.touch(workspace.id);
-      const cached = options?.mode === "open" && options.sessionPath
-        ? handles.get(handleKey(activeWorkspace.id, options.sessionPath))
-        : activeHandleByWorkspace.get(activeWorkspace.id);
+      const cachedId = options?.mode === "open" && options.sessionPath
+        ? runtimeIdBySessionKey.get(sessionKey(activeWorkspace.id, options.sessionPath))
+        : activeRuntimeByWorkspace.get(activeWorkspace.id);
+      const cached = cachedId ? runtimesById.get(cachedId) : undefined;
       const next = cached ?? await createHandle(activeWorkspace, options);
       return activateHandle(activeWorkspace, next);
     }
 
     try {
       await activate(activeWorkspace);
-      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: publicState(activeWorkspace, handle!.runtime.session), settings: settingsStore.get(), editors: availableEditors } });
+      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: scopedState(handle!), settings: settingsStore.get(), editors: availableEditors } });
       send(ws, { type: "settings", data: settingsStore.get() });
     } catch (error) {
       send(ws, { type: "response", command: "connect", success: false, error: error instanceof Error ? error.message : String(error) });
@@ -1513,8 +1731,22 @@ async function main() {
       }
 
       const id = command.id;
+      const targetHandle = command.runtimeId ? runtimesById.get(command.runtimeId) : handle;
+      const commandRuntime = () => {
+        if (!targetHandle) throw new Error(command.runtimeId ? `Unknown runtimeId: ${command.runtimeId}` : "No active session");
+        return targetHandle;
+      };
       try {
-        if (readOnly && writeCommands.has(command.type)) {
+        if (command.runtimeId && !targetHandle) {
+          throw new Error(`Unknown runtimeId: ${command.runtimeId}`);
+        }
+        if (targetHandle && command.runtimeId) {
+          assertCommandRoute(targetHandle, command);
+        }
+        if (sessionWriteCommands.has(command.type) && !targetHandle) {
+          throw new Error("No active session");
+        }
+        if (targetHandle?.readOnly && sessionWriteCommands.has(command.type)) {
           throw new Error("This session is read-only because another Pi runtime owns its session file. Close the other runtime before changing this session.");
         }
         switch (command.type) {
@@ -1551,7 +1783,7 @@ async function main() {
             if (command.workspaceId === initialWorkspaceId) {
               throw new Error("This workspace is the launch directory and is pinned — it can't be removed.");
             }
-            await disposeHandle(command.workspaceId);
+            await disposeWorkspace(command.workspaceId);
             await store.remove(command.workspaceId);
             const next = store.list()[0] ?? (await store.add(initialCwd));
             await activate(next);
@@ -1569,7 +1801,7 @@ async function main() {
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
             // Refuse to delete the session file we currently hold open.
-            if ([...handles.values()].some((existing) => existing.runtime.session.sessionFile === command.sessionPath)) {
+            if ([...runtimesById.values()].some((existing) => existing.runtime.session.sessionFile === command.sessionPath)) {
               throw new Error("This session is open. Switch to another conversation first, then delete it.");
             }
             // Don't allow deletion of files outside the target workspace's session listing.
@@ -1586,209 +1818,221 @@ async function main() {
             if (!command.sessionPath) throw new Error("Missing sessionPath");
             {
               const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
-              const lock = await locks.claim(command.sessionPath, workspace, ownerId);
-              if (lock.owner === "other") throw lockConflictError(command.sessionPath, lock.lock);
-              try {
-                const next = await openHandle(workspace, command.sessionPath);
-                await activateHandle(workspace, next);
-                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
-              } catch (error) {
-                await locks.release(command.sessionPath, ownerId);
-                throw error;
-              }
+              const next = await openHandle(workspace, command.sessionPath);
+              await activateHandle(workspace, next);
+              send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
             }
             break;
           case "continue_recent":
             {
-              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const sessionPath = await mostRecentSessionPath(workspace.cwd);
               if (sessionPath) {
-                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
-                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                try {
-                  const next = await openHandle(activeWorkspace, sessionPath);
-                  await activateHandle(activeWorkspace, next);
-                  send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
-                } catch (error) {
-                  await locks.release(sessionPath, ownerId);
-                  throw error;
-                }
+                const next = await openHandle(workspace, sessionPath);
+                await activateHandle(workspace, next);
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
               } else {
-                await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
-                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
+                const next = await activateHandle(workspace, await createHandle(workspace));
+                send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
               }
             }
             break;
           case "new_session":
-            await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
-            send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false } });
+            {
+              const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+              const next = await activateHandle(workspace, await createHandle(workspace));
+              send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: false, runtimeId: next.id } });
+            }
             break;
           case "get_state":
-            send(ws, { type: "response", id, command: command.type, success: true, data: publicState(activeWorkspace, handle!.runtime.session) });
+            send(ws, { type: "response", id, command: command.type, success: true, data: scopedState(commandRuntime()) });
             break;
           case "get_messages":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { messages: handle!.runtime.session.messages } });
+            send(ws, { type: "response", id, command: command.type, success: true, data: scopedMessages(commandRuntime()) });
             break;
           case "get_resources":
-            send(ws, { type: "response", id, command: command.type, success: true, data: publicResources(handle!.runtime.session) });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedResources(active) });
+              if (isActive(active)) send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           case "reload_resources":
-            await handle!.runtime.session.reload();
-            send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            {
+              const active = commandRuntime();
+              await active.runtime.session.reload();
+              send(ws, { type: "response", id, command: command.type, success: true });
+              if (isActive(active)) send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           case "invoke_command": {
             if (!command.commandName) throw new Error("Missing commandName");
+            const active = commandRuntime();
+            const workspace = active.workspace;
             const name = command.commandName.replace(/^\//, "");
             if (name === "new") {
-              await activateHandle(activeWorkspace, await createHandle(activeWorkspace));
+              await activateHandle(workspace, await createHandle(workspace));
             } else if (name === "resume") {
-              const sessionPath = await mostRecentSessionPath(activeWorkspace.cwd);
+              const sessionPath = await mostRecentSessionPath(workspace.cwd);
               if (sessionPath) {
-                const lock = await locks.claim(sessionPath, activeWorkspace, ownerId);
-                if (lock.owner === "other") throw lockConflictError(sessionPath, lock.lock);
-                try {
-                  await activateHandle(activeWorkspace, await openHandle(activeWorkspace, sessionPath));
-                } catch (error) {
-                  await locks.release(sessionPath, ownerId);
-                  throw error;
-                }
+                await activateHandle(workspace, await openHandle(workspace, sessionPath));
               }
             } else if (name === "clone") {
-              const leafId = handle!.runtime.session.sessionManager.getLeafId();
+              const leafId = active.runtime.session.sessionManager.getLeafId();
               if (leafId) {
-                const previous = handle!.runtime.session.sessionFile;
-                const result = await handle!.runtime.fork(leafId, { position: "at" });
-                if (!result.cancelled) await locks.release(previous, ownerId);
+                await forkHandle(active, leafId, "at");
               }
-            } else if (name === "compact") await handle!.runtime.session.compact();
-            else if (name === "export") await handle!.runtime.session.exportToHtml();
-            else if (name === "reload") await handle!.runtime.session.reload();
-            else await handle!.runtime.session.prompt(`/${name}`);
+            } else if (name === "compact") await active.runtime.session.compact();
+            else if (name === "export") await active.runtime.session.exportToHtml();
+            else if (name === "reload") await active.runtime.session.reload();
+            else await active.runtime.session.prompt(`/${name}`);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "resources", data: publicResources(handle!.runtime.session) });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "resources", data: scopedResources(active) });
+            }
             break;
           }
           case "get_models":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { models: publicModels(handle!.runtime.session) } });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedModels(active) });
+              if (isActive(active)) send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           case "get_tree":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { entries: publicTree(handle!.runtime.session) } });
-            send(ws, { type: "tree", data: { entries: publicTree(handle!.runtime.session) } });
+            {
+              const active = commandRuntime();
+              send(ws, { type: "response", id, command: command.type, success: true, data: scopedTree(active) });
+              if (isActive(active)) send(ws, { type: "tree", data: scopedTree(active) });
+            }
             break;
           case "prompt": {
-            const session = handle!.runtime.session;
-            const workspace = activeWorkspace;
+            const active = commandRuntime();
+            const session = active.runtime.session;
+            const workspace = active.workspace;
             if (!command.message?.trim()) throw new Error("Missing message");
             send(ws, { type: "response", id, command: command.type, success: true });
             await session.prompt(command.message, { streamingBehavior: command.streamingBehavior });
-            if (handle?.runtime.session === session && activeWorkspace.id === workspace.id) {
-              send(ws, { type: "state", data: publicState(workspace, session) });
-              send(ws, { type: "tree", data: { entries: publicTree(session) } });
+            await refreshSessionIdentity(active);
+            if (isActive(active) && active.runtime.session === session) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "tree", data: scopedTree(active) });
             }
             await sendWorkspaceSessions(workspace);
             break;
           }
           case "steer":
             if (!command.message?.trim()) throw new Error("Missing message");
-            await handle!.runtime.session.steer(command.message);
+            await commandRuntime().runtime.session.steer(command.message);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "follow_up":
             if (!command.message?.trim()) throw new Error("Missing message");
-            await handle!.runtime.session.followUp(command.message);
+            await commandRuntime().runtime.session.followUp(command.message);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "abort":
-            await handle!.runtime.session.abort();
+            await commandRuntime().runtime.session.abort();
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "fork":
             if (!command.entryId) throw new Error("Missing entryId");
-            const previousForkSessionFile = handle!.runtime.session.sessionFile;
-            const forkResult = await handle!.runtime.fork(command.entryId, { position: "before" });
-            if (!forkResult.cancelled) await locks.release(previousForkSessionFile, ownerId);
+            const forkResult = await forkHandle(commandRuntime(), command.entryId, "before");
             send(ws, { type: "response", id, command: command.type, success: !forkResult.cancelled, data: { cancelled: forkResult.cancelled, selectedText: forkResult.selectedText }, error: forkResult.cancelled ? "Fork cancelled by extension." : undefined });
             break;
           case "clone": {
-            const leafId = handle!.runtime.session.sessionManager.getLeafId();
+            const active = commandRuntime();
+            const leafId = active.runtime.session.sessionManager.getLeafId();
             if (!leafId) throw new Error("No current session entry to clone");
-            const previousCloneSessionFile = handle!.runtime.session.sessionFile;
-            const cloneResult = await handle!.runtime.fork(leafId, { position: "at" });
-            if (!cloneResult.cancelled) await locks.release(previousCloneSessionFile, ownerId);
+            const cloneResult = await forkHandle(active, leafId, "at");
             send(ws, { type: "response", id, command: command.type, success: !cloneResult.cancelled, data: cloneResult, error: cloneResult.cancelled ? "Clone cancelled by extension." : undefined });
             break;
           }
           case "compact": {
-            const result = await handle!.runtime.session.compact(command.customInstructions);
+            const active = commandRuntime();
+            const result = await active.runtime.session.compact(command.customInstructions);
             send(ws, { type: "response", id, command: command.type, success: true, data: result });
-            send(ws, { type: "messages", data: { messages: handle!.runtime.session.messages } });
-            send(ws, { type: "tree", data: { entries: publicTree(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "messages", data: scopedMessages(active) });
+              send(ws, { type: "tree", data: scopedTree(active) });
+            }
             break;
           }
-          case "set_session_name":
-            handle!.runtime.session.setSessionName(command.name ?? "");
+          case "set_session_name": {
+            const active = commandRuntime();
+            active.runtime.session.setSessionName(command.name ?? "");
             send(ws, { type: "response", id, command: command.type, success: true });
-            await sendWorkspaceSessions(activeWorkspace);
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
+            await sendWorkspaceSessions(active.workspace);
+            if (isActive(active)) send(ws, { type: "state", data: scopedState(active) });
             break;
+          }
           case "export_html": {
-            const outputPath = await handle!.runtime.session.exportToHtml();
+            const outputPath = await commandRuntime().runtime.session.exportToHtml();
             send(ws, { type: "response", id, command: command.type, success: true, data: { outputPath } });
             send(ws, { type: "notification", data: { level: "info", message: `Exported session to ${outputPath}` } });
             break;
           }
           case "cycle_model": {
-            const result = await handle!.runtime.session.cycleModel();
+            const active = commandRuntime();
+            const result = await active.runtime.session.cycleModel();
             send(ws, { type: "response", id, command: command.type, success: true, data: result });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           }
           case "set_model": {
             if (!command.provider || !command.modelId) throw new Error("Missing provider/modelId");
-            const model = handle!.runtime.session.modelRegistry.find(command.provider, command.modelId);
+            const active = commandRuntime();
+            const model = active.runtime.session.modelRegistry.find(command.provider, command.modelId);
             if (!model) throw new Error(`Unknown model: ${command.provider}/${command.modelId}`);
-            await handle!.runtime.session.setModel(model);
+            await active.runtime.session.setModel(model);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
-            send(ws, { type: "models", data: { models: publicModels(handle!.runtime.session) } });
+            if (isActive(active)) {
+              send(ws, { type: "state", data: scopedState(active) });
+              send(ws, { type: "models", data: scopedModels(active) });
+            }
             break;
           }
-          case "set_thinking_level":
+          case "set_thinking_level": {
             if (!command.level) throw new Error("Missing thinking level");
-            handle!.runtime.session.setThinkingLevel(command.level);
+            const active = commandRuntime();
+            active.runtime.session.setThinkingLevel(command.level);
             send(ws, { type: "response", id, command: command.type, success: true });
-            send(ws, { type: "state", data: publicState(activeWorkspace, handle!.runtime.session) });
+            if (isActive(active)) send(ws, { type: "state", data: scopedState(active) });
             break;
+          }
           case "list_files": {
-            const files = await listWorkspaceFiles(activeWorkspace.cwd);
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const files = await listWorkspaceFiles(workspace.cwd);
             send(ws, { type: "response", id, command: command.type, success: true, data: { files } });
-            send(ws, { type: "files", data: { workspaceId: activeWorkspace.id, files } });
+            send(ws, { type: "files", data: { workspaceId: workspace.id, files } });
             break;
           }
           case "open_in_editor": {
             if (!command.editor || !command.path) throw new Error("Missing editor or path");
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
             // Path comes from the client as workspace-relative (the same shape
-            // we ship in the `files` packet). Resolve against the active
+            // we ship in the `files` packet). Resolve against the target
             // workspace so the editor opens the right absolute location.
-            const abs = path.resolve(activeWorkspace.cwd, command.path);
+            const abs = path.resolve(workspace.cwd, command.path);
             // Don't allow escaping the workspace via "../" — keep this strictly
             // bounded so a misbehaving client can't `open -R /Users/.../id_rsa`.
-            const rel = path.relative(activeWorkspace.cwd, abs);
+            const rel = path.relative(workspace.cwd, abs);
             if (rel.startsWith("..") || path.isAbsolute(rel)) {
-              throw new Error("Path is outside the active workspace");
+              throw new Error("Path is outside the target workspace");
             }
             await openInEditor(command.editor, abs);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
           case "get_git": {
-            const snapshot = await gitSnapshot(activeWorkspace.cwd);
+            const workspace = workspaceFromCommand(store, activeWorkspace, command.workspaceId);
+            const snapshot = await gitSnapshot(workspace.cwd);
             send(ws, { type: "response", id, command: command.type, success: true, data: snapshot });
-            send(ws, { type: "git", data: snapshot });
+            send(ws, { type: "git", data: { ...snapshot, workspaceId: workspace.id, snapshot } });
             break;
           }
           case "get_settings":
@@ -1803,8 +2047,13 @@ async function main() {
           }
           case "extension_ui_response":
             if (!command.uiRequestId) throw new Error("Missing uiRequestId");
-            pendingUi.get(command.uiRequestId)?.(command.value);
-            pendingUi.delete(command.uiRequestId);
+            {
+              const uiHandle = command.runtimeId
+                ? runtimesById.get(command.runtimeId)
+                : [...runtimesById.values()].find((candidate) => candidate.pendingUi.has(command.uiRequestId!));
+              uiHandle?.pendingUi.get(command.uiRequestId)?.(command.value);
+              uiHandle?.pendingUi.delete(command.uiRequestId);
+            }
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           case "extension_input": {
@@ -1812,16 +2061,18 @@ async function main() {
             // (e.g. autoresearch's fullscreen dashboard). Silently dropped
             // when there's no overlay; that's fine — extra keystrokes after
             // close are racy anyway.
+            const inputHandle = command.runtimeId ? runtimesById.get(command.runtimeId) : handle;
             if (typeof command.data === "string" && command.data.length > 0) {
-              widgetHost.dispatchInput(command.data);
+              inputHandle?.widgetHost.dispatchInput(command.data);
             }
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
           case "trigger_shortcut": {
-            if (!command.key || !handle) throw new Error("Missing key or no active session");
+            const active = commandRuntime();
+            if (!command.key) throw new Error("Missing key");
             const target = canonicalKeyId(command.key);
-            const shortcuts = handle.runtime.session.extensionRunner.getShortcuts({});
+            const shortcuts = active.runtime.session.extensionRunner.getShortcuts({});
             const matchedHandler = (() => {
               for (const [registeredKey, sc] of shortcuts) {
                 if (canonicalKeyId(registeredKey) === target) return sc.handler;
@@ -1836,7 +2087,7 @@ async function main() {
             // don't want to block the WS message loop on a slow one. The cast
             // sidesteps the strict ExtensionContext shape; our buildExtension-
             // Context returns a structurally-compatible subset.
-            void Promise.resolve(matchedHandler(buildExtensionContext(handle, extensionUi) as Parameters<typeof matchedHandler>[0]))
+            void Promise.resolve(matchedHandler(buildExtensionContext(active, active.extensionUi) as Parameters<typeof matchedHandler>[0]))
               .catch((error) => send(ws, { type: "notification", data: { message: `Shortcut handler failed: ${error instanceof Error ? error.message : String(error)}`, level: "error" } }));
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
@@ -1852,22 +2103,17 @@ async function main() {
           success: false,
           error: error instanceof Error ? error.message : String(error),
         });
-        if (handle) send(ws, { type: "state", data: publicState(activeWorkspace, handle.runtime.session) });
+        if (handle) send(ws, { type: "state", data: scopedState(handle) });
       }
     });
 
     ws.on("close", async () => {
-      unsubscribe?.();
-      widgetHost.reset();
-      for (const resolve of pendingUi.values()) resolve(undefined);
-      pendingUi.clear();
-      await Promise.all([...handles.values()].map(async (existing) => {
-        await locks.release(existing.runtime.session.sessionFile, ownerId);
-        await existing.runtime.dispose();
-      }));
-      for (const releaseStatus of statusUnsubscribes.values()) releaseStatus();
-      statusUnsubscribes.clear();
-      handles.clear();
+      for (const timer of sessionRefreshTimers.values()) clearTimeout(timer);
+      sessionRefreshTimers.clear();
+      await Promise.all([...runtimesById.values()].map(disposeRuntime));
+      runtimesById.clear();
+      runtimeIdBySessionKey.clear();
+      activeRuntimeByWorkspace.clear();
     });
   });
 

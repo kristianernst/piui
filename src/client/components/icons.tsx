@@ -100,6 +100,13 @@ export const IconArrowUpSlim = ({ size = 16, className, title }: SlimProps) => (
   </svg>
 );
 
+export const IconArrowLeftSlim = ({ size = 16, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <path d="M19 12H5M11 6l-6 6 6 6" />
+  </svg>
+);
+
 // Git branch — two nodes on the left rail and a single branch arc forking off
 // to a third node on the right. The hairline weight matches IconPlus/IconClose
 // so this lives next to monospaced text without overpowering it.

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type CSSProperties } from "react";
 
 // Each Pi session gets a chunky, alive pixel orb — a tiny self-contained
 // particle simulation rendered into a 22×22 canvas, displayed via
@@ -146,11 +146,16 @@ function initOrbState(seed: string, palette: string[]): OrbState {
   };
 }
 
-export function AgentOrb({ seed, running, size = 18 }: { seed: string; running: boolean; size?: number }) {
+export function AgentOrb({ seed, running, size = 18, glow = false }: { seed: string; running: boolean; size?: number; glow?: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<OrbState | null>(null);
 
   const palette = useMemo(() => paletteFor(seed || "default"), [seed]);
+  const shellStyle = {
+    width: size,
+    height: size,
+    "--orb-glow": palette[Math.max(1, palette.length - 3)],
+  } as CSSProperties & Record<"--orb-glow", string>;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -299,16 +304,18 @@ export function AgentOrb({ seed, running, size = 18 }: { seed: string; running: 
 
   return (
     <span
-      className="orb"
-      style={{ width: size, height: size, background: palette[0] }}
+      className={`orb-shell${glow && running ? " running" : ""}`}
+      style={shellStyle}
       aria-hidden="true"
     >
-      <canvas
-        ref={canvasRef}
-        width={ORB_GRID}
-        height={ORB_GRID}
-        className="orb-canvas"
-      />
+      <span className="orb" style={{ background: palette[0] }}>
+        <canvas
+          ref={canvasRef}
+          width={ORB_GRID}
+          height={ORB_GRID}
+          className="orb-canvas"
+        />
+      </span>
     </span>
   );
 }
