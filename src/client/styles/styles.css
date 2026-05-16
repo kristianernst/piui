@@ -336,6 +336,22 @@ body.dark {
   font-size: 14px;
   line-height: 1.6;
 }
+.empty .primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: var(--ink);
+  color: var(--surface);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.15s var(--ease), transform 0.15s var(--ease);
+}
+.empty .primary:hover { opacity: 0.9; }
+.empty .primary:active { transform: translateY(1px); }
 /* ------- Messages ------- */
 .msg { margin-bottom: 28px; }
 .msg.user {
@@ -352,6 +368,117 @@ body.dark {
   color: var(--ink);
   line-height: 1.5;
   font-size: 14px;
+  display: grid;
+  gap: 8px;
+  white-space: pre-wrap;
+}
+.bubbleText { min-width: 0; }
+.attachmentList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.attachmentList.compact {
+  max-width: min(520px, 100%);
+}
+.attachmentPreview {
+  --attachment-accent: var(--muted);
+  --attachment-border: var(--hairline);
+  --attachment-tint: oklch(from var(--muted) l c h / 0.08);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.attachmentPreview.type-image,
+.attachmentChip.type-image {
+  --attachment-accent: oklch(0.62 0.16 250);
+  --attachment-border: oklch(0.62 0.16 250 / 0.24);
+  --attachment-tint: oklch(0.62 0.16 250 / 0.10);
+}
+.attachmentPreview.type-code,
+.attachmentChip.type-code {
+  --attachment-accent: oklch(0.58 0.16 286);
+  --attachment-border: oklch(0.58 0.16 286 / 0.24);
+  --attachment-tint: oklch(0.58 0.16 286 / 0.10);
+}
+.attachmentPreview.type-data,
+.attachmentChip.type-data {
+  --attachment-accent: oklch(0.57 0.13 170);
+  --attachment-border: oklch(0.57 0.13 170 / 0.24);
+  --attachment-tint: oklch(0.57 0.13 170 / 0.10);
+}
+.attachmentPreview.type-sheet,
+.attachmentChip.type-sheet {
+  --attachment-accent: oklch(0.60 0.14 145);
+  --attachment-border: oklch(0.60 0.14 145 / 0.24);
+  --attachment-tint: oklch(0.60 0.14 145 / 0.10);
+}
+.attachmentPreview.type-doc,
+.attachmentChip.type-doc {
+  --attachment-accent: oklch(0.59 0.13 225);
+  --attachment-border: oklch(0.59 0.13 225 / 0.24);
+  --attachment-tint: oklch(0.59 0.13 225 / 0.10);
+}
+.attachmentPreview.type-log,
+.attachmentChip.type-log {
+  --attachment-accent: oklch(0.62 0.13 70);
+  --attachment-border: oklch(0.62 0.13 70 / 0.28);
+  --attachment-tint: oklch(0.62 0.13 70 / 0.11);
+}
+.attachmentPreview.state-truncated,
+.attachmentChip.state-truncated {
+  --attachment-accent: var(--warn);
+  --attachment-border: oklch(from var(--warn) l c h / 0.32);
+  --attachment-tint: oklch(from var(--warn) l c h / 0.12);
+}
+.attachmentImageThumb {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.attachmentImageThumb img {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 5px;
+  border: 1px solid var(--attachment-border);
+  background: var(--card);
+}
+.attachmentPreview.text .attachmentFileIcon {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+  color: var(--attachment-accent);
+  background: var(--attachment-tint);
+  flex: 0 0 auto;
+}
+.attachmentName {
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Slim cap — long names get the middle. The hover preview still shows the
+     full name + size in its footer, so truncation here is safe. */
+  max-width: 180px;
+}
+.attachmentFlag {
+  flex: 0 0 auto;
+  font: 9.5px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: oklch(from var(--warn) l c h / 0.12);
 }
 .msg.assistant {
   color: var(--ink-soft);
@@ -1087,7 +1214,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .composer {
   position: relative;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
+  align-items: stretch;
   gap: 4px;
   min-height: 44px;
   background: var(--card);
@@ -1096,48 +1224,308 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   padding: 6px;
   transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
+.composer.dragging {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px oklch(from var(--accent) l c h / 0.08);
+}
+.composerInputRow {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  min-width: 0;
+}
+.attachmentShelf {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 34px 4px 34px;
+  scrollbar-width: none;
+}
+.attachmentShelf::-webkit-scrollbar { display: none; }
+.attachmentChip {
+  --attachment-accent: var(--muted);
+  --attachment-border: var(--hairline);
+  --attachment-tint: oklch(from var(--muted) l c h / 0.08);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 240px;
+  padding: 4px 4px 4px 6px;
+  border: 1px solid var(--attachment-border);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.attachmentChip button {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.attachmentChip button:hover { background: oklch(from var(--ink) l c h / 0.08); color: var(--ink); }
+
+/* Shared hover preview shell. Portaled to <body> with position:fixed so it
+   never gets clipped by ancestor `overflow: hidden`. JS picks top/bottom
+   placement based on viewport room. */
+.attachmentHover,
+.mentionTokenHover {
+  position: relative;
+  display: inline-flex;
+  isolation: isolate;
+}
+.mentionTokenHover { display: inline; }
+.hoverPanel {
+  max-width: calc(100vw - 16px);
+  padding: 8px;
+  background: var(--card);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 14px;
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.04),
+    0 24px 48px oklch(0 0 0 / 0.18);
+  display: grid;
+  gap: 6px;
+  z-index: 9999;
+  opacity: 0;
+  transition:
+    opacity 160ms var(--ease),
+    translate 220ms var(--ease);
+  /* Slight offset that resolves to "0" when .visible is added — the
+     existing `transform` is reserved for the placement flip. */
+  translate: 0 6px;
+}
+.hoverPanel[data-placement="top"] { translate: 0 -6px; }
+.hoverPanel.visible { opacity: 1; translate: 0 0; }
+.hoverPanelFoot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font: 10.5px var(--mono);
+  color: var(--faint);
+  padding: 0 2px;
+}
+.hoverPanelName {
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+
+/* Mention token preview — the structured card shown when hovering a
+   recognized $skill / /command / @file in a sent message. */
+.mentionPreview { display: grid; gap: 6px; padding: 2px; }
+.mentionPreviewHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mentionPreviewKind {
+  font: 9.5px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: oklch(from var(--accent) l c h / 0.10);
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.mentionPreviewName {
+  font: 600 13.5px var(--mono);
+  color: var(--ink);
+  letter-spacing: -0.005em;
+  word-break: break-word;
+}
+.mentionPreviewDesc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+.mentionPreviewMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mentionPreviewTag {
+  font: 10px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: oklch(from var(--ink) l c h / 0.05);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.mentionPreviewPath {
+  font: 11px var(--mono);
+  color: var(--faint);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  word-break: break-all;
+}
+.mentionPreviewCounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font: 11px var(--mono);
+  color: var(--muted);
+  padding: 4px 0 0;
+  border-top: 1px solid var(--hairline);
+}
+.mentionPreviewCounts strong {
+  color: var(--ink);
+  font-weight: 700;
+  margin-right: 2px;
+}
+.attachmentHoverMedia {
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border-radius: 8px;
+  padding: 2px;
+  max-height: 280px;
+  overflow: hidden;
+}
+.attachmentHoverImage {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+  border-radius: 4px;
+}
+.attachmentHoverScroll {
+  /* No inner border or background — the outer panel already provides the
+     visual container. Otherwise the rendered markdown sits inside a box
+     inside a box, which read as cluttered. */
+  position: relative;
+  max-height: 280px;
+  overflow: hidden;
+  padding: 2px 2px 6px;
+  background: transparent;
+  /* Fade the bottom edge so the excerpt reads as partial, not abrupt. */
+  mask-image: linear-gradient(to bottom, #000 80%, transparent);
+}
+.attachmentHoverScroll .answer { font-size: 12.5px; line-height: 1.55; }
+.attachmentHoverScroll .answer p { margin: 0 0 8px; }
+.attachmentHoverScroll .answer .md-heading { margin: 4px 0 6px; font-size: 13px; }
+.attachmentHoverScroll .md-code { margin: 4px 0; max-height: 240px; }
+.attachmentHoverScroll .md-code code { font-size: 11px; }
+.attachmentHoverScroll pre.attachmentHoverText {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.attachmentHoverMore {
+  position: absolute;
+  right: 12px;
+  bottom: 6px;
+  font: 10.5px var(--mono);
+  color: var(--faint);
+  pointer-events: none;
+}
+/* Mention tokens inside user message bubbles + composer overlay. Only
+   recognized skills/commands get rendered here; the tokenizer leaves
+   unknown matches as plain text upstream. */
+.mentionToken {
+  display: inline;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+.mentionToken.kind-skill,
+.mentionToken.kind-command {
+  color: var(--accent);
+  background: oklch(from var(--accent) l c h / 0.10);
+  border-radius: 5px;
+  padding: 0 5px;
+  /* Slight negative margin keeps the chip aligned with surrounding text
+     baselines instead of pushing the line height. */
+  margin: 0 1px;
+}
+.mentionToken.kind-file { color: var(--ink); font-weight: 600; }
+.mentionToken-trigger {
+  opacity: 0.7;
+  margin-right: 0.5px;
+}
+.mentionToken.kind-file .mentionToken-trigger { color: var(--muted); }
+
+/* Inside the composer's mirror layer we drop the chip padding + background
+   so the painted span stays glyph-for-glyph aligned with the textarea below.
+   Any horizontal padding would visually shift surrounding characters and the
+   caret would no longer sit under what the user thinks they're typing. The
+   trigger character (`$`, `/`) remains visible here for the same reason —
+   hiding it would shorten the rendered string and drift the caret. */
+.composerTextHighlight .mentionToken {
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  border-radius: 0;
+}
+
+/* Inside sent message bubbles we hide the trigger so the recognized skill /
+   command reads as a chip with just the name. No caret to track here. */
+.bubbleText .mentionToken.kind-skill .mentionToken-trigger,
+.bubbleText .mentionToken.kind-command .mentionToken-trigger {
+  display: none;
+}
 
 /* Mention popover — anchored to the composer, sitting just above the textarea
-   so the user's eye stays close to where they're typing. */
+   so the user's eye stays close to where they're typing. Width mirrors the
+   composer so it never overflows beyond the chat input bounds. */
 .mention {
   position: absolute;
   bottom: calc(100% + 6px);
-  left: 8px;
-  right: 8px;
-  max-width: 460px;
+  left: 0;
+  right: 0;
   background: var(--card);
   border: 1px solid var(--hairline-strong);
-  border-radius: 12px;
-  box-shadow: 0 16px 40px oklch(0 0 0 / 0.10);
-  padding: 6px;
+  border-radius: 10px;
+  box-shadow: 0 12px 28px oklch(0 0 0 / 0.10);
+  padding: 4px;
   z-index: 30;
 }
 .mention-head {
-  font: 10px var(--mono);
+  font: 9.5px var(--mono);
   letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--faint);
-  padding: 4px 8px 6px;
+  padding: 3px 8px 4px;
 }
 .mention-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  max-height: 240px;
+  max-height: 200px;
   overflow-y: auto;
   display: grid;
-  gap: 1px;
+  gap: 0;
 }
 .mention-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
   align-items: baseline;
-  column-gap: 8px;
-  padding: 6px 8px;
+  gap: 10px;
+  padding: 4px 8px;
   border-radius: 6px;
   cursor: pointer;
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--ink-soft);
 }
+.mention-item > .mention-label { flex: 0 0 auto; max-width: 50%; }
+.mention-item > .mention-desc { flex: 1 1 auto; min-width: 0; }
+.mention-item > .mention-group { flex: 0 0 auto; margin-left: auto; }
 .mention-item.active {
   background: oklch(from var(--ink) l c h / 0.06);
   color: var(--ink);
@@ -1148,39 +1536,82 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.mention-item.emphasis .mention-label {
+  color: var(--accent);
+  font-weight: 800;
+  letter-spacing: -0.005em;
+}
+.mention-item.emphasis.active {
+  background: oklch(from var(--accent) l c h / 0.08);
+}
+.mention-item.emphasis .mention-group {
+  color: var(--accent);
+  font-weight: 700;
+  opacity: 0.85;
+}
 .mention-desc {
-  grid-column: 1 / -1;
   color: var(--faint);
   font-size: 11.5px;
-  line-height: 1.35;
+  line-height: 1.3;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 .mention-group {
-  font: 10px var(--mono);
+  font: 9.5px var(--mono);
   color: var(--faint);
   letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 .composer:focus-within {
   border-color: var(--hairline-strong);
   box-shadow: 0 0 0 4px oklch(from var(--accent) l c h / 0.06);
 }
-.composer textarea {
+/* Layered text input: highlighter div behind, textarea on top. The two share
+   typography, padding, and box-sizing so glyph positions line up exactly —
+   any divergence causes the painted tokens to drift from the caret. */
+.composerText {
+  position: relative;
   flex: 1;
   min-width: 0;
+  display: grid;
+}
+.composerText > .composerTextHighlight,
+.composerText > .composerTextarea {
+  grid-area: 1 / 1;
   min-height: 30px;
   max-height: 160px;
   padding: 6px 8px;
   border: 0;
   outline: 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+.composerTextHighlight {
+  pointer-events: none;
+  color: var(--ink);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.composerTextHighlight::-webkit-scrollbar { display: none; }
+.composerTextarea {
+  position: relative;
   resize: none;
   background: transparent;
-  color: var(--ink);
-  line-height: 1.5;
-  font-size: 14px;
+  color: transparent;
+  caret-color: var(--ink);
+  /* Selection still needs visible text. WebKit/Blink lets us paint the fill
+     transparent without affecting selection foreground via this property. */
+  -webkit-text-fill-color: transparent;
 }
-.composer textarea::placeholder { color: var(--faint); }
+.composerTextarea::selection { color: var(--ink); background: oklch(from var(--accent) l c h / 0.22); -webkit-text-fill-color: var(--ink); }
+.composerTextarea::placeholder { color: var(--faint); -webkit-text-fill-color: var(--faint); }
 .add, .send {
   width: 30px; height: 30px;
   border-radius: 50%;
@@ -1194,6 +1625,8 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   transition: background 0.15s var(--ease), color 0.15s var(--ease);
 }
 .add:hover, .send:hover { background: oklch(from var(--ink) l c h / 0.05); color: var(--ink); }
+.add:disabled, .send:disabled { opacity: 0.45; cursor: default; }
+.add:disabled:hover, .send:disabled:hover { background: transparent; color: var(--muted); }
 .send.stop { color: var(--ink); }
 .send.stop:hover { background: oklch(from var(--ink) l c h / 0.08); }
 
@@ -2323,8 +2756,7 @@ body.dark .settingsNav-item.active { background: oklch(0.26 0.006 270); }
   white-space: normal;
   line-height: 1.3;
 }
-.settingsRow > select,
-.settingsRow > .settingsToggle { align-self: center; }
+.settingsRow > select { align-self: center; }
 .settingsRow select {
   background: var(--paper);
   color: var(--ink);
@@ -2340,22 +2772,6 @@ body.dark .settingsNav-item.active { background: oklch(0.26 0.006 270); }
 .settingsRow select:hover { border-color: var(--hairline-strong); }
 .settingsRow select:focus { border-color: var(--ink-soft); }
 .settingsRow select:disabled { opacity: 0.6; cursor: not-allowed; }
-.settingsToggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 9px;
-  background: var(--paper);
-  border: 1px solid var(--hairline);
-  border-radius: 8px;
-  color: var(--ink);
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-  justify-self: start;
-  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
-}
-.settingsToggle:hover { background: var(--card); border-color: var(--hairline-strong); }
 .settingsSectionTitle {
   grid-column: 1 / -1;
   display: flex;
@@ -2716,6 +3132,5 @@ body.dark .settingsNav-item.active { background: oklch(0.26 0.006 270); }
   .settingsSection.settingsResources { min-height: 0; }
   .resourceGroup { min-height: 0; }
   .resourceList { max-height: 300px; flex: 0 1 auto; }
-  .settingsRow > select,
-  .settingsRow > .settingsToggle { width: 100%; justify-self: stretch; }
+  .settingsRow > select { width: 100%; justify-self: stretch; }
 }

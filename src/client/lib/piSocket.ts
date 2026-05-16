@@ -80,12 +80,58 @@ export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "x
 
 export type PiModelRef = { provider: string; modelId: string };
 
+export type PiAppearanceSettings = {
+  colorScheme: "system" | "light" | "dark";
+  leftSidebarOpen: boolean;
+  rightSidebarOpen: boolean;
+  rightSidebarWidth: number;
+};
+
+export type PromptAttachment =
+  | {
+      id: string;
+      kind: "image";
+      name: string;
+      mimeType: string;
+      data: string;
+      size: number;
+      width?: number;
+      height?: number;
+      originalWidth?: number;
+      originalHeight?: number;
+    }
+  | {
+      id: string;
+      kind: "text";
+      name: string;
+      mimeType?: string;
+      text: string;
+      size: number;
+      truncated?: boolean;
+    };
+
 export type PiSettings = {
   defaultModel: PiModelRef | null;
   defaultThinkingLevel: PiThinkingLevel | null;
   titleModel: PiModelRef | null;
   showStarterPrompts: boolean;
+  appearance: PiAppearanceSettings;
 };
+
+export type PiNavigationState = {
+  activeWorkspaceId?: string;
+  activeSessionPathByWorkspace: Record<string, string>;
+  openWorkspaceIds: string[];
+  expandedSessionWorkspaceIds: string[];
+  openFileTreePathsByWorkspace: Record<string, string[]>;
+  rightSidebarTab: "diffs" | "files";
+  updatedAt?: string;
+};
+
+export type PiNavigationPatch = Partial<Pick<
+  PiNavigationState,
+  "openWorkspaceIds" | "expandedSessionWorkspaceIds" | "openFileTreePathsByWorkspace" | "rightSidebarTab"
+>>;
 
 export type GitFileStatus = {
   path: string;
@@ -161,9 +207,10 @@ export type SessionExtensionWidget = SessionScoped<{ slot: string; lines?: strin
 export type SessionShortcuts = SessionScoped<{ shortcuts: Array<{ key: string; description?: string }> }>;
 
 export type PiPacket =
-  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string; state: SessionStateSnapshot; settings?: PiSettings; editors?: Array<{ id: string; label: string; hasIcon: boolean }> } }
-  | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string } }
+  | { type: "ready"; data: { workspaces: Workspace[]; activeWorkspaceId: string | null; state: SessionStateSnapshot | null; settings?: PiSettings; editors?: Array<{ id: string; label: string; hasIcon: boolean }>; navigation?: PiNavigationState } }
+  | { type: "workspaces"; data: { workspaces: Workspace[]; activeWorkspaceId: string | null } }
   | { type: "workspace"; data: Workspace }
+  | { type: "navigation"; data: PiNavigationState }
   | { type: "sessions"; data: { workspaceId: string; sessions: PiSessionInfo[] } }
   | { type: "state"; data: SessionStateSnapshot }
   | { type: "messages"; data: SessionMessagesSnapshot }
@@ -197,6 +244,7 @@ export type PiWorkspaceCommand =
   | { id?: string; type: "list_files"; workspaceId: string }
   | { id?: string; type: "get_git"; workspaceId: string }
   | { id?: string; type: "set_settings"; settings: Partial<PiSettings> }
+  | { id?: string; type: "set_navigation"; navigation: PiNavigationPatch }
   | { id?: string; type: "open_in_editor"; workspaceId: string; editor: string; path: string };
 
 export type PiSessionCommand =
@@ -204,8 +252,8 @@ export type PiSessionCommand =
   | RoutedCommand<{ id?: string; type: "reload_resources" | "abort" | "clone" | "export_html" }>
   | RoutedCommand<{ id?: string; type: "compact"; customInstructions?: string }>
   | RoutedCommand<{ id?: string; type: "fork"; entryId: string }>
-  | RoutedCommand<{ id?: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp"; clientMessageId?: string }>
-  | RoutedCommand<{ id?: string; type: "steer" | "follow_up"; message: string }>
+  | RoutedCommand<{ id?: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp"; clientMessageId?: string; attachments?: PromptAttachment[] }>
+  | RoutedCommand<{ id?: string; type: "steer" | "follow_up"; message: string; attachments?: PromptAttachment[] }>
   | RoutedCommand<{ id?: string; type: "invoke_command"; commandName: string }>
   | RoutedCommand<{ id?: string; type: "set_session_name"; name: string }>
   | RoutedCommand<{ id?: string; type: "cycle_model" }>

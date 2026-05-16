@@ -26,20 +26,20 @@ import {
   getAgentDir,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
-import { completeSimple, type Api, type Model } from "@mariozechner/pi-ai";
+import { completeSimple, type Api, type ImageContent, type Model } from "@mariozechner/pi-ai";
 import { WidgetHost, OVERLAY_SLOT } from "./tui-shim.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === "production";
 const port = Number(process.env.PORT ?? 5174);
 const initialCwd = path.resolve(process.env.PIUI_CWD ?? process.cwd());
-// Pi piui re-adds `initialCwd` on every startup, so the launch directory can
-// never truly be removed from the sidebar — pinning it makes that explicit
-// (no × on hover, server rejects remove_workspace for this id).
-const initialWorkspaceId = crypto.createHash("sha1").update(initialCwd).digest("hex").slice(0, 12);
+// `initialCwd` is just the directory piui was launched from — it gets
+// seeded as the first workspace on a fresh install, but is otherwise no
+// different from any other workspace and can be detached freely.
 const agentDir = getAgentDir();
 const workspaceFile = path.join(agentDir, "piui-workspaces.json");
 const settingsFile = path.join(agentDir, "piui-settings.json");
+const navigationFile = path.join(agentDir, "piui-navigation.json");
 const lockDir = path.join(agentDir, "piui-locks");
 const localToken = process.env.PIUI_TOKEN ?? crypto.randomBytes(24).toString("base64url");
 
@@ -340,6 +340,7 @@ type ClientCommand = {
     | "set_thinking_level"
     | "get_settings"
     | "set_settings"
+    | "set_navigation"
     | "list_files"
     | "get_git"
     | "extension_ui_response"
@@ -356,10 +357,12 @@ type ClientCommand = {
   message?: string;
   clientMessageId?: string;
   streamingBehavior?: "steer" | "followUp";
+  attachments?: PromptAttachment[];
   provider?: string;
   modelId?: string;
   level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   settings?: Partial<PiSettings>;
+  navigation?: NavigationPatch;
   runtimeId?: string;
   sessionId?: string;
   uiRequestId?: string;
@@ -372,24 +375,60 @@ type ClientCommand = {
 
 type ModelRef = { provider: string; modelId: string };
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type AppearanceSettings = {
+  colorScheme: "system" | "light" | "dark";
+  leftSidebarOpen: boolean;
+  rightSidebarOpen: boolean;
+  rightSidebarWidth: number;
+};
+type PromptAttachment =
+  | {
+      id: string;
+      kind: "image";
+      name: string;
+      mimeType: string;
+      data: string;
+      size: number;
+      width?: number;
+      height?: number;
+      originalWidth?: number;
+      originalHeight?: number;
+    }
+  | {
+      id: string;
+      kind: "text";
+      name: string;
+      mimeType?: string;
+      text: string;
+      size: number;
+      truncated?: boolean;
+    };
 type PiSettings = {
   // null = "use the currently selected chat model".
   defaultModel: ModelRef | null;
   defaultThinkingLevel: ThinkingLevel | null;
   titleModel: ModelRef | null;
   showStarterPrompts: boolean;
+  appearance: AppearanceSettings;
 };
 const DEFAULT_SETTINGS: PiSettings = {
   defaultModel: null,
   defaultThinkingLevel: null,
   titleModel: null,
   showStarterPrompts: false,
+  appearance: {
+    colorScheme: "system",
+    leftSidebarOpen: true,
+    rightSidebarOpen: true,
+    rightSidebarWidth: 244,
+  },
 };
 
 type ServerPacket =
   | { type: "ready"; data: unknown }
   | { type: "workspaces"; data: unknown }
   | { type: "workspace"; data: unknown }
+  | { type: "navigation"; data: unknown }
   | { type: "sessions"; data: unknown }
   | { type: "state"; data: unknown }
   | { type: "messages"; data: unknown }
@@ -457,7 +496,10 @@ class WorkspaceStore {
     await fs.mkdir(path.dirname(workspaceFile), { recursive: true });
     const data = await readJsonFile<{ workspaces?: Workspace[] }>(workspaceFile, {});
     for (const workspace of data.workspaces ?? []) this.workspaces.set(workspace.id, workspace);
-    await this.add(initialCwd);
+    // Seed the launch directory on first run only. Once the user has any
+    // persisted workspaces we treat piui as workspace-agnostic — re-adding
+    // the launch dir every startup would silently undo their removals.
+    if (this.workspaces.size === 0) await this.add(initialCwd);
   }
 
   list() {
@@ -508,18 +550,226 @@ class SettingsStore {
 
   async load() {
     const data = await readJsonFile<Partial<PiSettings>>(settingsFile, {});
-    this.settings = { ...DEFAULT_SETTINGS, ...data };
+    this.settings = normalizeSettings(data);
   }
 
   get(): PiSettings {
-    return { ...this.settings };
+    return cloneSettings(this.settings);
   }
 
   async update(patch: Partial<PiSettings>): Promise<PiSettings> {
-    this.settings = { ...this.settings, ...patch };
+    this.settings = normalizeSettings({
+      ...this.settings,
+      ...patch,
+      appearance: {
+        ...this.settings.appearance,
+        ...(patch.appearance ?? {}),
+      },
+    });
     await writeJsonFile(settingsFile, this.settings);
     return this.get();
   }
+}
+
+function cloneSettings(settings: PiSettings): PiSettings {
+  return { ...settings, appearance: { ...settings.appearance } };
+}
+
+function normalizeSettings(value: Partial<PiSettings>): PiSettings {
+  return {
+    defaultModel: normalizeModelRef(value.defaultModel),
+    defaultThinkingLevel: normalizeThinkingLevel(value.defaultThinkingLevel),
+    titleModel: normalizeModelRef(value.titleModel),
+    showStarterPrompts: Boolean(value.showStarterPrompts),
+    appearance: normalizeAppearanceSettings(value.appearance),
+  };
+}
+
+function normalizeModelRef(value: unknown): ModelRef | null {
+  if (!value || typeof value !== "object") return null;
+  const ref = value as Partial<ModelRef>;
+  return typeof ref.provider === "string" && typeof ref.modelId === "string"
+    ? { provider: ref.provider, modelId: ref.modelId }
+    : null;
+}
+
+function normalizeThinkingLevel(value: unknown): ThinkingLevel | null {
+  return value === "off"
+    || value === "minimal"
+    || value === "low"
+    || value === "medium"
+    || value === "high"
+    || value === "xhigh"
+    ? value
+    : null;
+}
+
+function normalizeAppearanceSettings(value: unknown): AppearanceSettings {
+  const raw = value && typeof value === "object" ? value as Partial<AppearanceSettings> : {};
+  const width = typeof raw.rightSidebarWidth === "number" && Number.isFinite(raw.rightSidebarWidth)
+    ? Math.min(640, Math.max(220, Math.round(raw.rightSidebarWidth)))
+    : DEFAULT_SETTINGS.appearance.rightSidebarWidth;
+  return {
+    colorScheme: raw.colorScheme === "light" || raw.colorScheme === "dark" ? raw.colorScheme : "system",
+    leftSidebarOpen: typeof raw.leftSidebarOpen === "boolean" ? raw.leftSidebarOpen : DEFAULT_SETTINGS.appearance.leftSidebarOpen,
+    rightSidebarOpen: typeof raw.rightSidebarOpen === "boolean" ? raw.rightSidebarOpen : DEFAULT_SETTINGS.appearance.rightSidebarOpen,
+    rightSidebarWidth: width,
+  };
+}
+
+type NavigationState = {
+  activeWorkspaceId?: string;
+  activeSessionPathByWorkspace: Record<string, string>;
+  openWorkspaceIds: string[];
+  expandedSessionWorkspaceIds: string[];
+  openFileTreePathsByWorkspace: Record<string, string[]>;
+  rightSidebarTab: "diffs" | "files";
+  updatedAt?: string;
+};
+
+type NavigationPatch = Partial<Pick<
+  NavigationState,
+  "openWorkspaceIds" | "expandedSessionWorkspaceIds" | "openFileTreePathsByWorkspace" | "rightSidebarTab"
+>>;
+
+const DEFAULT_NAVIGATION_STATE: NavigationState = {
+  activeSessionPathByWorkspace: {},
+  openWorkspaceIds: [],
+  expandedSessionWorkspaceIds: [],
+  openFileTreePathsByWorkspace: {},
+  rightSidebarTab: "diffs",
+};
+
+class NavigationStore {
+  private state: NavigationState = { ...DEFAULT_NAVIGATION_STATE };
+
+  async load() {
+    const data = await readJsonFile<Partial<NavigationState>>(navigationFile, {});
+    this.state = normalizeNavigationState(data);
+  }
+
+  get() {
+    return cloneNavigationState(this.state);
+  }
+
+  activeWorkspaceId() {
+    return this.state.activeWorkspaceId;
+  }
+
+  sessionPathFor(workspaceId: string) {
+    return this.state.activeSessionPathByWorkspace[workspaceId];
+  }
+
+  async remember(workspaceId: string, sessionPath?: string | null) {
+    const nextSessions = { ...this.state.activeSessionPathByWorkspace };
+    if (sessionPath) nextSessions[workspaceId] = sessionPath;
+    else delete nextSessions[workspaceId];
+    this.state = {
+      ...this.state,
+      activeWorkspaceId: workspaceId,
+      activeSessionPathByWorkspace: nextSessions,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.save();
+  }
+
+  async forgetWorkspace(workspaceId: string) {
+    const nextSessions = { ...this.state.activeSessionPathByWorkspace };
+    delete nextSessions[workspaceId];
+    const nextFileTree = { ...this.state.openFileTreePathsByWorkspace };
+    delete nextFileTree[workspaceId];
+    this.state = {
+      ...this.state,
+      activeWorkspaceId: this.state.activeWorkspaceId === workspaceId ? undefined : this.state.activeWorkspaceId,
+      activeSessionPathByWorkspace: nextSessions,
+      openWorkspaceIds: this.state.openWorkspaceIds.filter((id) => id !== workspaceId),
+      expandedSessionWorkspaceIds: this.state.expandedSessionWorkspaceIds.filter((id) => id !== workspaceId),
+      openFileTreePathsByWorkspace: nextFileTree,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.save();
+  }
+
+  async forgetSession(workspaceId: string, sessionPath: string) {
+    if (this.state.activeSessionPathByWorkspace[workspaceId] !== sessionPath) return;
+    const nextSessions = { ...this.state.activeSessionPathByWorkspace };
+    delete nextSessions[workspaceId];
+    this.state = {
+      ...this.state,
+      activeSessionPathByWorkspace: nextSessions,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.save();
+  }
+
+  async update(patch: NavigationPatch) {
+    this.state = normalizeNavigationState({
+      ...this.state,
+      ...patch,
+      activeSessionPathByWorkspace: this.state.activeSessionPathByWorkspace,
+      activeWorkspaceId: this.state.activeWorkspaceId,
+      updatedAt: new Date().toISOString(),
+    });
+    await this.save();
+    return this.get();
+  }
+
+  private async save() {
+    try {
+      await writeJsonFile(navigationFile, this.state);
+    } catch (error) {
+      console.warn(`Could not save ${navigationFile}:`, error);
+    }
+  }
+}
+
+function cloneNavigationState(state: NavigationState): NavigationState {
+  return {
+    ...state,
+    activeSessionPathByWorkspace: { ...state.activeSessionPathByWorkspace },
+    openWorkspaceIds: [...state.openWorkspaceIds],
+    expandedSessionWorkspaceIds: [...state.expandedSessionWorkspaceIds],
+    openFileTreePathsByWorkspace: Object.fromEntries(
+      Object.entries(state.openFileTreePathsByWorkspace).map(([workspaceId, paths]) => [workspaceId, [...paths]]),
+    ),
+  };
+}
+
+function normalizeNavigationState(value: Partial<NavigationState>): NavigationState {
+  return {
+    activeWorkspaceId: typeof value.activeWorkspaceId === "string" ? value.activeWorkspaceId : undefined,
+    activeSessionPathByWorkspace: stringRecord(value.activeSessionPathByWorkspace),
+    openWorkspaceIds: stringList(value.openWorkspaceIds),
+    expandedSessionWorkspaceIds: stringList(value.expandedSessionWorkspaceIds),
+    openFileTreePathsByWorkspace: stringListRecord(value.openFileTreePathsByWorkspace),
+    rightSidebarTab: value.rightSidebarTab === "files" ? "files" : "diffs",
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
+  };
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!value || typeof value !== "object") return out;
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof key === "string" && typeof raw === "string") out[key] = raw;
+  }
+  return out;
+}
+
+function stringList(value: unknown, limit = 500): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0))].slice(0, limit);
+}
+
+function stringListRecord(value: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  if (!value || typeof value !== "object") return out;
+  for (const [workspaceId, rawPaths] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof workspaceId !== "string") continue;
+    const paths = stringList(rawPaths, 2000);
+    out[workspaceId] = paths;
+  }
+  return out;
 }
 
 type SessionLock = {
@@ -755,8 +1005,11 @@ async function listSessions(cwd: string, liveSessions: AgentSession[] = []) {
   });
 }
 
-function workspaceFromCommand(store: WorkspaceStore, activeWorkspace: Workspace, workspaceId?: string) {
-  if (!workspaceId) return activeWorkspace;
+function workspaceFromCommand(store: WorkspaceStore, activeWorkspace: Workspace | undefined, workspaceId?: string): Workspace {
+  if (!workspaceId) {
+    if (!activeWorkspace) throw new Error("No active workspace. Open a workspace before running this command.");
+    return activeWorkspace;
+  }
   const workspace = store.get(workspaceId);
   if (!workspace) throw new Error(`Unknown workspace: ${workspaceId}`);
   return workspace;
@@ -765,6 +1018,11 @@ function workspaceFromCommand(store: WorkspaceStore, activeWorkspace: Workspace,
 async function mostRecentSessionPath(cwd: string) {
   const sessions = await SessionManager.list(cwd);
   return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0]?.path;
+}
+
+async function workspaceHasSession(cwd: string, sessionPath: string) {
+  const sessions = await SessionManager.list(cwd);
+  return sessions.some((session) => session.path === sessionPath);
 }
 
 const FILE_LIST_LIMIT = 4000;
@@ -939,12 +1197,10 @@ async function listWorkspaceFiles(cwd: string): Promise<string[]> {
   return collected;
 }
 
-// Decorate persisted workspaces with a derived `pinned` flag for the wire so
-// the client can hide the remove-X on the launch directory. We don't persist
-// `pinned` because it's a function of `initialCwd` (which is per-process), so
-// it'd go stale if the server is launched from a different cwd next time.
+// piui no longer treats the launch directory as special — workspaces are
+// all detachable. Kept as a thin wrapper so existing call sites stay tidy.
 function publicWorkspaces(store: WorkspaceStore) {
-  return store.list().map((workspace) => ({ ...workspace, pinned: workspace.id === initialWorkspaceId }));
+  return store.list().map((workspace) => ({ ...workspace }));
 }
 
 // Pull the plain text out of an agent message's content, ignoring tool calls,
@@ -1098,6 +1354,113 @@ function publicTree(session: AgentSession) {
           : "[user content]"
         : undefined,
   }));
+}
+
+const MAX_PROMPT_ATTACHMENTS = 12;
+const MAX_TEXT_ATTACHMENT_CHARS = 256 * 1024;
+const MAX_IMAGE_ATTACHMENT_BASE64_BYTES = 4.8 * 1024 * 1024;
+const supportedImageAttachmentTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+function normalizePromptAttachments(value: unknown): PromptAttachment[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("Invalid attachments payload");
+  if (value.length > MAX_PROMPT_ATTACHMENTS) throw new Error(`Too many attachments; max ${MAX_PROMPT_ATTACHMENTS}.`);
+
+  return value.map((raw, index): PromptAttachment => {
+    if (!raw || typeof raw !== "object") throw new Error(`Invalid attachment at index ${index}.`);
+    const attachment = raw as Record<string, unknown>;
+    const id = typeof attachment.id === "string" && attachment.id.trim() ? attachment.id.slice(0, 120) : crypto.randomUUID();
+    const name = typeof attachment.name === "string" && attachment.name.trim()
+      ? attachment.name.slice(0, 240)
+      : `attachment-${index + 1}`;
+    const size = typeof attachment.size === "number" && Number.isFinite(attachment.size) && attachment.size >= 0
+      ? attachment.size
+      : 0;
+
+    if (attachment.kind === "image") {
+      const mimeType = typeof attachment.mimeType === "string" ? attachment.mimeType.toLowerCase() : "";
+      if (!supportedImageAttachmentTypes.has(mimeType)) throw new Error(`Unsupported image type: ${mimeType || "unknown"}.`);
+      const data = typeof attachment.data === "string" ? attachment.data.replace(/^data:[^,]+,/, "") : "";
+      if (!data) throw new Error(`Missing image data for ${name}.`);
+      if (Buffer.byteLength(data, "utf8") > MAX_IMAGE_ATTACHMENT_BASE64_BYTES) {
+        throw new Error(`Image attachment is too large: ${name}.`);
+      }
+      return {
+        id,
+        kind: "image",
+        name,
+        mimeType,
+        data,
+        size,
+        width: numberField(attachment.width),
+        height: numberField(attachment.height),
+        originalWidth: numberField(attachment.originalWidth),
+        originalHeight: numberField(attachment.originalHeight),
+      };
+    }
+
+    if (attachment.kind === "text") {
+      const text = typeof attachment.text === "string" ? attachment.text.slice(0, MAX_TEXT_ATTACHMENT_CHARS) : "";
+      if (!text) throw new Error(`Missing text content for ${name}.`);
+      return {
+        id,
+        kind: "text",
+        name,
+        mimeType: typeof attachment.mimeType === "string" ? attachment.mimeType.slice(0, 120) : undefined,
+        text,
+        size,
+        truncated: Boolean(attachment.truncated) || (typeof attachment.text === "string" && attachment.text.length > MAX_TEXT_ATTACHMENT_CHARS),
+      };
+    }
+
+    throw new Error(`Unsupported attachment at index ${index}.`);
+  });
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function escapeFileAttribute(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function protectFileClosingTag(value: string) {
+  return value.replace(/<\/file>/gi, "<\\/file>");
+}
+
+function imageAttachmentNote(attachment: Extract<PromptAttachment, { kind: "image" }>) {
+  if (attachment.originalWidth && attachment.originalHeight && attachment.width && attachment.height) {
+    const scale = attachment.originalWidth / attachment.width;
+    if (attachment.originalWidth !== attachment.width || attachment.originalHeight !== attachment.height) {
+      return `[Image: original ${attachment.originalWidth}x${attachment.originalHeight}, displayed at ${attachment.width}x${attachment.height}. Multiply coordinates by ${scale.toFixed(2)} to map to original image.]`;
+    }
+  }
+  return "[Image attached]";
+}
+
+function buildPromptPayload(message: string | undefined, attachments: PromptAttachment[]) {
+  const parts: string[] = [];
+  const trimmed = message?.trim() ?? "";
+  if (trimmed) parts.push(trimmed);
+
+  const images: ImageContent[] = [];
+  for (const attachment of attachments) {
+    const name = escapeFileAttribute(attachment.name);
+    if (attachment.kind === "image") {
+      images.push({ type: "image", data: attachment.data, mimeType: attachment.mimeType });
+      parts.push(`<file name="${name}" mime="${escapeFileAttribute(attachment.mimeType)}">${imageAttachmentNote(attachment)}</file>`);
+    } else {
+      const truncated = attachment.truncated ? ` truncated="true"` : "";
+      const mime = attachment.mimeType ? ` mime="${escapeFileAttribute(attachment.mimeType)}"` : "";
+      parts.push(`<file name="${name}"${mime}${truncated}>\n${protectFileClosingTag(attachment.text)}\n</file>`);
+    }
+  }
+
+  return {
+    text: parts.join("\n\n"),
+    images: images.length ? images : undefined,
+  };
 }
 
 function waitForIdle(session: AgentSession) {
@@ -1284,9 +1647,11 @@ async function main() {
   const store = new WorkspaceStore();
   const locks = new LockStore();
   const settingsStore = new SettingsStore();
+  const navigationStore = new NavigationStore();
   await store.load();
   await locks.load();
   await settingsStore.load();
+  await navigationStore.load();
 
   const app = express();
   app.use(express.json());
@@ -1348,7 +1713,9 @@ async function main() {
   }
 
   wss.on("connection", async (ws) => {
-    let activeWorkspace = store.list()[0];
+    const rememberedWorkspaceId = navigationStore.activeWorkspaceId();
+    const rememberedWorkspace = rememberedWorkspaceId ? store.get(rememberedWorkspaceId) : undefined;
+    let activeWorkspace: Workspace | undefined = rememberedWorkspace ?? store.list()[0];
     let handle: RuntimeHandle | undefined;
     let activeRuntimeId: string | null = null;
     const runtimesById = new Map<string, RuntimeHandle>();
@@ -1481,6 +1848,9 @@ async function main() {
     async function refreshSessionIdentity(next: RuntimeHandle) {
       await claimRuntimeLock(next);
       registerHandle(next);
+      if (isActive(next)) {
+        await navigationStore.remember(next.workspace.id, next.runtime.session.sessionFile ?? null);
+      }
     }
 
     function maybeGenerateTitle(next: RuntimeHandle) {
@@ -1565,7 +1935,7 @@ async function main() {
       for (const packet of next.eventBuffer) {
         if (packet.data.seq > revision) send(ws, packet);
       }
-      send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
+      send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: next.workspace.id } });
     }
 
     async function createHandle(workspace: Workspace, options?: { mode?: "new" | "continue" | "open"; sessionPath?: string }) {
@@ -1698,6 +2068,7 @@ async function main() {
       const generation = ++activationGeneration;
       activeRuntimeByWorkspace.set(activeWorkspace.id, next.id);
       handle = next;
+      await navigationStore.remember(activeWorkspace.id, next.runtime.session.sessionFile ?? null);
       await sendActivationSnapshot(next, generation);
       return next;
     }
@@ -1712,9 +2083,27 @@ async function main() {
       return activateHandle(activeWorkspace, next);
     }
 
+    async function activateRemembered() {
+      if (!activeWorkspace) return;
+      const sessionPath = navigationStore.sessionPathFor(activeWorkspace.id);
+      if (sessionPath && await workspaceHasSession(activeWorkspace.cwd, sessionPath)) {
+        try {
+          return await activate(activeWorkspace, { mode: "open", sessionPath });
+        } catch (error) {
+          console.warn("Could not restore last Pi session:", error);
+          await navigationStore.forgetSession(activeWorkspace.id, sessionPath);
+        }
+      }
+      return activate(activeWorkspace);
+    }
+
     try {
-      await activate(activeWorkspace);
-      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id, state: scopedState(handle!), settings: settingsStore.get(), editors: availableEditors } });
+      await activateRemembered();
+      // `activeWorkspace`/`handle` may be undefined here when piui has no
+      // workspaces yet (first launch with the auto-seed gone, or after the
+      // user detached the last one). The client renders an Open Workspace
+      // empty state in that case.
+      send(ws, { type: "ready", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace?.id ?? null, state: handle ? scopedState(handle) : null, settings: settingsStore.get(), editors: availableEditors, navigation: navigationStore.get() } });
       send(ws, { type: "settings", data: settingsStore.get() });
     } catch (error) {
       send(ws, { type: "response", command: "connect", success: false, error: error instanceof Error ? error.message : String(error) });
@@ -1751,14 +2140,14 @@ async function main() {
         }
         switch (command.type) {
           case "list_workspaces":
-            send(ws, { type: "response", id, command: command.type, success: true, data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
-            send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace.id } });
+            send(ws, { type: "response", id, command: command.type, success: true, data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace?.id ?? null } });
+            send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: activeWorkspace?.id ?? null } });
             break;
           case "open_workspace": {
             // No cwd supplied → pop a native folder picker. Cancel = no-op.
             let cwd = command.cwd;
             if (!cwd) {
-              const picked = await pickFolderNative(activeWorkspace.cwd ?? initialCwd);
+              const picked = await pickFolderNative(activeWorkspace?.cwd ?? initialCwd);
               if (!picked) {
                 send(ws, { type: "response", id, command: command.type, success: true, data: { cancelled: true } });
                 break;
@@ -1780,13 +2169,24 @@ async function main() {
           }
           case "remove_workspace": {
             if (!command.workspaceId) throw new Error("Missing workspaceId");
-            if (command.workspaceId === initialWorkspaceId) {
-              throw new Error("This workspace is the launch directory and is pinned — it can't be removed.");
-            }
             await disposeWorkspace(command.workspaceId);
+            await navigationStore.forgetWorkspace(command.workspaceId);
             await store.remove(command.workspaceId);
-            const next = store.list()[0] ?? (await store.add(initialCwd));
-            await activate(next);
+            const remaining = store.list();
+            if (remaining.length === 0) {
+              // No workspaces left — piui sits in its "unattached" state. The
+              // client renders an empty surface with an Open Workspace button;
+              // we don't auto-resurrect the launch dir here because that's
+              // exactly what the user just asked us to detach.
+              activeWorkspace = undefined;
+              handle = undefined;
+              activeRuntimeId = null;
+              send(ws, { type: "workspaces", data: { workspaces: publicWorkspaces(store), activeWorkspaceId: null } });
+            } else {
+              // Pick the most recently opened remaining workspace.
+              const next = remaining.sort((a, b) => (b.lastOpenedAt ?? "").localeCompare(a.lastOpenedAt ?? ""))[0];
+              await activate(next);
+            }
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
           }
@@ -1810,6 +2210,7 @@ async function main() {
               throw new Error("Session not found in this workspace.");
             }
             await fs.unlink(command.sessionPath);
+            await navigationStore.forgetSession(workspace.id, command.sessionPath);
             send(ws, { type: "response", id, command: command.type, success: true });
             await sendWorkspaceSessions(workspace);
             break;
@@ -1911,9 +2312,11 @@ async function main() {
             const active = commandRuntime();
             const session = active.runtime.session;
             const workspace = active.workspace;
-            if (!command.message?.trim()) throw new Error("Missing message");
+            const attachments = normalizePromptAttachments(command.attachments);
+            const payload = buildPromptPayload(command.message, attachments);
+            if (!payload.text.trim() && attachments.length === 0) throw new Error("Missing message");
             send(ws, { type: "response", id, command: command.type, success: true });
-            await session.prompt(command.message, { streamingBehavior: command.streamingBehavior });
+            await session.prompt(payload.text, { streamingBehavior: command.streamingBehavior, images: payload.images });
             await refreshSessionIdentity(active);
             if (isActive(active) && active.runtime.session === session) {
               send(ws, { type: "state", data: scopedState(active) });
@@ -1922,16 +2325,22 @@ async function main() {
             await sendWorkspaceSessions(workspace);
             break;
           }
-          case "steer":
-            if (!command.message?.trim()) throw new Error("Missing message");
-            await commandRuntime().runtime.session.steer(command.message);
+          case "steer": {
+            const attachments = normalizePromptAttachments(command.attachments);
+            const payload = buildPromptPayload(command.message, attachments);
+            if (!payload.text.trim() && attachments.length === 0) throw new Error("Missing message");
+            await commandRuntime().runtime.session.steer(payload.text, payload.images);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
-          case "follow_up":
-            if (!command.message?.trim()) throw new Error("Missing message");
-            await commandRuntime().runtime.session.followUp(command.message);
+          }
+          case "follow_up": {
+            const attachments = normalizePromptAttachments(command.attachments);
+            const payload = buildPromptPayload(command.message, attachments);
+            if (!payload.text.trim() && attachments.length === 0) throw new Error("Missing message");
+            await commandRuntime().runtime.session.followUp(payload.text, payload.images);
             send(ws, { type: "response", id, command: command.type, success: true });
             break;
+          }
           case "abort":
             await commandRuntime().runtime.session.abort();
             send(ws, { type: "response", id, command: command.type, success: true });
@@ -2045,6 +2454,12 @@ async function main() {
             send(ws, { type: "settings", data: next });
             break;
           }
+          case "set_navigation": {
+            const next = await navigationStore.update(command.navigation ?? {});
+            send(ws, { type: "response", id, command: command.type, success: true, data: next });
+            send(ws, { type: "navigation", data: next });
+            break;
+          }
           case "extension_ui_response":
             if (!command.uiRequestId) throw new Error("Missing uiRequestId");
             {
@@ -2122,6 +2537,8 @@ async function main() {
     console.log(`Piui WebSocket token: ${localToken}`);
     console.log(`Initial workspace: ${initialCwd}`);
     console.log(`Workspace registry: ${workspaceFile}`);
+    console.log(`Settings state: ${settingsFile}`);
+    console.log(`Navigation state: ${navigationFile}`);
   });
 }
 

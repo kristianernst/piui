@@ -4,10 +4,9 @@ import { useEffect, useMemo, useRef, type CSSProperties } from "react";
 // particle simulation rendered into a 22×22 canvas, displayed via
 // `image-rendering: pixelated` for crisp pixel-art edges. Adapted from the
 // design-team prototype shipped in the AI Orb library handoff bundle. The
-// seed (session id) picks a palette + initial particle layout deterministically,
-// so the same conversation always shows the same orb identity; per-frame
-// color morphing + ember sparkles use Math.random for liveness so two parallel
-// orbs from the same seed don't lockstep.
+// seed (session id) picks a palette + particle layout deterministically. All
+// mounted orbs for the same seed share one simulation state, so the active
+// conversation appears as the same agent in the chat header and sidebar.
 //
 // Rendering: per-pixel winner-takes-all over the 9 particles' weighted
 // distance fields. Where two particles' weights are close we 4×4 Bayer-dither
@@ -82,6 +81,7 @@ type OrbState = {
   seed: string;
   particles: OrbParticle[];
   t: number;
+  lastNow: number;
   colors: RGB[];
   particleColors: RGB[];
   bg: RGB;
@@ -95,6 +95,7 @@ const ORB_PARTICLE_COUNT = 9;
 const ORB_CONTRAST = 4;
 const ORB_MORPH_RATE = 1;
 const ORB_EMBER_RATE = 1.2;
+const sharedOrbStates = new Map<string, OrbState>();
 
 function paletteFor(seed: string): string[] {
   // Run a fresh PRNG (separate stream from particle init) so palette and
@@ -137,6 +138,7 @@ function initOrbState(seed: string, palette: string[]): OrbState {
     seed,
     particles,
     t: 0,
+    lastNow: 0,
     colors,
     particleColors,
     bg: colors[0],
@@ -146,11 +148,19 @@ function initOrbState(seed: string, palette: string[]): OrbState {
   };
 }
 
+function sharedOrbState(seed: string, palette: string[]): OrbState {
+  const key = seed || "default";
+  const current = sharedOrbStates.get(key);
+  if (current) return current;
+  const next = initOrbState(key, palette);
+  sharedOrbStates.set(key, next);
+  return next;
+}
+
 export function AgentOrb({ seed, running, size = 18, glow = false }: { seed: string; running: boolean; size?: number; glow?: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const stateRef = useRef<OrbState | null>(null);
-
   const palette = useMemo(() => paletteFor(seed || "default"), [seed]);
+  const stateRef = useRef<OrbState>(sharedOrbState(seed || "default", palette));
   const shellStyle = {
     width: size,
     height: size,
@@ -162,9 +172,7 @@ export function AgentOrb({ seed, running, size = 18, glow = false }: { seed: str
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    if (!stateRef.current || stateRef.current.seed !== (seed || "default")) {
-      stateRef.current = initOrbState(seed || "default", palette);
-    }
+    stateRef.current = sharedOrbState(seed || "default", palette);
     const G = ORB_GRID;
     const img = ctx.createImageData(G, G);
     const data = img.data;
@@ -173,16 +181,15 @@ export function AgentOrb({ seed, running, size = 18, glow = false }: { seed: str
     const Rsq = R * R;
 
     let raf = 0;
-    let last = 0;
     const tick = (now: number) => {
-      if (!last) last = now;
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
       const s = stateRef.current;
       if (!s) {
         if (running) raf = requestAnimationFrame(tick);
         return;
       }
+      if (!s.lastNow) s.lastNow = now;
+      const dt = Math.min(0.05, Math.max(0, (now - s.lastNow) / 1000));
+      s.lastNow = now;
       s.t += dt;
       const t = s.t;
       const particles = s.particles;

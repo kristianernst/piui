@@ -24,7 +24,6 @@ import {
   IconSidebarLeft,
   IconSidebarRight,
   IconStop,
-  IconSun,
   IconTerminal,
 } from "./components/icons";
 import {
@@ -39,6 +38,9 @@ import {
   type PiClientCommand,
   type PiSessionCommandBody,
   type PiModelSummary,
+  type PiNavigationPatch,
+  type PiNavigationState,
+  type PromptAttachment,
   type PiResourceSummary,
   type PiSourceInfo,
   type PiSessionInfo,
@@ -89,6 +91,7 @@ type UiMessage = {
   clientId?: string;
   role: "user" | "assistant";
   text: string;          // user role only
+  attachments?: PromptAttachment[];
   blocks?: UiBlock[];    // assistant role only — chronological
   optimistic?: boolean;
   streaming?: boolean;
@@ -117,6 +120,7 @@ type SessionCache = {
   state: PiState | null;
   messages: UiMessage[];
   draft: string;
+  attachments: PromptAttachment[];
   lastRevision: number;
   lastSeq: number;
   models: PiModelSummary[];
@@ -128,6 +132,98 @@ type SessionCache = {
 };
 
 type AppErrorBoundaryState = { error?: Error };
+
+type ParsedFileTag = {
+  name: string;
+  mimeType?: string;
+  text: string;
+  truncated?: boolean;
+  isImage: boolean;
+};
+
+function textContentOnly(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object") return "";
+      const b = block as { type?: unknown; text?: unknown };
+      return b.type === "text" && typeof b.text === "string" ? b.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseFileTags(input: string): { text: string; tags: ParsedFileTag[] } {
+  const tags: ParsedFileTag[] = [];
+  const text = input.replace(/<file\b([^>]*)>([\s\S]*?)<\/file>/gi, (_match, rawAttrs: string, body: string) => {
+    const attrs = parseFileTagAttrs(rawAttrs);
+    const mimeType = attrs.mime;
+    const trimmedBody = body.replace(/^\n|\n$/g, "");
+    tags.push({
+      name: attrs.name ?? "attachment",
+      mimeType,
+      text: trimmedBody,
+      truncated: attrs.truncated === "true",
+      isImage: !!mimeType?.startsWith("image/") || /^\[Image/.test(trimmedBody.trim()),
+    });
+    return "";
+  });
+  return { text: text.replace(/\n{3,}/g, "\n\n").trim(), tags };
+}
+
+function parseFileTagAttrs(input: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  input.replace(/([a-zA-Z][\w-]*)="([^"]*)"/g, (_match, key: string, value: string) => {
+    attrs[key] = decodeFileAttribute(value);
+    return "";
+  });
+  return attrs;
+}
+
+function decodeFileAttribute(value: string) {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function userAttachmentsFromContent(content: unknown, idPrefix: string): { text: string; attachments: PromptAttachment[] } {
+  const parsed = parseFileTags(textContentOnly(content));
+  const textAttachments: PromptAttachment[] = parsed.tags
+    .filter((tag) => !tag.isImage)
+    .map((tag, index) => ({
+      id: `${idPrefix}-file-${index}`,
+      kind: "text" as const,
+      name: tag.name,
+      mimeType: tag.mimeType,
+      text: tag.text,
+      size: tag.text.length,
+      truncated: tag.truncated,
+    }));
+  const imageTags = parsed.tags.filter((tag) => tag.isImage);
+  const imageAttachments: PromptAttachment[] = [];
+  if (Array.isArray(content)) {
+    let imageIndex = 0;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as { type?: unknown; data?: unknown; mimeType?: unknown };
+      if (b.type !== "image" || typeof b.data !== "string" || typeof b.mimeType !== "string") continue;
+      const tag = imageTags[imageIndex];
+      imageAttachments.push({
+        id: `${idPrefix}-image-${imageIndex}`,
+        kind: "image",
+        name: tag?.name ?? `image-${imageIndex + 1}`,
+        mimeType: b.mimeType,
+        data: b.data,
+        size: b.data.length,
+      });
+      imageIndex += 1;
+    }
+  }
+  return { text: parsed.text, attachments: [...textAttachments, ...imageAttachments] };
+}
 
 class AppErrorBoundary extends Component<{ children: React.ReactNode }, AppErrorBoundaryState> {
   state: AppErrorBoundaryState = {};
@@ -156,7 +252,10 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode }, AppError
 }
 
 function uiMessageFromAgent(message: AgentMessage, id: string): UiMessage | null {
-  if (message.role === "user") return { id, role: "user", text: contentToText(message.content) };
+  if (message.role === "user") {
+    const display = userAttachmentsFromContent(message.content, id);
+    return { id, role: "user", text: display.text, attachments: display.attachments };
+  }
   if (message.role === "assistant") {
     const content = Array.isArray(message.content) ? message.content : [];
     const blocks: UiBlock[] = [];
@@ -251,6 +350,7 @@ function emptySessionCache(route: SessionRoute): SessionCache {
     state: null,
     messages: [],
     draft: "",
+    attachments: [],
     lastRevision: 0,
     lastSeq: 0,
     models: [],
@@ -429,6 +529,238 @@ function updateCurrentAssistant(messages: UiMessage[], updater: (message: UiMess
   return next;
 }
 
+const MAX_COMPOSER_ATTACHMENTS = 12;
+const MAX_TEXT_ATTACHMENT_CHARS = 256 * 1024;
+const MAX_IMAGE_ATTACHMENT_BASE64_BYTES = 4.5 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_DIMENSION = 2000;
+const supportedImageMimeTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const textLikeExtensions = new Set([
+  "txt", "md", "mdx", "json", "jsonl", "yaml", "yml", "toml", "xml", "html", "css", "scss",
+  "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt", "swift",
+  "c", "cc", "cpp", "h", "hpp", "cs", "php", "sh", "bash", "zsh", "fish", "sql", "csv",
+  "tsv", "log", "env", "gitignore", "dockerfile",
+]);
+
+function nextAttachmentId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function fileExtension(name: string) {
+  const lower = name.toLowerCase();
+  const base = lower.split(/[\\/]/).pop() ?? lower;
+  if (base === "dockerfile" || base.endsWith(".dockerfile")) return "dockerfile";
+  const idx = base.lastIndexOf(".");
+  return idx >= 0 ? base.slice(idx + 1) : "";
+}
+
+function isTextLikeFile(file: File) {
+  return file.type.startsWith("text/") || textLikeExtensions.has(fileExtension(file.name));
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+async function promptAttachmentFromFile(file: File): Promise<PromptAttachment> {
+  const mimeType = file.type || guessMimeType(file.name);
+  if (supportedImageMimeTypes.has(mimeType)) return imageAttachmentFromFile(file, mimeType);
+  if (isTextLikeFile(file)) {
+    const text = await file.slice(0, MAX_TEXT_ATTACHMENT_CHARS).text();
+    return {
+      id: nextAttachmentId(),
+      kind: "text",
+      name: file.name || "pasted-text.txt",
+      mimeType: file.type || undefined,
+      text,
+      size: file.size,
+      truncated: file.size > MAX_TEXT_ATTACHMENT_CHARS,
+    };
+  }
+  throw new Error(`Unsupported attachment type: ${file.name || mimeType || "file"}`);
+}
+
+function guessMimeType(name: string) {
+  const ext = fileExtension(name);
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "";
+}
+
+async function imageAttachmentFromFile(file: File, mimeType: string): Promise<PromptAttachment> {
+  const originalDataUrl = await fileToDataUrl(file);
+  const originalData = dataUrlBase64(originalDataUrl);
+  if (mimeType === "image/gif") {
+    if (originalData.length > MAX_IMAGE_ATTACHMENT_BASE64_BYTES) throw new Error(`Image is too large: ${file.name || "pasted image"}`);
+    return {
+      id: nextAttachmentId(),
+      kind: "image",
+      name: file.name || "pasted-image.gif",
+      mimeType,
+      data: originalData,
+      size: file.size,
+    };
+  }
+
+  const image = await loadImage(originalDataUrl);
+  const originalWidth = image.naturalWidth || image.width;
+  const originalHeight = image.naturalHeight || image.height;
+  if (
+    originalData.length <= MAX_IMAGE_ATTACHMENT_BASE64_BYTES &&
+    originalWidth <= MAX_IMAGE_ATTACHMENT_DIMENSION &&
+    originalHeight <= MAX_IMAGE_ATTACHMENT_DIMENSION
+  ) {
+    return {
+      id: nextAttachmentId(),
+      kind: "image",
+      name: file.name || "pasted-image.png",
+      mimeType,
+      data: originalData,
+      size: file.size,
+      width: originalWidth,
+      height: originalHeight,
+      originalWidth,
+      originalHeight,
+    };
+  }
+
+  const resized = await resizeImageForPrompt(image, originalWidth, originalHeight);
+  return {
+    id: nextAttachmentId(),
+    kind: "image",
+    name: file.name || "pasted-image.jpg",
+    mimeType: resized.mimeType,
+    data: resized.data,
+    size: resized.size,
+    width: resized.width,
+    height: resized.height,
+    originalWidth,
+    originalHeight,
+  };
+}
+
+function fileToDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read file"));
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlBase64(dataUrl: string) {
+  const comma = dataUrl.indexOf(",");
+  return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not load image"));
+    image.src = src;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Could not encode image"));
+    }, type, quality);
+  });
+}
+
+async function resizeImageForPrompt(
+  image: HTMLImageElement,
+  originalWidth: number,
+  originalHeight: number,
+): Promise<{ data: string; mimeType: string; size: number; width: number; height: number }> {
+  let scale = Math.min(1, MAX_IMAGE_ATTACHMENT_DIMENSION / originalWidth, MAX_IMAGE_ATTACHMENT_DIMENSION / originalHeight);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not prepare image");
+
+  while (scale > 0.03) {
+    const width = Math.max(1, Math.round(originalWidth * scale));
+    const height = Math.max(1, Math.round(originalHeight * scale));
+    canvas.width = width;
+    canvas.height = height;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0, width, height);
+
+    for (const quality of [0.86, 0.72, 0.58, 0.44]) {
+      const blob = await canvasToBlob(canvas, "image/jpeg", quality);
+      const data = dataUrlBase64(await fileToDataUrl(blob));
+      if (data.length <= MAX_IMAGE_ATTACHMENT_BASE64_BYTES) {
+        return { data, mimeType: "image/jpeg", size: blob.size, width, height };
+      }
+    }
+    scale *= 0.75;
+  }
+
+  throw new Error("Image could not be resized below the inline image limit.");
+}
+
+function filesFromDataTransfer(dataTransfer: DataTransfer) {
+  const files = Array.from(dataTransfer.files ?? []);
+  if (files.length) return files;
+  return Array.from(dataTransfer.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => !!file);
+}
+
+function dataTransferHasFiles(dataTransfer: DataTransfer) {
+  return Array.from(dataTransfer.types ?? []).includes("Files")
+    || Array.from(dataTransfer.items ?? []).some((item) => item.kind === "file");
+}
+
+function setFromStrings(values: readonly string[] | undefined) {
+  return new Set((values ?? []).filter((value) => typeof value === "string" && value.length > 0));
+}
+
+function setToList(values: Set<string>) {
+  return [...values];
+}
+
+function setsEqual(a: Set<string>, b: Set<string>) {
+  if (a.size !== b.size) return false;
+  for (const value of a) if (!b.has(value)) return false;
+  return true;
+}
+
+function hasOwn<T extends object>(value: T, key: PropertyKey): key is keyof T {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+const DEFAULT_APPEARANCE: PiSettings["appearance"] = {
+  colorScheme: "system",
+  leftSidebarOpen: true,
+  rightSidebarOpen: true,
+  rightSidebarWidth: 244,
+};
+
+function systemPrefersDark() {
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
+}
+
+function darkFromAppearance(appearance: PiSettings["appearance"]) {
+  if (appearance.colorScheme === "dark") return true;
+  if (appearance.colorScheme === "light") return false;
+  return systemPrefersDark();
+}
+
 function applyExtensionStatusToRun(prev: ExtensionRun | null, data: { key: string; text?: string; value?: unknown }): ExtensionRun | null {
   const base: ExtensionRun = prev ?? { workingVisible: false, status: {}, slots: [] };
   const next: ExtensionRun = { ...base, status: { ...base.status }, slots: base.slots.slice() };
@@ -463,6 +795,10 @@ function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [sessionsByWorkspace, setSessionsByWorkspace] = useState<Record<string, PiSessionInfo[]>>({});
+  const [openWorkspaceIds, setOpenWorkspaceIds] = useState<Set<string>>(() => new Set());
+  const [expandedSessionWorkspaceIds, setExpandedSessionWorkspaceIds] = useState<Set<string>>(() => new Set());
+  const [fileTreeOpenPathsByWorkspace, setFileTreeOpenPathsByWorkspace] = useState<Record<string, string[]>>({});
+  const [rightSidebarTab, setRightSidebarTab] = useState<"diffs" | "files">("diffs");
   const [unreadDoneByRouteKey, setUnreadDoneByRouteKey] = useState<Set<string>>(() => new Set());
   const [settings, setSettings] = useState<PiSettings | null>(null);
   const [editors, setEditors] = useState<Array<{ id: string; label: string; hasIcon: boolean }>>([]);
@@ -475,20 +811,12 @@ function App() {
   // collapse it off-screen or grow it past half the viewport.
   const RIGHT_MIN = 220;
   const RIGHT_MAX = 640;
-  const [rightWidth, setRightWidth] = useState<number>(() => {
-    if (typeof localStorage === "undefined") return 244;
-    const stored = Number(localStorage.getItem("piui:right-sidebar-width"));
-    return Number.isFinite(stored) && stored >= RIGHT_MIN && stored <= RIGHT_MAX ? stored : 244;
-  });
-  useEffect(() => {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem("piui:right-sidebar-width", String(rightWidth));
-    }
-  }, [rightWidth]);
-  const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
+  const [rightWidth, setRightWidth] = useState<number>(DEFAULT_APPEARANCE.rightSidebarWidth);
+  const [dark, setDark] = useState(systemPrefersDark);
   const socketRef = useRef<ReturnType<typeof connectPi> | null>(null);
   const activeRouteRef = useRef<SessionRoute | null>(null);
   const activeWorkspaceIdRef = useRef<string | null>(null);
+  const lastRouteByWorkspaceRef = useRef<Record<string, SessionRoute>>({});
   const sessionsByWorkspaceRef = useRef<Record<string, PiSessionInfo[]>>({});
   const clientMessageSeqRef = useRef<Record<string, number>>({});
   const threadRef = useRef<HTMLDivElement>(null);
@@ -503,7 +831,10 @@ function App() {
     : null;
   const state = activeCache?.state ?? null;
   const messages = activeCache?.messages ?? [];
+  const activeOrbSeed = state?.sessionId ?? activeRoute?.sessionId ?? activeRoute?.runtimeId ?? "active";
+  const activeIsStreaming = !!state?.isStreaming || messages.some((message) => message.role === "assistant" && !!message.streaming);
   const draft = activeCache?.draft ?? "";
+  const attachments = activeCache?.attachments ?? [];
   const models = activeCache?.models ?? [];
   const resources = activeCache?.resources ?? null;
   const extension = activeCache?.extension ?? null;
@@ -523,6 +854,7 @@ function App() {
 
   function setActiveRoute(route: SessionRoute | null) {
     activeRouteRef.current = route;
+    if (route) lastRouteByWorkspaceRef.current = { ...lastRouteByWorkspaceRef.current, [route.workspaceId]: route };
     setActiveRouteState(route);
   }
 
@@ -535,6 +867,31 @@ function App() {
     return routesMatch(activeRouteRef.current, route);
   }
 
+  function routeFromSessionInfo(workspaceId: string, session: PiSessionInfo): SessionRoute {
+    return {
+      runtimeId: session.liveSessionId ?? session.id,
+      workspaceId,
+      sessionPath: session.path,
+      sessionId: session.liveSessionId ?? session.id,
+    };
+  }
+
+  function cachedRouteForSession(workspaceId: string, sessionPath: string): SessionRoute | null {
+    const cached = Object.values(sessionCaches).find((cache) => cache.route.workspaceId === workspaceId && cache.route.sessionPath === sessionPath);
+    if (cached) return cached.route;
+    const session = sessionsByWorkspaceRef.current[workspaceId]?.find((candidate) => candidate.path === sessionPath);
+    return session ? routeFromSessionInfo(workspaceId, session) : null;
+  }
+
+  function cachedRouteForWorkspace(workspaceId: string): SessionRoute | null {
+    const remembered = lastRouteByWorkspaceRef.current[workspaceId];
+    if (remembered?.sessionPath) return cachedRouteForSession(workspaceId, remembered.sessionPath) ?? remembered;
+    const cached = Object.values(sessionCaches)
+      .filter((cache) => cache.route.workspaceId === workspaceId)
+      .sort((a, b) => Math.max(b.lastSeq, b.lastRevision) - Math.max(a.lastSeq, a.lastRevision))[0];
+    return cached?.route ?? null;
+  }
+
   function updateDraft(value: string | ((previous: string) => string)) {
     const route = activeRouteRef.current;
     if (!route) return;
@@ -544,9 +901,58 @@ function App() {
     })));
   }
 
+  async function addComposerFiles(files: File[]) {
+    const route = activeRouteRef.current;
+    if (!route || files.length === 0) return;
+    const current = activeCache?.attachments.length ?? 0;
+    const allowed = Math.max(0, MAX_COMPOSER_ATTACHMENTS - current);
+    if (allowed === 0) {
+      pushNotice(`Maximum ${MAX_COMPOSER_ATTACHMENTS} attachments per message.`, "warning");
+      return;
+    }
+    const selected = files.slice(0, allowed);
+    if (files.length > allowed) pushNotice(`Added first ${allowed} attachments; remove one to add more.`, "warning");
+
+    const next: PromptAttachment[] = [];
+    for (const file of selected) {
+      try {
+        next.push(await promptAttachmentFromFile(file));
+      } catch (error) {
+        pushNotice(error instanceof Error ? error.message : String(error), "warning");
+      }
+    }
+    if (next.length === 0) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      attachments: [...cache.attachments, ...next].slice(0, MAX_COMPOSER_ATTACHMENTS),
+    })));
+  }
+
+  function removeComposerAttachment(id: string) {
+    const route = activeRouteRef.current;
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      attachments: cache.attachments.filter((attachment) => attachment.id !== id),
+    })));
+  }
+
+  function clearComposerAttachments(route: SessionRoute) {
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({ ...cache, attachments: [] })));
+  }
+
   useEffect(() => {
     document.body.classList.toggle("dark", dark);
   }, [dark]);
+
+  useEffect(() => {
+    if (settings?.appearance.colorScheme !== "system") return;
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) return;
+    const onChange = () => setDark(media.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [settings?.appearance.colorScheme]);
 
   useEffect(() => {
     const socket = connectPi((packet) => {
@@ -554,13 +960,17 @@ function App() {
         setWorkspaces(packet.data.workspaces);
         setActiveWorkspace(packet.data.activeWorkspaceId);
         applyStateSnapshot(packet.data.state, true);
-        if (packet.data.settings) setSettings(packet.data.settings);
+        if (packet.data.settings) applySettingsState(packet.data.settings);
         if (packet.data.editors) setEditors(packet.data.editors);
+        if (packet.data.navigation) applyNavigationState(packet.data.navigation);
         return;
       }
       if (packet.type === "workspaces") {
         setWorkspaces(packet.data.workspaces);
         setActiveWorkspace(packet.data.activeWorkspaceId);
+        // No active workspace left — clear the route so the unattached
+        // empty state renders instead of stale messages.
+        if (packet.data.activeWorkspaceId === null) setActiveRoute(null);
         return;
       }
       if (packet.type === "workspace") {
@@ -580,7 +990,11 @@ function App() {
         return;
       }
       if (packet.type === "settings") {
-        setSettings(packet.data);
+        applySettingsState(packet.data);
+        return;
+      }
+      if (packet.type === "navigation") {
+        applyNavigationState(packet.data);
         return;
       }
       if (packet.type === "resources") {
@@ -688,17 +1102,29 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [shortcuts, overlayActive]);
 
-  // Refresh `@`-mention candidates whenever the active workspace changes.
-  // We send a fresh request rather than caching per-workspace because file
-  // listings drift quickly during active development.
+  // Refresh workspace-scoped data whenever the active workspace changes, but
+  // keep the previous payloads in place so quick tab switches render from the
+  // warm cache while the server catches up.
   useEffect(() => {
     if (!activeWorkspaceId) return;
-    setFilesByWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: [] }));
-    setGitByWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: null }));
     socketRef.current?.send({ type: "list_sessions", workspaceId: activeWorkspaceId });
     socketRef.current?.send({ type: "list_files", workspaceId: activeWorkspaceId });
     socketRef.current?.send({ type: "get_git", workspaceId: activeWorkspaceId });
   }, [activeWorkspaceId]);
+
+  // Restored workspace accordions are visible UI, so their conversation lists
+  // must hydrate on reconnect even when they are not the active workspace.
+  // Otherwise an expanded workspace looks empty until the user clicks it.
+  useEffect(() => {
+    if (connection !== "open" || workspaces.length === 0) return;
+    const knownWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    const visibleWorkspaceIds = new Set([...openWorkspaceIds, ...expandedSessionWorkspaceIds]);
+    for (const workspaceId of visibleWorkspaceIds) {
+      if (!knownWorkspaceIds.has(workspaceId)) continue;
+      if (hasOwn(sessionsByWorkspaceRef.current, workspaceId)) continue;
+      socketRef.current?.send({ type: "list_sessions", workspaceId });
+    }
+  }, [connection, workspaces, openWorkspaceIds, expandedSessionWorkspaceIds]);
 
   function handleThreadScroll() {
     const el = threadRef.current;
@@ -713,7 +1139,14 @@ function App() {
     else toast(message);
   }
 
-  function applyStateSnapshot(data: SessionStateSnapshot, makeActive: boolean) {
+  function applyStateSnapshot(data: SessionStateSnapshot | null, makeActive: boolean) {
+    if (!data) {
+      // No active workspace yet — drop any active route so the empty state
+      // renders. We don't touch session caches: navigating back into a
+      // workspace later should restore whatever was cached.
+      if (makeActive) setActiveRoute(null);
+      return;
+    }
     const route = routeFromData(data);
     if (!route) return;
     if (makeActive) {
@@ -897,12 +1330,83 @@ function App() {
     return activeWorkspaceIdRef.current ?? activeRouteRef.current?.workspaceId ?? null;
   }
 
+  function applyAppearanceState(appearance: PiSettings["appearance"]) {
+    setLeftOpen(appearance.leftSidebarOpen);
+    setRightOpen(appearance.rightSidebarOpen);
+    setRightWidth(Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, appearance.rightSidebarWidth)));
+    setDark(darkFromAppearance(appearance));
+  }
+
+  function applySettingsState(data: PiSettings) {
+    const next = { ...data, appearance: { ...DEFAULT_APPEARANCE, ...(data.appearance ?? {}) } };
+    setSettings(next);
+    applyAppearanceState(next.appearance);
+  }
+
+  function mergeSettingsPatch(current: PiSettings, patch: Partial<PiSettings>): PiSettings {
+    return {
+      ...current,
+      ...patch,
+      appearance: {
+        ...current.appearance,
+        ...(patch.appearance ?? {}),
+      },
+    };
+  }
+
+  function updateAppearanceSettings(patch: Partial<PiSettings["appearance"]>) {
+    const current = settings ?? { defaultModel: null, defaultThinkingLevel: null, titleModel: null, showStarterPrompts: false, appearance: DEFAULT_APPEARANCE };
+    const appearance = { ...current.appearance, ...patch };
+    updateSettings({ appearance });
+  }
+
+  function applyNavigationState(data: PiNavigationState) {
+    setOpenWorkspaceIds(setFromStrings(data.openWorkspaceIds));
+    setExpandedSessionWorkspaceIds(setFromStrings(data.expandedSessionWorkspaceIds));
+    setFileTreeOpenPathsByWorkspace(data.openFileTreePathsByWorkspace ?? {});
+    setRightSidebarTab(data.rightSidebarTab === "files" ? "files" : "diffs");
+  }
+
+  function sendNavigationPatch(navigation: PiNavigationPatch) {
+    socketRef.current?.send({ type: "set_navigation", navigation });
+  }
+
+  function updateOpenWorkspaceIds(next: Set<string>) {
+    if (setsEqual(openWorkspaceIds, next)) return;
+    setOpenWorkspaceIds(next);
+    sendNavigationPatch({ openWorkspaceIds: setToList(next) });
+  }
+
+  function updateExpandedSessionWorkspaceIds(next: Set<string>) {
+    if (setsEqual(expandedSessionWorkspaceIds, next)) return;
+    setExpandedSessionWorkspaceIds(next);
+    sendNavigationPatch({ expandedSessionWorkspaceIds: setToList(next) });
+  }
+
+  function updateFileTreeOpenPaths(workspaceId: string, paths: string[]) {
+    const current = fileTreeOpenPathsByWorkspace[workspaceId] ?? [];
+    if (current.length === paths.length && current.every((value, index) => value === paths[index])) return;
+    setFileTreeOpenPathsByWorkspace((prev) => {
+      const next = { ...prev, [workspaceId]: paths };
+      sendNavigationPatch({ openFileTreePathsByWorkspace: next });
+      return next;
+    });
+  }
+
+  function updateRightSidebarTab(tab: "diffs" | "files") {
+    if (rightSidebarTab === tab) return;
+    setRightSidebarTab(tab);
+    sendNavigationPatch({ rightSidebarTab: tab });
+  }
+
   function sendPrompt(text: string, streamingBehavior?: "steer" | "followUp") {
     const route = activeRouteRef.current;
     if (!route) {
       pushNotice("No active Pi session.", "warning");
       return;
     }
+    const promptAttachments = activeCache?.attachments ?? [];
+    if (!text.trim() && promptAttachments.length === 0) return;
     // The user is engaging with the conversation again — re-engage autoscroll
     // even if they had scrolled up to read earlier content.
     stickToBottomRef.current = true;
@@ -912,13 +1416,22 @@ function App() {
     const clientMessageId = `${route.runtimeId}:${seq}`;
     setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
       ...cache,
-      messages: [...cache.messages, { id: `u-${clientMessageId}`, clientId: clientMessageId, role: "user", text, optimistic: true }],
+      messages: [...cache.messages, { id: `u-${clientMessageId}`, clientId: clientMessageId, role: "user", text, attachments: promptAttachments, optimistic: true }],
+      attachments: [],
     })));
-    socketRef.current?.send({ ...route, type: "prompt", message: text, streamingBehavior, clientMessageId });
+    socketRef.current?.send({ ...route, type: "prompt", message: text, attachments: promptAttachments, streamingBehavior, clientMessageId });
   }
 
   function queuePrompt(text: string, mode: "steer" | "follow_up") {
-    sendSessionCommand({ type: mode, message: text });
+    const route = activeRouteRef.current;
+    if (!route) {
+      pushNotice("No active Pi session.", "warning");
+      return;
+    }
+    const promptAttachments = activeCache?.attachments ?? [];
+    if (!text.trim() && promptAttachments.length === 0) return;
+    socketRef.current?.send({ ...route, type: mode, message: text, attachments: promptAttachments } as PiClientCommand);
+    clearComposerAttachments(route);
   }
 
   function abort() {
@@ -939,7 +1452,8 @@ function App() {
   }
 
   function switchWorkspace(workspaceId: string) {
-    setActiveRoute(null);
+    setActiveWorkspace(workspaceId);
+    setActiveRoute(cachedRouteForWorkspace(workspaceId));
     socketRef.current?.send({ type: "switch_workspace", workspaceId });
   }
 
@@ -952,14 +1466,19 @@ function App() {
   }
 
   function switchSession(workspaceId: string, sessionPath: string) {
-    setActiveRoute(null);
-    setUnreadDoneByRouteKey((prev) => {
-      const key = sessionRouteKey({ runtimeId: "", workspaceId, sessionPath });
-      if (!prev.has(key)) return prev;
-      const next = new Set(prev);
-      next.delete(key);
-      return next;
-    });
+    const route = cachedRouteForSession(workspaceId, sessionPath);
+    setActiveWorkspace(workspaceId);
+    setActiveRoute(route);
+    if (route) clearUnreadDone(route);
+    else {
+      setUnreadDoneByRouteKey((prev) => {
+        const key = sessionRouteKey({ runtimeId: "", workspaceId, sessionPath });
+        if (!prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
     socketRef.current?.send({ type: "switch_session", workspaceId, sessionPath });
   }
 
@@ -970,7 +1489,11 @@ function App() {
   function updateSettings(patch: Partial<PiSettings>) {
     // Optimistic update so the dialog feels snappy; the server will broadcast
     // a settings packet that supersedes this.
-    setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
+    if (settings) {
+      const next = mergeSettingsPatch(settings, patch);
+      setSettings(next);
+      if (patch.appearance) applyAppearanceState(next.appearance);
+    }
     socketRef.current?.send({ type: "set_settings", settings: patch });
   }
 
@@ -983,8 +1506,8 @@ function App() {
       <div className="settingsShell">
         <SettingsScreen
           onBack={() => setSettingsOpen(false)}
-          dark={dark}
-          onToggleDark={() => setDark((v) => !v)}
+          appearance={settings?.appearance ?? DEFAULT_APPEARANCE}
+          onUpdateAppearance={updateAppearanceSettings}
           models={models}
           currentModel={state?.model ?? null}
           resources={resources}
@@ -1006,7 +1529,7 @@ function App() {
     <div className="shell">
       <LeftSidebar
         open={leftOpen}
-        onToggle={() => setLeftOpen((v) => !v)}
+        onToggle={() => updateAppearanceSettings({ leftSidebarOpen: !leftOpen })}
         onNewSession={newSession}
         onOpenWorkspace={openWorkspace}
         onSwitchWorkspace={switchWorkspace}
@@ -1017,18 +1540,23 @@ function App() {
         workspaces={workspaces}
         activeWorkspaceId={activeWorkspaceId}
         sessionsByWorkspace={sessionsByWorkspace}
+        openWorkspaceIds={openWorkspaceIds}
+        expandedSessionWorkspaceIds={expandedSessionWorkspaceIds}
+        onOpenWorkspaceIdsChange={updateOpenWorkspaceIds}
+        onExpandedSessionWorkspaceIdsChange={updateExpandedSessionWorkspaceIds}
         pendingUiByRouteKey={pendingUiByRouteKey}
         unreadDoneByRouteKey={unreadDoneByRouteKey}
-        activeSessionFile={state?.sessionFile}
-        activeSessionId={state?.sessionId}
-        activeIsStreaming={!!state?.isStreaming}
+        activeSessionFile={state?.sessionFile ?? activeRoute?.sessionPath}
+        activeSessionId={state?.sessionId ?? activeRoute?.sessionId}
+        activeOrbSeed={activeOrbSeed}
+        activeIsStreaming={activeIsStreaming}
         onOpenSettings={() => setSettingsOpen(true)}
       />
       <main className="app">
         <header className="topbar">
           <div className="topbar-side">
             {!leftOpen && (
-              <button className="ghost" onClick={() => setLeftOpen(true)} title="Show sidebar">
+              <button className="ghost" onClick={() => updateAppearanceSettings({ leftSidebarOpen: true })} title="Show sidebar">
                 <IconSidebarLeft />
               </button>
             )}
@@ -1038,7 +1566,7 @@ function App() {
           </div>
           <div className="topbar-side right">
             {!rightOpen && (
-              <button className="ghost" onClick={() => setRightOpen(true)} title="Show diffs">
+              <button className="ghost" onClick={() => updateAppearanceSettings({ rightSidebarOpen: true })} title="Show diffs">
                 <IconSidebarRight />
               </button>
             )}
@@ -1046,14 +1574,21 @@ function App() {
         </header>
 
         <div className="thread" ref={threadRef} onScroll={handleThreadScroll}>
-          {messages.length === 0 ? <EmptyState /> : messages.map((message) => <MessageView key={message.id} message={message} seed={state?.sessionId} />)}
+          {activeWorkspaceId === null
+            ? <NoWorkspaceState onOpenWorkspace={openWorkspace} />
+            : (messages.length === 0
+                ? <EmptyState />
+                : messages.map((message) => <MessageView key={message.id} message={message} seed={activeOrbSeed} resources={resources} />))}
         </div>
 
-        <Composer
+        {activeWorkspaceId !== null && <Composer
           state={state}
           connection={connection}
           value={draft}
+          attachments={attachments}
           onValueChange={updateDraft}
+          onAddAttachments={addComposerFiles}
+          onRemoveAttachment={removeComposerAttachment}
           onSend={sendPrompt}
           onSteer={(text) => queuePrompt(text, "steer")}
           onFollowUp={(text) => queuePrompt(text, "follow_up")}
@@ -1065,16 +1600,22 @@ function App() {
           files={files}
           git={git}
           extension={extension}
-        />
+        />}
       </main>
       <RightSidebar
         open={rightOpen}
-        onToggle={() => setRightOpen((v) => !v)}
+        onToggle={() => updateAppearanceSettings({ rightSidebarOpen: !rightOpen })}
+        tab={rightSidebarTab}
+        onTabChange={updateRightSidebarTab}
         git={git}
         files={files}
+        workspaceId={sidecarWorkspaceId}
         workspaceName={state?.workspace?.name ?? ""}
         width={rightWidth}
         onWidthChange={setRightWidth}
+        onWidthCommit={(next) => updateAppearanceSettings({ rightSidebarWidth: next })}
+        fileTreeOpenPathsByWorkspace={fileTreeOpenPathsByWorkspace}
+        onFileTreeOpenPathsChange={updateFileTreeOpenPaths}
         editors={editors}
         onOpenInEditor={(editor, p) => {
           const workspaceId = activeWorkspaceForCommand();
@@ -1225,8 +1766,30 @@ function EmptyState() {
   );
 }
 
-function MessageView({ message, seed }: { message: UiMessage; seed?: string }) {
-  if (message.role === "user") return <div className="msg user fadeUp"><div className="bubble">{message.text}</div></div>;
+// Shown when no workspaces are attached. piui still runs — sidebar, settings,
+// and the daemon are all available — but there's no project to act on yet.
+// The user picks one via the OS folder picker just like adding any other.
+function NoWorkspaceState({ onOpenWorkspace }: { onOpenWorkspace: () => void }) {
+  return (
+    <section className="empty fadeUp">
+      <h1><PiLogo className="empty-piLogo" />, unattached.</h1>
+      <p>No workspaces attached. Open a folder to start a session — piui works on whatever you point it at and remembers what you've attached between launches.</p>
+      <button className="primary" type="button" onClick={onOpenWorkspace}>Open workspace</button>
+    </section>
+  );
+}
+
+function MessageView({ message, seed, resources }: { message: UiMessage; seed?: string; resources?: PiResourceSummary | null }) {
+  if (message.role === "user") {
+    return (
+      <div className="msg user fadeUp">
+        <div className="bubble">
+          {message.attachments && message.attachments.length > 0 ? <AttachmentList attachments={message.attachments} compact /> : null}
+          {message.text ? <div className="bubbleText"><MentionedText text={message.text} resources={resources} interactive /></div> : null}
+        </div>
+      </div>
+    );
+  }
 
   const blocks = message.blocks ?? [];
   // The final answer is the last `text` block; everything before it (thoughts,
@@ -1255,6 +1818,514 @@ function MessageView({ message, seed }: { message: UiMessage; seed?: string }) {
       {answer ? <Markdown text={answer} /> : null}
     </div>
   );
+}
+
+function AttachmentList({ attachments, compact = false }: { attachments: PromptAttachment[]; compact?: boolean }) {
+  return (
+    <div className={`attachmentList${compact ? " compact" : ""}`}>
+      {attachments.map((attachment) => (
+        <AttachmentHover key={attachment.id} attachment={attachment}>
+          <AttachmentPreview attachment={attachment} />
+        </AttachmentHover>
+      ))}
+    </div>
+  );
+}
+
+function AttachmentChip({ attachment, onRemove }: { attachment: PromptAttachment; onRemove: () => void }) {
+  const visual = attachmentVisual(attachment);
+  const state = attachmentState(attachment);
+  return (
+    <AttachmentHover attachment={attachment}>
+      <div className={`attachmentChip ${attachment.kind} type-${visual.type} state-${state}`}>
+        <AttachmentPreview attachment={attachment} />
+        <button type="button" title="Remove attachment" onClick={onRemove}><IconClose size={13} /></button>
+      </div>
+    </AttachmentHover>
+  );
+}
+
+// Width of the hover preview card. Centralized so the placement math and the
+// stylesheet stay in sync — change one, change the other.
+const HOVER_PREVIEW_WIDTH = 360;
+const HOVER_PREVIEW_GAP = 8;
+
+type HoverPlacement = { left: number; top: number; placement: "top" | "bottom" };
+
+// Shared logic for any "hover for a preview" affordance: managed enter/leave
+// delays, smart top/bottom placement based on viewport room, portal mount,
+// and scroll/resize tracking. Returns a trigger element with the standard
+// hover handlers and a `panel` node ready to render alongside it.
+function useHoverPopover({
+  width = HOVER_PREVIEW_WIDTH,
+  minSpace = 220,
+}: { width?: number; minSpace?: number } = {}) {
+  const triggerRef = useRef<HTMLSpanElement | null>(null);
+  const [placement, setPlacement] = useState<HoverPlacement | null>(null);
+  // Open mounts the portal; visible drives the animation. Decoupling lets the
+  // fade-out play before the node unmounts.
+  const [open, setOpen] = useState(false);
+  const [visible, setVisible] = useState(false);
+  const enterTimer = useRef<number | null>(null);
+  const leaveTimer = useRef<number | null>(null);
+
+  function compute(): HoverPlacement | null {
+    const el = triggerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const spaceAbove = rect.top;
+    const spaceBelow = vh - rect.bottom;
+    const placeBelow = spaceAbove < minSpace && spaceBelow > spaceAbove;
+    const top = placeBelow ? rect.bottom + HOVER_PREVIEW_GAP : rect.top - HOVER_PREVIEW_GAP;
+    let left = rect.left;
+    if (left + width > vw - 8) left = vw - 8 - width;
+    if (left < 8) left = 8;
+    return { left, top, placement: placeBelow ? "bottom" : "top" };
+  }
+
+  function handleEnter() {
+    if (leaveTimer.current) { window.clearTimeout(leaveTimer.current); leaveTimer.current = null; }
+    if (open) return;
+    enterTimer.current = window.setTimeout(() => {
+      const p = compute();
+      if (!p) return;
+      setPlacement(p);
+      setOpen(true);
+      requestAnimationFrame(() => requestAnimationFrame(() => setVisible(true)));
+    }, 120);
+  }
+  function handleLeave() {
+    if (enterTimer.current) { window.clearTimeout(enterTimer.current); enterTimer.current = null; }
+    if (!open) return;
+    setVisible(false);
+    leaveTimer.current = window.setTimeout(() => {
+      setOpen(false);
+      setPlacement(null);
+    }, 180);
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    function update() {
+      const p = compute();
+      if (p) setPlacement(p);
+    }
+    window.addEventListener("scroll", update, true);
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("scroll", update, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [open]);
+
+  useEffect(() => () => {
+    if (enterTimer.current) window.clearTimeout(enterTimer.current);
+    if (leaveTimer.current) window.clearTimeout(leaveTimer.current);
+  }, []);
+
+  return { triggerRef, open, visible, placement, handleEnter, handleLeave };
+}
+
+function HoverPanel({
+  visible,
+  placement,
+  className,
+  width = HOVER_PREVIEW_WIDTH,
+  onMouseEnter,
+  onMouseLeave,
+  children,
+}: {
+  visible: boolean;
+  placement: HoverPlacement;
+  className?: string;
+  width?: number;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
+  children: React.ReactNode;
+}) {
+  return createPortal(
+    <div
+      className={`hoverPanel ${className ?? ""} ${visible ? "visible" : ""}`}
+      role="tooltip"
+      style={{
+        position: "fixed",
+        left: placement.left,
+        top: placement.top,
+        width,
+        transform: placement.placement === "top" ? "translateY(-100%)" : "translateY(0)",
+      }}
+      data-placement={placement.placement}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
+function AttachmentHover({ attachment, children }: { attachment: PromptAttachment; children: React.ReactNode }) {
+  const visual = attachmentVisual(attachment);
+  const { triggerRef, open, visible, placement, handleEnter, handleLeave } = useHoverPopover();
+  return (
+    <span
+      ref={triggerRef}
+      className={`attachmentHover type-${visual.type} ${attachment.kind}`}
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+      onFocus={handleEnter}
+      onBlur={handleLeave}
+    >
+      {children}
+      {open && placement && (
+        <HoverPanel
+          visible={visible}
+          placement={placement}
+          className="attachmentHoverPanel"
+          onMouseEnter={handleEnter}
+          onMouseLeave={handleLeave}
+        >
+          <AttachmentRichPreview attachment={attachment} />
+          <div className="hoverPanelFoot">
+            <span className="hoverPanelName">{attachment.name}</span>
+            <span className="hoverPanelMeta">
+              {formatBytes(attachment.size)}
+              {attachment.kind === "text" && attachment.truncated ? " · truncated" : ""}
+            </span>
+          </div>
+        </HoverPanel>
+      )}
+    </span>
+  );
+}
+
+// Rich content preview shown inside the hover card. Discriminates on attachment
+// kind + filename so markdown renders as markdown, code highlights, images are
+// large, and unknown text falls back to a monospace snippet.
+function AttachmentRichPreview({ attachment }: { attachment: PromptAttachment }) {
+  if (attachment.kind === "image") {
+    return (
+      <div className="attachmentHoverMedia">
+        <img
+          className="attachmentHoverImage"
+          src={`data:${attachment.mimeType};base64,${attachment.data}`}
+          alt=""
+        />
+      </div>
+    );
+  }
+  const ext = fileExtension(attachment.name);
+  const snippet = attachment.text.length > 4000 ? attachment.text.slice(0, 4000) : attachment.text;
+  if (ext === "md" || ext === "mdx") {
+    return (
+      <div className="attachmentHoverScroll">
+        <Markdown text={snippet} compact />
+        {attachment.text.length > snippet.length ? <div className="attachmentHoverMore">…</div> : null}
+      </div>
+    );
+  }
+  if (codeAttachmentExtensions.has(ext) || dataAttachmentExtensions.has(ext)) {
+    return (
+      <div className="attachmentHoverScroll">
+        <CodeBlock code={snippet} lang={ext} />
+        {attachment.text.length > snippet.length ? <div className="attachmentHoverMore">…</div> : null}
+      </div>
+    );
+  }
+  return (
+    <div className="attachmentHoverScroll">
+      <pre className="attachmentHoverText">{snippet || "(empty)"}</pre>
+      {attachment.text.length > snippet.length ? <div className="attachmentHoverMore">…</div> : null}
+    </div>
+  );
+}
+
+// Inline tokenizer for user-typed chat input. Wraps `$skill` / `/command` in
+// styled chips ONLY when the body matches a real resource — that way a stray
+// `$3.50` or `/path/that/is/not/a/command` stays plain text. Files (`@path`)
+// stay highlighted on shape since we don't ship a directory index here.
+// `interactive` enables hover previews — disabled inside the composer overlay
+// where the chips live behind a textarea and can't accept pointer events.
+const MENTION_TOKEN_RE = /([\/$@])([A-Za-z0-9][A-Za-z0-9._\-\/]*)/g;
+function MentionedText({
+  text,
+  resources,
+  interactive = false,
+}: {
+  text: string;
+  resources?: PiResourceSummary | null;
+  interactive?: boolean;
+}) {
+  const skillByName = useMemo(() => {
+    const m = new Map<string, PiResourceSummary["skills"][number]>();
+    for (const s of resources?.skills ?? []) m.set(s.name, s);
+    return m;
+  }, [resources]);
+  const commandByName = useMemo(() => {
+    const m = new Map<string, PiResourceSummary["commands"][number]>();
+    for (const c of resources?.commands ?? []) m.set(c.name, c);
+    return m;
+  }, [resources]);
+
+  const nodes: React.ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  text.replace(MENTION_TOKEN_RE, (match, trigger: string, body: string, offset: number) => {
+    // Don't highlight mid-word triggers (URLs, prose containing `/` or `@`).
+    const prev = offset > 0 ? text[offset - 1] : "";
+    if (prev && /[A-Za-z0-9]/.test(prev)) return match;
+
+    let kind: "command" | "skill" | "file" | null = null;
+    if (trigger === "$") {
+      if (skillByName.has(body)) kind = "skill";
+    } else if (trigger === "/") {
+      if (commandByName.has(body)) kind = "command";
+    } else if (trigger === "@") {
+      // No directory catalog on the client; if it *looks* like a path we
+      // accept it. This matches what the popover inserts.
+      if (/[\/.]/.test(body)) kind = "file";
+    }
+
+    if (!kind) return match;
+    if (offset > last) nodes.push(<span key={key++}>{text.slice(last, offset)}</span>);
+    // The trigger is always rendered so the composer overlay stays glyph-
+    // aligned with the textarea. CSS hides it inside sent message bubbles
+    // where there's no caret to keep in sync.
+    const chip = (
+      <span className={`mentionToken kind-${kind}`}>
+        <span className="mentionToken-trigger">{trigger}</span>
+        {body}
+      </span>
+    );
+    nodes.push(
+      interactive
+        ? <MentionTokenHover key={key++} kind={kind} body={body} resources={resources ?? null}>{chip}</MentionTokenHover>
+        : <React.Fragment key={key++}>{chip}</React.Fragment>,
+    );
+    last = offset + match.length;
+    return match;
+  });
+  if (last < text.length) nodes.push(<span key={key++}>{text.slice(last)}</span>);
+  return <>{nodes}</>;
+}
+
+// Hover preview for a `$skill`, `/command`, or `@file` chip rendered in a
+// sent message. Skill / extension previews surface the YAML-frontmatter
+// description and source path (the structured metadata Pi already exposes
+// via `resources`). File previews show the resolved path + type label.
+function MentionTokenHover({
+  kind,
+  body,
+  resources,
+  children,
+}: {
+  kind: "skill" | "command" | "file";
+  body: string;
+  resources: PiResourceSummary | null;
+  children: React.ReactNode;
+}) {
+  const { triggerRef, open, visible, placement, handleEnter, handleLeave } = useHoverPopover({
+    width: 320,
+    minSpace: 180,
+  });
+  return (
+    <span
+      ref={triggerRef}
+      className={`mentionTokenHover kind-${kind}`}
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+      onFocus={handleEnter}
+      onBlur={handleLeave}
+    >
+      {children}
+      {open && placement && (
+        <HoverPanel
+          visible={visible}
+          placement={placement}
+          width={320}
+          className="mentionHoverPanel"
+          onMouseEnter={handleEnter}
+          onMouseLeave={handleLeave}
+        >
+          <MentionTokenPreview kind={kind} body={body} resources={resources} />
+        </HoverPanel>
+      )}
+    </span>
+  );
+}
+
+function MentionTokenPreview({
+  kind,
+  body,
+  resources,
+}: {
+  kind: "skill" | "command" | "file";
+  body: string;
+  resources: PiResourceSummary | null;
+}) {
+  if (kind === "skill") {
+    const skill = resources?.skills.find((s) => s.name === body);
+    if (!skill) return null;
+    const info = skill.sourceInfo;
+    return (
+      <div className="mentionPreview">
+        <div className="mentionPreviewHead">
+          <span className="mentionPreviewKind">Skill</span>
+          <span className="mentionPreviewName">{skill.name}</span>
+        </div>
+        {skill.description && <p className="mentionPreviewDesc">{skill.description}</p>}
+        {info && (
+          <div className="mentionPreviewMeta">
+            {info.scope && <span className="mentionPreviewTag">{info.scope}</span>}
+            {info.source && info.source !== "local" && <span className="mentionPreviewTag">{info.source}</span>}
+            {info.path && <code className="mentionPreviewPath">{compactPath(info.path)}</code>}
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (kind === "command") {
+    const cmd = resources?.commands.find((c) => c.name === body);
+    if (!cmd) return null;
+    // Extensions surface richer counts than plain commands — when the
+    // command is registered by an extension, fold the extension's counts
+    // into the preview so it reads as a card for the extension itself.
+    const extension = cmd.source === "extension" && cmd.sourceInfo?.path
+      ? resources?.extensions.find((e) => e.path === cmd.sourceInfo!.path || e.resolvedPath === cmd.sourceInfo!.path)
+      : null;
+    const sourceLabel = cmd.source === "builtin" ? "Built-in"
+      : cmd.source === "prompt" ? "Prompt"
+      : cmd.source === "extension" ? "Extension"
+      : cmd.source === "skill" ? "Skill"
+      : "Command";
+    return (
+      <div className="mentionPreview">
+        <div className="mentionPreviewHead">
+          <span className="mentionPreviewKind">{sourceLabel}</span>
+          <span className="mentionPreviewName">/{cmd.name}</span>
+        </div>
+        {cmd.description && <p className="mentionPreviewDesc">{cmd.description}</p>}
+        {extension && (
+          <div className="mentionPreviewCounts">
+            <span><strong>{extension.commandCount}</strong> commands</span>
+            <span><strong>{extension.toolCount}</strong> tools</span>
+            <span><strong>{extension.shortcutCount}</strong> shortcuts</span>
+            <span><strong>{extension.handlerCount}</strong> handlers</span>
+          </div>
+        )}
+        {cmd.sourceInfo?.path && (
+          <div className="mentionPreviewMeta">
+            <code className="mentionPreviewPath">{compactPath(cmd.sourceInfo.path)}</code>
+          </div>
+        )}
+      </div>
+    );
+  }
+  // File chip.
+  const ext = fileExtension(body);
+  const visualType = ext === "md" || ext === "mdx" ? "Document"
+    : codeAttachmentExtensions.has(ext) ? "Code file"
+    : dataAttachmentExtensions.has(ext) ? "Data file"
+    : sheetAttachmentExtensions.has(ext) ? "Table file"
+    : ext === "log" ? "Log file"
+    : "File";
+  const parts = body.split("/");
+  const filename = parts.pop() ?? body;
+  const dir = parts.join("/");
+  return (
+    <div className="mentionPreview">
+      <div className="mentionPreviewHead">
+        <span className="mentionPreviewKind">{visualType}</span>
+        <span className="mentionPreviewName">{filename}</span>
+      </div>
+      {dir && <div className="mentionPreviewMeta"><code className="mentionPreviewPath">{dir}/</code></div>}
+      {ext && <div className="mentionPreviewMeta"><span className="mentionPreviewTag">.{ext}</span></div>}
+    </div>
+  );
+}
+
+// Trim a long absolute path to its meaningful tail (last 2 segments) plus
+// a `…/` prefix. Keeps the hover compact while still showing where the
+// resource lives on disk.
+function compactPath(p: string): string {
+  const segs = p.split(/[\\/]/).filter(Boolean);
+  if (segs.length <= 3) return p;
+  return `…/${segs.slice(-3).join("/")}`;
+}
+
+function AttachmentPreview({ attachment }: { attachment: PromptAttachment }) {
+  const visual = attachmentVisual(attachment);
+  const state = attachmentState(attachment);
+  if (attachment.kind === "image") {
+    return (
+      <span className={`attachmentPreview image type-${visual.type} state-${state}`}>
+        <span className="attachmentImageThumb">
+          <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt="" />
+        </span>
+        <span className="attachmentName" title={attachment.name}>{attachment.name}</span>
+      </span>
+    );
+  }
+  return (
+    <span className={`attachmentPreview text type-${visual.type} state-${state}`}>
+      <span className="attachmentFileIcon" title={visual.title}>
+        <AttachmentTypeIcon visual={visual} />
+      </span>
+      <span className="attachmentName" title={attachment.name}>{attachment.name}</span>
+      {attachment.truncated ? <span className="attachmentFlag">truncated</span> : null}
+    </span>
+  );
+}
+
+type AttachmentVisual = {
+  type: "image" | "code" | "data" | "sheet" | "doc" | "log" | "text";
+  label: string;
+  title: string;
+};
+
+const codeAttachmentExtensions = new Set([
+  "bash", "c", "cc", "cjs", "cpp", "cs", "css", "dockerfile", "fish", "go", "h", "hpp",
+  "html", "java", "js", "jsx", "kt", "mjs", "php", "py", "rb", "rs", "scss", "sh",
+  "swift", "ts", "tsx", "xml", "zsh",
+]);
+const dataAttachmentExtensions = new Set(["env", "gitignore", "json", "jsonl", "sql", "toml", "yaml", "yml"]);
+const sheetAttachmentExtensions = new Set(["csv", "tsv"]);
+const docAttachmentExtensions = new Set(["md", "mdx"]);
+
+function attachmentState(attachment: PromptAttachment) {
+  return attachment.kind === "text" && attachment.truncated ? "truncated" : "ready";
+}
+
+function attachmentVisual(attachment: PromptAttachment): AttachmentVisual {
+  if (attachment.kind === "image") return { type: "image", label: imageAttachmentLabel(attachment.mimeType), title: "Image" };
+  const ext = fileExtension(attachment.name);
+  const label = attachmentLabel(ext || (attachment.mimeType?.split("/").pop() ?? "TXT"));
+  if (codeAttachmentExtensions.has(ext)) return { type: "code", label, title: "Code file" };
+  if (dataAttachmentExtensions.has(ext) || attachment.mimeType === "application/json") return { type: "data", label, title: "Data file" };
+  if (sheetAttachmentExtensions.has(ext)) return { type: "sheet", label, title: "Table file" };
+  if (docAttachmentExtensions.has(ext)) return { type: "doc", label, title: "Document" };
+  if (ext === "log") return { type: "log", label, title: "Log file" };
+  return { type: "text", label: label || "TXT", title: "Text file" };
+}
+
+function attachmentLabel(value: string) {
+  const clean = value.replace(/[^a-z0-9]+/gi, "").toUpperCase();
+  return clean.slice(0, 4) || "TXT";
+}
+
+function imageAttachmentLabel(mimeType: string) {
+  const suffix = mimeType.split("/").pop() ?? "";
+  if (suffix === "jpeg") return "JPG";
+  return attachmentLabel(suffix || "IMG");
+}
+
+function AttachmentTypeIcon({ visual }: { visual: AttachmentVisual }) {
+  if (visual.type === "code") return <IconCode size={13} />;
+  if (visual.type === "data") return <IconDb size={13} />;
+  if (visual.type === "sheet") return <IconChart size={13} />;
+  return <IconFile size={13} />;
 }
 
 function formatDuration(ms?: number): string | null {
@@ -2118,7 +3189,10 @@ function Composer({
   state,
   connection,
   value,
+  attachments,
   onValueChange,
+  onAddAttachments,
+  onRemoveAttachment,
   onSend,
   onSteer,
   onFollowUp,
@@ -2134,7 +3208,10 @@ function Composer({
   state: PiState | null;
   connection: string;
   value: string;
+  attachments: PromptAttachment[];
   onValueChange: (value: string) => void;
+  onAddAttachments: (files: File[]) => void | Promise<void>;
+  onRemoveAttachment: (id: string) => void;
   onSend: (text: string) => void;
   onSteer: (text: string) => void;
   onFollowUp: (text: string) => void;
@@ -2182,7 +3259,7 @@ function Composer({
     ?? "No model";
 
   function submit(mode: "send" | "steer" | "followUp" = "send") {
-    if (!value.trim() || disabled) return;
+    if ((!value.trim() && attachments.length === 0) || disabled) return;
     if (mode === "steer") onSteer(value.trim());
     else if (mode === "followUp") onFollowUp(value.trim());
     else onSend(value.trim());
@@ -2192,6 +3269,8 @@ function Composer({
   // Mention popover state — only one is open at a time. `mention` describes
   // the active trigger token; `mentionIndex` is the keyboard-highlighted item.
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [draggingFile, setDraggingFile] = useState(false);
   const [mention, setMention] = useState<MentionState | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const suggestions: MentionItem[] = (() => {
@@ -2287,23 +3366,77 @@ function Composer({
     }
   }
 
+  function attachFiles(files: File[]) {
+    if (files.length === 0 || disabled) return;
+    void onAddAttachments(files);
+  }
+
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = filesFromDataTransfer(event.clipboardData);
+    if (files.length) attachFiles(files);
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLDivElement>) {
+    const files = filesFromDataTransfer(event.dataTransfer);
+    if (files.length === 0) return;
+    event.preventDefault();
+    setDraggingFile(false);
+    attachFiles(files);
+  }
+
+  function handleDragOver(event: React.DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    setDraggingFile(true);
+  }
+
   return (
     <footer className="composerWrap">
       <ExtensionDock extension={extension} />
-      <div className="composer">
-        <button className="add" title="Attach"><IconPlusSlim size={16} /></button>
-        <textarea
-          ref={textareaRef}
-          value={value}
-          disabled={disabled}
-          onChange={handleChange}
-          onSelect={handleSelect}
-          onBlur={() => window.setTimeout(() => setMention(null), 120)}
-          placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…  (try /, $, @)"}
-          rows={1}
-          onKeyDown={handleKeyDown}
+      <div
+        className={`composer${draggingFile ? " dragging" : ""}`}
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragLeave={() => setDraggingFile(false)}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/png,image/jpeg,image/webp,image/gif,text/*,.md,.mdx,.json,.jsonl,.yaml,.yml,.toml,.xml,.html,.css,.scss,.js,.jsx,.ts,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cc,.cpp,.h,.hpp,.cs,.php,.sh,.bash,.zsh,.fish,.sql,.csv,.tsv,.log,.env,.gitignore,Dockerfile"
+          hidden
+          onChange={(event) => {
+            attachFiles(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+          }}
         />
-        {state?.isStreaming ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button> : <button className="send" onClick={() => submit()} title="Send"><IconArrowUpSlim size={16} /></button>}
+        {attachments.length > 0 && (
+          <div className="attachmentShelf" aria-label="Attachments">
+            {attachments.map((attachment) => (
+              <AttachmentChip key={attachment.id} attachment={attachment} onRemove={() => onRemoveAttachment(attachment.id)} />
+            ))}
+          </div>
+        )}
+        <div className="composerInputRow">
+          <button className="add" title="Attach" disabled={disabled} onClick={() => fileInputRef.current?.click()}>
+            <IconPlusSlim size={16} />
+          </button>
+          <ComposerInput
+            textareaRef={textareaRef}
+            value={value}
+            disabled={disabled}
+            placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…  (try /, $, @)"}
+            resources={resources}
+            onChange={handleChange}
+            onSelect={handleSelect}
+            onBlur={() => window.setTimeout(() => setMention(null), 120)}
+            onPaste={handlePaste}
+            onKeyDown={handleKeyDown}
+          />
+          {state?.isStreaming
+            ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button>
+            : <button className="send" onClick={() => submit()} title="Send" disabled={disabled || (!value.trim() && attachments.length === 0)}><IconArrowUpSlim size={16} /></button>}
+        </div>
         {mention && suggestions.length > 0 && (
           <MentionPopover
             trigger={mention.trigger}
@@ -2511,6 +3644,75 @@ function AnsiLine({ line }: { line: string }) {
   );
 }
 
+// Textarea + a layered highlighter so /commands, $skills, @files render with
+// the same accent emphasis the popover uses. The textarea sits on top with a
+// transparent fill but a normal caret color; the overlay div renders styled
+// tokens behind it with identical typography and padding, kept in sync via
+// the shared value. We keep the textarea opaque to the caret/selection but
+// transparent to the painted text via `-webkit-text-fill-color: transparent`.
+function ComposerInput({
+  textareaRef,
+  value,
+  disabled,
+  placeholder,
+  resources,
+  onChange,
+  onSelect,
+  onBlur,
+  onPaste,
+  onKeyDown,
+}: {
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
+  value: string;
+  disabled?: boolean;
+  placeholder: string;
+  resources?: PiResourceSummary | null;
+  onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  onSelect: (event: React.SyntheticEvent<HTMLTextAreaElement>) => void;
+  onBlur: () => void;
+  onPaste: (event: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+  onKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+}) {
+  const highlightRef = useRef<HTMLDivElement | null>(null);
+  function syncScroll() {
+    const ta = textareaRef.current;
+    const hl = highlightRef.current;
+    if (!ta || !hl) return;
+    hl.scrollTop = ta.scrollTop;
+    hl.scrollLeft = ta.scrollLeft;
+  }
+  return (
+    <div className="composerText">
+      <div
+        ref={highlightRef}
+        className="composerTextHighlight"
+        aria-hidden
+      >
+        <MentionedText text={value} resources={resources} />
+        {/* Trailing newline guarantees the last line renders with full height
+            even when the textarea ends with `\n` — mirrors what the textarea
+            does internally. */}
+        <span>{"​"}</span>
+      </div>
+      <textarea
+        ref={textareaRef}
+        className="composerTextarea"
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        rows={1}
+        spellCheck={false}
+        onChange={(event) => { onChange(event); syncScroll(); }}
+        onSelect={onSelect}
+        onBlur={onBlur}
+        onPaste={onPaste}
+        onScroll={syncScroll}
+        onKeyDown={onKeyDown}
+      />
+    </div>
+  );
+}
+
 function MentionPopover({
   trigger,
   items,
@@ -2531,20 +3733,25 @@ function MentionPopover({
     <div className="mention" role="listbox" aria-label={heading}>
       <div className="mention-head">{heading}</div>
       <ul className="mention-list">
-        {items.map((item, index) => (
-          <li
-            key={`${item.kind}-${item.insert}`}
-            role="option"
-            aria-selected={index === highlightedIndex}
-            className={`mention-item${index === highlightedIndex ? " active" : ""}`}
-            onMouseEnter={() => onHover(index)}
-            onMouseDown={(event) => { event.preventDefault(); onPick(item); }}
-          >
-            <span className="mention-label">{item.label}</span>
-            {item.description && <span className="mention-desc">{item.description}</span>}
-            {item.group && <span className="mention-group">{item.group}</span>}
-          </li>
-        ))}
+        {items.map((item, index) => {
+          const emphasis = item.kind === "skill" || item.group === "Extensions";
+          return (
+            <li
+              key={`${item.kind}-${item.insert}`}
+              role="option"
+              aria-selected={index === highlightedIndex}
+              className={`mention-item${index === highlightedIndex ? " active" : ""}${emphasis ? " emphasis" : ""}`}
+              data-kind={item.kind}
+              data-group={item.group}
+              onMouseEnter={() => onHover(index)}
+              onMouseDown={(event) => { event.preventDefault(); onPick(item); }}
+            >
+              <span className="mention-label">{item.label}</span>
+              {item.description && <span className="mention-desc">{item.description}</span>}
+              {item.group && <span className="mention-group">{item.group}</span>}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
@@ -2565,10 +3772,15 @@ function LeftSidebar({
   workspaces,
   activeWorkspaceId,
   sessionsByWorkspace,
+  openWorkspaceIds,
+  expandedSessionWorkspaceIds,
+  onOpenWorkspaceIdsChange,
+  onExpandedSessionWorkspaceIdsChange,
   pendingUiByRouteKey,
   unreadDoneByRouteKey,
   activeSessionFile,
   activeSessionId,
+  activeOrbSeed,
   activeIsStreaming,
   onOpenSettings,
 }: {
@@ -2584,21 +3796,25 @@ function LeftSidebar({
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   sessionsByWorkspace: Record<string, PiSessionInfo[]>;
+  openWorkspaceIds: Set<string>;
+  expandedSessionWorkspaceIds: Set<string>;
+  onOpenWorkspaceIdsChange: (next: Set<string>) => void;
+  onExpandedSessionWorkspaceIdsChange: (next: Set<string>) => void;
   pendingUiByRouteKey: Set<string>;
   unreadDoneByRouteKey: Set<string>;
   activeSessionFile?: string;
   activeSessionId?: string;
+  activeOrbSeed: string;
   activeIsStreaming: boolean;
   onOpenSettings: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const [openWorkspaces, setOpenWorkspaces] = useState<Set<string>>(() => new Set());
-  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     if (!activeWorkspaceId) return;
-    setOpenWorkspaces((prev) => new Set(prev).add(activeWorkspaceId));
-  }, [activeWorkspaceId]);
+    if (openWorkspaceIds.has(activeWorkspaceId)) return;
+    onOpenWorkspaceIdsChange(new Set(openWorkspaceIds).add(activeWorkspaceId));
+  }, [activeWorkspaceId, openWorkspaceIds]);
   function confirmDelete(workspaceId: string, session: PiSessionInfo) {
     const label = session.name || session.firstMessage || "Untitled";
     toast(`Delete "${label}"?`, {
@@ -2635,24 +3851,20 @@ function LeftSidebar({
   function toggleWorkspace(id: string) {
     // Expansion and active-workspace are decoupled: the workspace row is just
     // an accordion. Picking a session inside it is the explicit switch.
-    setOpenWorkspaces((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else {
-        next.add(id);
-        onListSessions(id);
-      }
-      return next;
-    });
+    const next = new Set(openWorkspaceIds);
+    if (next.has(id)) next.delete(id);
+    else {
+      next.add(id);
+      onListSessions(id);
+    }
+    onOpenWorkspaceIdsChange(next);
   }
 
   function toggleExpanded(workspaceId: string) {
-    setExpandedSessions((prev) => {
-      const next = new Set(prev);
-      if (next.has(workspaceId)) next.delete(workspaceId);
-      else next.add(workspaceId);
-      return next;
-    });
+    const next = new Set(expandedSessionWorkspaceIds);
+    if (next.has(workspaceId)) next.delete(workspaceId);
+    else next.add(workspaceId);
+    onExpandedSessionWorkspaceIdsChange(next);
   }
 
   return (
@@ -2691,8 +3903,8 @@ function LeftSidebar({
             workspaces.map((workspace) => {
               const isActive = workspace.id === activeWorkspaceId;
               const wsSessions = sessionsForWorkspace(workspace.id);
-              const isOpen = q ? wsSessions.length > 0 : openWorkspaces.has(workspace.id);
-              const expanded = expandedSessions.has(workspace.id);
+              const isOpen = q ? wsSessions.length > 0 : openWorkspaceIds.has(workspace.id);
+              const expanded = expandedSessionWorkspaceIds.has(workspace.id);
               const visible = expanded || q ? wsSessions : wsSessions.slice(0, SESSIONS_INITIAL_LIMIT);
               const hiddenCount = wsSessions.length - visible.length;
               return (
@@ -2733,7 +3945,7 @@ function LeftSidebar({
                               {visible.map((session) => {
                                 const isCurrent = session.path === activeSessionFile || session.id === activeSessionId;
                                 const running = !!session.isRunning || (isCurrent && activeIsStreaming);
-                                const orbSeed = isCurrent && activeSessionId ? activeSessionId : session.liveSessionId ?? session.id;
+                                const orbSeed = isCurrent ? activeOrbSeed : session.liveSessionId ?? session.id;
                                 const hasPendingUi = pendingUiByRouteKey.has(sessionRouteKey({
                                   runtimeId: session.liveSessionId ?? session.id,
                                   workspaceId: workspace.id,
@@ -2811,8 +4023,8 @@ type SettingsTab = "appearance" | "connections";
 
 function SettingsScreen({
   onBack,
-  dark,
-  onToggleDark,
+  appearance,
+  onUpdateAppearance,
   models,
   currentModel,
   resources,
@@ -2820,8 +4032,8 @@ function SettingsScreen({
   onUpdateSettings,
 }: {
   onBack: () => void;
-  dark: boolean;
-  onToggleDark: () => void;
+  appearance: PiSettings["appearance"];
+  onUpdateAppearance: (patch: Partial<PiSettings["appearance"]>) => void;
   models: PiModelSummary[];
   currentModel: PiState["model"];
   resources: PiResourceSummary | null;
@@ -2899,11 +4111,16 @@ function SettingsScreen({
               <section className="settingsSection">
                 <h3>Appearance</h3>
                 <div className="settingsRow">
-                  <label className="settingsLabel">Theme</label>
-                  <button className="settingsToggle" onClick={onToggleDark}>
-                    {dark ? <IconSun size={13} /> : <IconMoon size={13} />}
-                    <span>{dark ? "Light mode" : "Dark mode"}</span>
-                  </button>
+                  <label className="settingsLabel" htmlFor="theme-mode">Theme</label>
+                  <select
+                    id="theme-mode"
+                    value={appearance.colorScheme}
+                    onChange={(event) => onUpdateAppearance({ colorScheme: event.target.value as PiSettings["appearance"]["colorScheme"] })}
+                  >
+                    <option value="system">System</option>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                  </select>
                 </div>
               </section>
 
@@ -3188,25 +4405,36 @@ type EditorInfo = { id: string; label: string; hasIcon: boolean };
 function RightSidebar({
   open,
   onToggle,
+  tab,
+  onTabChange,
   git,
   files,
+  workspaceId,
   workspaceName,
   width,
   onWidthChange,
+  onWidthCommit,
+  fileTreeOpenPathsByWorkspace,
+  onFileTreeOpenPathsChange,
   editors,
   onOpenInEditor,
 }: {
   open: boolean;
   onToggle: () => void;
+  tab: "diffs" | "files";
+  onTabChange: (tab: "diffs" | "files") => void;
   git: GitSnapshot | null;
   files: string[];
+  workspaceId: string | null;
   workspaceName: string;
   width: number;
   onWidthChange: (next: number) => void;
+  onWidthCommit: (next: number) => void;
+  fileTreeOpenPathsByWorkspace: Record<string, string[]>;
+  onFileTreeOpenPathsChange: (workspaceId: string, paths: string[]) => void;
   editors: EditorInfo[];
   onOpenInEditor: (editor: string, path: string) => void;
 }) {
-  const [tab, setTab] = useState<"diffs" | "files">("diffs");
   // Clamp tracking for the resize handle. Min/max keep the sidebar useful
   // (can't scrunch file paths into illegibility, can't eat the chat column).
   const RIGHT_MIN = 220;
@@ -3216,10 +4444,12 @@ function RightSidebar({
     e.preventDefault();
     const startX = e.clientX;
     const startW = width;
+    let lastW = width;
     const onMove = (ev: MouseEvent) => {
       // Handle is on the LEFT edge of the right sidebar; dragging the cursor
       // left should make the sidebar wider, so subtract the delta.
       const next = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, startW + (startX - ev.clientX)));
+      lastW = next;
       onWidthChange(next);
     };
     const onUp = () => {
@@ -3227,6 +4457,7 @@ function RightSidebar({
       window.removeEventListener("mouseup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      onWidthCommit(lastW);
     };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
@@ -3254,14 +4485,14 @@ function RightSidebar({
           <div className="sideHead-tabs">
             <button
               className={`sideHead-tab ${tab === "diffs" ? "active" : ""}`}
-              onClick={() => setTab("diffs")}
+              onClick={() => onTabChange("diffs")}
               aria-selected={tab === "diffs"}
             >
               Diffs
             </button>
             <button
               className={`sideHead-tab ${tab === "files" ? "active" : ""}`}
-              onClick={() => setTab("files")}
+              onClick={() => onTabChange("files")}
               aria-selected={tab === "files"}
             >
               Files
@@ -3273,7 +4504,7 @@ function RightSidebar({
         </div>
         {tab === "diffs"
           ? <DiffsPanel git={git} editors={editors} onOpenInEditor={onOpenInEditor} />
-          : <FilesPanel files={files} workspaceName={workspaceName} editors={editors} onOpenInEditor={onOpenInEditor} />}
+          : <FilesPanel files={files} workspaceId={workspaceId} workspaceName={workspaceName} openPathsByWorkspace={fileTreeOpenPathsByWorkspace} onOpenPathsChange={onFileTreeOpenPathsChange} editors={editors} onOpenInEditor={onOpenInEditor} />}
       </div>
     </aside>
   );
@@ -3429,7 +4660,27 @@ function buildFileTree(paths: string[]): FileNode {
   return root;
 }
 
-function FilesPanel({ files, workspaceName, editors, onOpenInEditor }: { files: string[]; workspaceName: string; editors: EditorInfo[]; onOpenInEditor: (editor: string, path: string) => void }) {
+function defaultOpenFileTreePaths(root: FileNode): string[] {
+  return root.children.filter((node) => !node.isFile).map((node) => node.path);
+}
+
+function FilesPanel({
+  files,
+  workspaceId,
+  workspaceName,
+  openPathsByWorkspace,
+  onOpenPathsChange,
+  editors,
+  onOpenInEditor,
+}: {
+  files: string[];
+  workspaceId: string | null;
+  workspaceName: string;
+  openPathsByWorkspace: Record<string, string[]>;
+  onOpenPathsChange: (workspaceId: string, paths: string[]) => void;
+  editors: EditorInfo[];
+  onOpenInEditor: (editor: string, path: string) => void;
+}) {
   if (files.length === 0) {
     return (
       <SidePanelEmpty
@@ -3439,6 +4690,18 @@ function FilesPanel({ files, workspaceName, editors, onOpenInEditor }: { files: 
     );
   }
   const tree = buildFileTree(files);
+  const hasPersistedOpenPaths = !!workspaceId && hasOwn(openPathsByWorkspace, workspaceId);
+  const openPaths = hasPersistedOpenPaths && workspaceId
+    ? openPathsByWorkspace[workspaceId] ?? []
+    : defaultOpenFileTreePaths(tree);
+  const openPathSet = new Set(openPaths);
+  function togglePath(path: string, open: boolean) {
+    if (!workspaceId) return;
+    const next = new Set(openPathSet);
+    if (open) next.add(path);
+    else next.delete(path);
+    onOpenPathsChange(workspaceId, [...next]);
+  }
   return (
     <div className="sidePanel">
       {workspaceName && (
@@ -3451,23 +4714,33 @@ function FilesPanel({ files, workspaceName, editors, onOpenInEditor }: { files: 
         <span className="sidePanel-label">{files.length === 1 ? "1 file" : `${files.length} files`}</span>
       </div>
       <ul className="fileTree" role="tree">
-        {tree.children.map((node) => <FileTreeNode key={node.path} node={node} depth={0} editors={editors} onOpenInEditor={onOpenInEditor} />)}
+        {tree.children.map((node) => (
+          <FileTreeNode
+            key={node.path}
+            node={node}
+            depth={0}
+            openPathSet={openPathSet}
+            onTogglePath={togglePath}
+            editors={editors}
+            onOpenInEditor={onOpenInEditor}
+          />
+        ))}
       </ul>
     </div>
   );
 }
 
 function FileTreeNode({
-  node, depth, editors, onOpenInEditor,
+  node, depth, openPathSet, onTogglePath, editors, onOpenInEditor,
 }: {
   node: FileNode;
   depth: number;
+  openPathSet: Set<string>;
+  onTogglePath: (path: string, open: boolean) => void;
   editors: EditorInfo[];
   onOpenInEditor: (editor: string, path: string) => void;
 }) {
-  // Root-level folders open by default; nested folders collapsed so a deep
-  // monorepo doesn't dump thousands of rows up front.
-  const [open, setOpen] = useState(depth === 0 && !node.isFile);
+  const open = openPathSet.has(node.path);
   const padding = 8 + depth * 12;
   if (node.isFile) {
     return (
@@ -3486,7 +4759,7 @@ function FileTreeNode({
         type="button"
         className="fileTree-folderHead"
         style={{ paddingLeft: padding }}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => onTogglePath(node.path, !open)}
         aria-expanded={open}
       >
         <span className="fileTree-chev" aria-hidden="true">{open ? "▾" : "▸"}</span>
@@ -3494,7 +4767,17 @@ function FileTreeNode({
       </button>
       {open && (
         <ul role="group">
-          {node.children.map((child) => <FileTreeNode key={child.path} node={child} depth={depth + 1} editors={editors} onOpenInEditor={onOpenInEditor} />)}
+          {node.children.map((child) => (
+            <FileTreeNode
+              key={child.path}
+              node={child}
+              depth={depth + 1}
+              openPathSet={openPathSet}
+              onTogglePath={onTogglePath}
+              editors={editors}
+              onOpenInEditor={onOpenInEditor}
+            />
+          ))}
         </ul>
       )}
     </li>
