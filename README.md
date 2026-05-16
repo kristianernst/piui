@@ -31,7 +31,15 @@ By default the daemon registers this repo as the first workspace. Add more works
 PIUI_CWD=/path/to/your/project npm run dev
 ```
 
-Workspace registry is stored at `~/.pi/agent/piui-workspaces.json`.
+## State & config
+
+Piui keeps small app state in the Pi agent directory:
+
+- `~/.pi/agent/piui-workspaces.json` — workspace registry.
+- `~/.pi/agent/piui-settings.json` — durable user settings, including theme, sidebar visibility, sidebar width, default model, default reasoning, title model, and starter prompt preference.
+- `~/.pi/agent/piui-navigation.json` — restore-only navigation state, including the active workspace/session, expanded workspace rows, expanded session lists, file-tree folders, and right-panel tab.
+
+The browser should not be the source of truth for durable Piui state; it hydrates these files through the local daemon on startup.
 
 ## Extensions
 
