@@ -9,10 +9,13 @@ import {
   IconArrowUpSlim,
   IconBranch,
   IconBolt,
+  IconCheck,
   IconChev,
   IconChart,
   IconClose,
   IconCode,
+  IconCopy,
+  IconEdit,
   IconDb,
   IconExpand,
   IconFile,
@@ -129,6 +132,12 @@ type SessionCache = {
   extension: ExtensionRun | null;
   uiRequest: ExtensionUiRequest | null;
   shortcuts: Shortcut[];
+  // Inline edit state. `editingMessageId` points at a past user-turn the
+  // viewer is rewriting; `editingDraft` is the textarea buffer for that edit.
+  // Resetting on session/workspace switch keeps the experience local to where
+  // the user clicked Edit.
+  editingMessageId: string | null;
+  editingDraft: string;
 };
 
 type AppErrorBoundaryState = { error?: Error };
@@ -359,6 +368,8 @@ function emptySessionCache(route: SessionRoute): SessionCache {
     extension: null,
     uiRequest: null,
     shortcuts: [],
+    editingMessageId: null,
+    editingDraft: "",
   };
 }
 
@@ -819,6 +830,10 @@ function App() {
   const lastRouteByWorkspaceRef = useRef<Record<string, SessionRoute>>({});
   const sessionsByWorkspaceRef = useRef<Record<string, PiSessionInfo[]>>({});
   const clientMessageSeqRef = useRef<Record<string, number>>({});
+  // Pending edit-and-resend operations. Keyed by the fork command id we sent —
+  // once the server's response packet for that id arrives we fire the rewritten
+  // prompt against the now-active forked session.
+  const pendingEditsRef = useRef<Map<string, { text: string }>>(new Map());
   const threadRef = useRef<HTMLDivElement>(null);
   // Autoscroll is "sticky" — we follow new content to the bottom unless the
   // user has manually scrolled away. Once they scroll back near the bottom we
@@ -899,6 +914,74 @@ function App() {
       ...cache,
       draft: typeof value === "function" ? value(cache.draft) : value,
     })));
+  }
+
+  // Begin editing a past user-turn in place. Opens an inline editor on that
+  // message; sending from there forks the session at that point (truncating
+  // the rest) and submits the rewritten prompt.
+  function beginEditMessage(message: UiMessage) {
+    if (message.role !== "user" || !message.text) return;
+    const route = activeRouteRef.current;
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      editingMessageId: message.id,
+      editingDraft: message.text,
+    })));
+  }
+
+  function updateEditingDraft(value: string) {
+    const route = activeRouteRef.current;
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      editingDraft: value,
+    })));
+  }
+
+  function cancelEditMessage() {
+    const route = activeRouteRef.current;
+    if (!route) return;
+    setSessionCaches((prev) => updateCache(prev, route, (cache) => ({
+      ...cache,
+      editingMessageId: null,
+      editingDraft: "",
+    })));
+  }
+
+  function submitEditMessage(message: UiMessage, newText: string) {
+    const trimmed = newText.trim();
+    if (!trimmed) return;
+    const route = activeRouteRef.current;
+    if (!route) return;
+    const cache = activeCache;
+    if (!cache) return;
+    // Map the UI message → tree entryId by walking user turns in order. The
+    // tree is the source of truth Pi expects for fork.
+    const userMessages = cache.messages.filter((m) => m.role === "user" && !m.optimistic);
+    const messageIndex = userMessages.findIndex((m) => m.id === message.id);
+    if (messageIndex < 0) {
+      pushNotice("Could not locate this message for editing.", "warning");
+      return;
+    }
+    const userEntries = cache.tree.filter((e) => e.type === "message" && typeof e.text === "string");
+    const entry = userEntries[messageIndex];
+    if (!entry) {
+      pushNotice("This message hasn't been saved yet — try again in a moment.", "warning");
+      return;
+    }
+    const commandId = `edit-${route.runtimeId}-${Date.now()}`;
+    pendingEditsRef.current.set(commandId, { text: trimmed });
+    // Clear the editor immediately — once we send the fork the message list
+    // will be replaced by the truncated history, and the optimistic prompt
+    // will appear at the bottom.
+    setSessionCaches((prev) => updateCache(prev, route, (current) => ({
+      ...current,
+      editingMessageId: null,
+      editingDraft: "",
+    })));
+    stickToBottomRef.current = true;
+    socketRef.current?.send({ ...route, type: "fork", entryId: entry.id, id: commandId });
   }
 
   async function addComposerFiles(files: File[]) {
@@ -1045,8 +1128,25 @@ function App() {
         applyEventPacket(packet.data);
         return;
       }
-      if (packet.type === "response" && !packet.success) {
-        pushNotice(packet.error ?? "Unknown Pi error", "error");
+      if (packet.type === "response") {
+        // Edit-and-resend flow: a "fork" we initiated lands here once the
+        // server has activated the new branched session. The activation
+        // snapshot (state/messages/tree) has already been delivered earlier
+        // in the same packet stream, so activeRouteRef points at the new
+        // runtime by now — we can fire the rewritten prompt straight away.
+        if (packet.command === "fork" && packet.id && pendingEditsRef.current.has(packet.id)) {
+          const pending = pendingEditsRef.current.get(packet.id)!;
+          pendingEditsRef.current.delete(packet.id);
+          if (packet.success) {
+            sendPrompt(pending.text);
+          } else {
+            pushNotice(packet.error ?? "Couldn't fork session for edit", "error");
+          }
+          return;
+        }
+        if (!packet.success) {
+          pushNotice(packet.error ?? "Unknown Pi error", "error");
+        }
       }
     }, setConnection);
     socketRef.current = socket;
@@ -1500,6 +1600,13 @@ function App() {
 
   const sessionTitle = state?.workspace.name ? state.workspace.name : "Pi";
   const headerTitle = messages[0]?.text.slice(0, 64) || sessionTitle;
+  // Reasoning timelines should not all compete for attention. While the
+  // agent is running, only the active turn stays open. Once idle, the latest
+  // completed assistant turn may stay open if it is small; older turns fold
+  // into a compact "Worked …" summary unless the user manually overrode them.
+  const latestCompletedAssistantId = activeIsStreaming
+    ? null
+    : [...messages].reverse().find((message) => message.role === "assistant" && !message.streaming)?.id ?? null;
 
   if (settingsOpen) {
     return (
@@ -1578,7 +1685,26 @@ function App() {
             ? <NoWorkspaceState onOpenWorkspace={openWorkspace} />
             : (messages.length === 0
                 ? <EmptyState />
-                : messages.map((message) => <MessageView key={message.id} message={message} seed={activeOrbSeed} resources={resources} />))}
+                : messages.map((message) => {
+                    const isEditing = activeCache?.editingMessageId === message.id;
+                    return (
+                      <MessageView
+                        key={message.id}
+                        message={message}
+                        seed={activeOrbSeed}
+                        resources={resources}
+                        onEdit={beginEditMessage}
+                        editing={message.role === "user" ? {
+                          active: isEditing,
+                          draft: activeCache?.editingDraft ?? "",
+                          onChange: updateEditingDraft,
+                          onSubmit: (text) => submitEditMessage(message, text),
+                          onCancel: cancelEditMessage,
+                        } : undefined}
+                        latestCompleted={message.id === latestCompletedAssistantId}
+                      />
+                    );
+                  }))}
         </div>
 
         {activeWorkspaceId !== null && <Composer
@@ -1779,13 +1905,60 @@ function NoWorkspaceState({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   );
 }
 
-function MessageView({ message, seed, resources }: { message: UiMessage; seed?: string; resources?: PiResourceSummary | null }) {
+type MessageEditingProps = {
+  active: boolean;
+  draft: string;
+  onChange: (value: string) => void;
+  onSubmit: (text: string) => void;
+  onCancel: () => void;
+};
+
+function MessageView({
+  message,
+  seed,
+  resources,
+  onEdit,
+  editing,
+  latestCompleted,
+}: {
+  message: UiMessage;
+  seed?: string;
+  resources?: PiResourceSummary | null;
+  onEdit?: (message: UiMessage) => void;
+  editing?: MessageEditingProps;
+  latestCompleted?: boolean;
+}) {
   if (message.role === "user") {
+    const canEdit = !message.optimistic && !!onEdit && !!message.text;
+    if (editing?.active) {
+      return (
+        <div className="msg user fadeUp">
+          <UserMessageEditor
+            value={editing.draft}
+            onChange={editing.onChange}
+            onSubmit={() => editing.onSubmit(editing.draft)}
+            onCancel={editing.onCancel}
+          />
+        </div>
+      );
+    }
     return (
       <div className="msg user fadeUp">
-        <div className="bubble">
-          {message.attachments && message.attachments.length > 0 ? <AttachmentList attachments={message.attachments} compact /> : null}
-          {message.text ? <div className="bubbleText"><MentionedText text={message.text} resources={resources} interactive /></div> : null}
+        <div className="msgUserCol">
+          <div className="bubble">
+            {message.attachments && message.attachments.length > 0 ? <AttachmentList attachments={message.attachments} compact /> : null}
+            {message.text ? <div className="bubbleText"><MentionedText text={message.text} resources={resources} interactive /></div> : null}
+          </div>
+          <div className="msgActions">
+            {canEdit && (
+              <MessageActionButton title="Edit message" onClick={() => onEdit?.(message)}>
+                <IconEdit size={13} />
+              </MessageActionButton>
+            )}
+            {message.text && (
+              <CopyActionButton text={message.text} title="Copy message" />
+            )}
+          </div>
         </div>
       </div>
     );
@@ -1803,6 +1976,9 @@ function MessageView({ message, seed, resources }: { message: UiMessage; seed?: 
   const isWorking = !!message.streaming;
   const toolCount = timeline.reduce((sum, block) => sum + (block.kind === "tool" ? 1 : 0), 0);
   const durationMs = message.startedAt && message.endedAt ? message.endedAt - message.startedAt : undefined;
+  // Only show the copy button once the answer is fully streamed — copying a
+  // half-written response is rarely what the user wants.
+  const canCopyAnswer = !!answer && !isWorking;
 
   return (
     <div className="msg assistant fadeUp">
@@ -1813,10 +1989,149 @@ function MessageView({ message, seed, resources }: { message: UiMessage; seed?: 
           toolCount={toolCount}
           durationMs={durationMs}
           seed={seed ?? message.id}
+          messageId={message.id}
+          latestCompleted={!!latestCompleted}
         />
       )}
       {answer ? <Markdown text={answer} /> : null}
+      {canCopyAnswer && (
+        <div className="msgActions">
+          <CopyActionButton text={answer} title="Copy response" />
+        </div>
+      )}
     </div>
+  );
+}
+
+function UserMessageEditor({
+  value,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  // Autosize: grow with content, capped so a huge paste doesn't shove the
+  // composer off-screen. The cap matches the bubble's natural max-height feel.
+  useLayoutEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 360)}px`;
+  }, [value]);
+  // Focus + move caret to end on mount so the user can immediately start
+  // typing rather than reading where the cursor landed.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.focus();
+    const length = ta.value.length;
+    try { ta.setSelectionRange(length, length); } catch { /* noop */ }
+  }, []);
+  function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onCancel();
+      return;
+    }
+    // Enter submits, Shift+Enter inserts a newline — same contract as the
+    // main composer so muscle memory carries over.
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      if (value.trim()) onSubmit();
+    }
+  }
+  const canSubmit = !!value.trim();
+  return (
+    <div className="msgEditor">
+      <textarea
+        ref={taRef}
+        className="msgEditorTextarea"
+        value={value}
+        spellCheck={false}
+        rows={1}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+      <div className="msgEditorControls">
+        <span className="msgEditorHint">Esc to cancel · Enter to send</span>
+        <div className="msgEditorButtons">
+          <button type="button" className="msgEditorButton ghost" onClick={onCancel}>Cancel</button>
+          <button
+            type="button"
+            className="msgEditorButton primary"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessageActionButton({ children, title, onClick }: { children: React.ReactNode; title: string; onClick: () => void }) {
+  return (
+    <button type="button" className="msgAction" title={title} aria-label={title} onClick={onClick}>
+      {children}
+    </button>
+  );
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to execCommand fallback
+    }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    ta.style.pointerEvents = "none";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function CopyActionButton({ text, title }: { text: string; title: string }) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+  }, []);
+  async function handleClick() {
+    const ok = await copyTextToClipboard(text);
+    if (!ok) { toast.error("Couldn't copy"); return; }
+    setCopied(true);
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => setCopied(false), 1400);
+  }
+  return (
+    <button
+      type="button"
+      className={`msgAction${copied ? " copied" : ""}`}
+      title={copied ? "Copied" : title}
+      aria-label={title}
+      onClick={handleClick}
+    >
+      {copied ? <IconCheck size={13} /> : <IconCopy size={13} />}
+    </button>
   );
 }
 
@@ -1859,7 +2174,8 @@ type HoverPlacement = { left: number; top: number; placement: "top" | "bottom" }
 function useHoverPopover({
   width = HOVER_PREVIEW_WIDTH,
   minSpace = 220,
-}: { width?: number; minSpace?: number } = {}) {
+  align = "start",
+}: { width?: number; minSpace?: number; align?: "start" | "center" } = {}) {
   const triggerRef = useRef<HTMLSpanElement | null>(null);
   const [placement, setPlacement] = useState<HoverPlacement | null>(null);
   // Open mounts the portal; visible drives the animation. Decoupling lets the
@@ -1879,7 +2195,12 @@ function useHoverPopover({
     const spaceBelow = vh - rect.bottom;
     const placeBelow = spaceAbove < minSpace && spaceBelow > spaceAbove;
     const top = placeBelow ? rect.bottom + HOVER_PREVIEW_GAP : rect.top - HOVER_PREVIEW_GAP;
-    let left = rect.left;
+    // `start`: panel's left edge aligns with trigger's left (good for chips
+    // where the panel reads from the same start point as the chip).
+    // `center`: panel centers horizontally over the trigger (good for tiny
+    // icon-sized triggers like the context wheel, where left-alignment makes
+    // the panel float weirdly off to one side).
+    let left = align === "center" ? rect.left + rect.width / 2 - width / 2 : rect.left;
     if (left + width > vw - 8) left = vw - 8 - width;
     if (left < 8) left = 8;
     return { left, top, placement: placeBelow ? "bottom" : "top" };
@@ -2334,11 +2655,73 @@ function formatDuration(ms?: number): string | null {
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-// Threshold above which a *completed* turn collapses by default. While the
-// turn is still streaming we always keep the timeline expanded so the user
-// can watch progress; once it settles, a long reasoning trail folds into a
-// "Worked …" pill so the chat stays readable.
-const REASONING_AUTO_COLLAPSE_THRESHOLD = 5;
+const REASONING_MANUAL_STATE_KEY = "piui:reasoning-open:v1";
+const REASONING_MANUAL_STATE_LIMIT = 300;
+const REASONING_LARGE_STEP_THRESHOLD = 5;
+const REASONING_LARGE_TOOL_THRESHOLD = 4;
+const REASONING_LARGE_TEXT_CHARS = 3500;
+const REASONING_LARGE_TOOL_OUTPUT_CHARS = 1200;
+
+function readReasoningManualState(): Record<string, boolean> {
+  try {
+    if (typeof window === "undefined") return {};
+    const raw = window.localStorage.getItem(REASONING_MANUAL_STATE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>)
+        .filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean"),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function readReasoningManualOpen(messageId: string): boolean | undefined {
+  return readReasoningManualState()[messageId];
+}
+
+function writeReasoningManualOpen(messageId: string, open: boolean) {
+  try {
+    if (typeof window === "undefined") return;
+    const state = readReasoningManualState();
+    state[messageId] = open;
+    const entries = Object.entries(state).slice(-REASONING_MANUAL_STATE_LIMIT);
+    window.localStorage.setItem(REASONING_MANUAL_STATE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // localStorage can be unavailable in hardened browsers; collapse behavior
+    // still works for the current render via component state.
+  }
+}
+
+function isLargeReasoningTurn(blocks: UiBlock[], toolCount: number) {
+  if (blocks.length > REASONING_LARGE_STEP_THRESHOLD) return true;
+  if (toolCount > REASONING_LARGE_TOOL_THRESHOLD) return true;
+  let textChars = 0;
+  for (const block of blocks) {
+    if (block.kind === "thought" || block.kind === "text") textChars += block.text.length;
+    if (block.kind === "tool") {
+      if ((block.tool.output?.length ?? 0) > REASONING_LARGE_TOOL_OUTPUT_CHARS) return true;
+      if (block.tool.details?.kind === "edit_diff") return true;
+    }
+  }
+  return textChars > REASONING_LARGE_TEXT_CHARS;
+}
+
+function reasoningSignals(blocks: UiBlock[]) {
+  let errors = 0;
+  let edits = 0;
+  let bash = 0;
+  for (const block of blocks) {
+    if (block.kind !== "tool") continue;
+    const name = block.tool.name.toLowerCase();
+    if (block.tool.status === "error") errors += 1;
+    if (name === "bash") bash += 1;
+    if (name === "edit" || name === "write" || block.tool.details?.kind === "edit_diff") edits += 1;
+  }
+  return { errors, edits, bash };
+}
 
 function Reasoning({
   blocks,
@@ -2346,41 +2729,56 @@ function Reasoning({
   toolCount,
   durationMs,
   seed,
+  messageId,
+  latestCompleted,
 }: {
   blocks: UiBlock[];
   active?: boolean;
   toolCount: number;
   durationMs?: number;
   seed: string;
+  messageId: string;
+  latestCompleted?: boolean;
 }) {
-  // Initial state: open while working, open if short, collapsed if a settled
-  // turn already has > N steps (e.g. when scrolling back through history).
-  const [open, setOpen] = useState(() => active || blocks.length <= REASONING_AUTO_COLLAPSE_THRESHOLD);
-  // Track explicit user clicks so the active → done transition doesn't yank
-  // the panel shut on someone who deliberately opened it mid-stream.
-  const [userToggled, setUserToggled] = useState(false);
+  const large = isLargeReasoningTurn(blocks, toolCount);
+  const [manualOpen, setManualOpen] = useState<boolean | undefined>(() => readReasoningManualOpen(messageId));
+  const defaultOpen = active ? true : (manualOpen ?? (!!latestCompleted && !large));
+  const [open, setOpen] = useState(defaultOpen);
+
   useEffect(() => {
-    if (active) {
-      setOpen(true);
-    } else if (!userToggled && blocks.length > REASONING_AUTO_COLLAPSE_THRESHOLD) {
-      setOpen(false);
-    }
-  }, [active, blocks.length, userToggled]);
+    setManualOpen(readReasoningManualOpen(messageId));
+  }, [messageId]);
+
+  useEffect(() => {
+    setOpen(defaultOpen);
+  }, [defaultOpen]);
+
   function toggle() {
     if (active) return;
-    setUserToggled(true);
-    setOpen((v) => !v);
+    const next = !open;
+    setOpen(next);
+    setManualOpen(next);
+    writeReasoningManualOpen(messageId, next);
   }
 
   const duration = formatDuration(durationMs);
   const label = active ? "Working" : "Worked";
+  const signals = reasoningSignals(blocks);
   const meta = [
     duration && !active ? `for ${duration}` : null,
-    !active && toolCount > 0 ? `· ${toolCount} ${toolCount === 1 ? "tool" : "tools"}` : null,
-  ].filter(Boolean).join(" ");
+    !active && toolCount > 0 ? `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` : null,
+    !active && signals.edits > 0 ? `${signals.edits} ${signals.edits === 1 ? "edit" : "edits"}` : null,
+    !active && signals.errors > 0 ? `${signals.errors} ${signals.errors === 1 ? "error" : "errors"}` : null,
+    !active && signals.bash > 0 ? `${signals.bash} bash` : null,
+  ].filter(Boolean).join(" · ");
   return (
-    <div className={`reasoning ${open ? "open" : ""}`}>
-      <button onClick={toggle} className={active ? "thinking" : "done"}>
+    <div className={`reasoning ${open ? "open" : ""} ${large ? "large" : "small"}`}>
+      <button
+        onClick={toggle}
+        className={active ? "thinking" : "done"}
+        aria-expanded={open}
+        title={active ? "Current turn stays expanded while Pi is working" : open ? "Collapse work timeline" : "Expand work timeline"}
+      >
         {/* The orb replaces the old static spinner: while a turn streams it
             ticks on rAF as the active session's identity, and when the turn
             settles it freezes on its last frame as a quiet badge next to
@@ -3185,6 +3583,78 @@ function rankSuggestions<T extends { label: string; description?: string }>(item
   return [...buckets[0], ...buckets[1], ...buckets[2]].slice(0, max);
 }
 
+// Tiny circular indicator of context-window usage. The number lives in the
+// hover panel rather than on the page — the wheel itself is the signal.
+// Custom popover (not the native `title`) so it pops fast and stays in style.
+function ContextWheel({
+  pct,
+  usage,
+}: {
+  pct: number;
+  usage?: { tokens?: number; contextWindow?: number } | null;
+}) {
+  const size = 14;
+  const stroke = 1.75;
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const filled = Math.max(0, Math.min(100, pct)) / 100 * c;
+  // Color shifts toward warn as the wheel fills, so glances catch a near-full
+  // window without needing to read the percentage.
+  const tone = pct >= 90 ? "danger" : pct >= 70 ? "warn" : "ok";
+  const { triggerRef, open, visible, placement, handleEnter, handleLeave } = useHoverPopover({
+    width: 140,
+    minSpace: 100,
+    align: "center",
+  });
+  const aria = usage?.tokens != null && usage?.contextWindow
+    ? `${pct}% — ${usage.tokens.toLocaleString()} of ${usage.contextWindow.toLocaleString()} tokens used`
+    : "Context usage will appear after the first turn";
+  return (
+    <span
+      ref={triggerRef}
+      className={`ctxWheel tone-${tone}`}
+      aria-label={aria}
+      role="img"
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+    >
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <circle cx={size / 2} cy={size / 2} r={r} className="ctxWheel-track" strokeWidth={stroke} fill="none" />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          className="ctxWheel-fill"
+          strokeWidth={stroke}
+          fill="none"
+          strokeDasharray={`${filled} ${c - filled}`}
+          strokeDashoffset={c / 4}
+          strokeLinecap="round"
+        />
+      </svg>
+      {open && placement && (
+        <HoverPanel
+          visible={visible}
+          placement={placement}
+          width={140}
+          className="ctxWheelPanel"
+          onMouseEnter={handleEnter}
+          onMouseLeave={handleLeave}
+        >
+          <div className="ctxWheelPanelInner">
+            <div className="ctxWheelPanelPct">{pct}%</div>
+            {usage?.tokens != null && usage?.contextWindow ? (
+              <div className="ctxWheelPanelRatio">{usage.tokens.toLocaleString()} / {usage.contextWindow.toLocaleString()}</div>
+            ) : (
+              <div className="ctxWheelPanelRatio empty">—</div>
+            )}
+          </div>
+        </HoverPanel>
+      )}
+    </span>
+  );
+}
+
 function Composer({
   state,
   connection,
@@ -3418,14 +3888,11 @@ function Composer({
           </div>
         )}
         <div className="composerInputRow">
-          <button className="add" title="Attach" disabled={disabled} onClick={() => fileInputRef.current?.click()}>
-            <IconPlusSlim size={16} />
-          </button>
           <ComposerInput
             textareaRef={textareaRef}
             value={value}
             disabled={disabled}
-            placeholder={disabled ? "Connecting to Pi…" : state?.isStreaming ? "Steer this turn or queue a follow-up…" : "Ask Pi to work in this OS workspace…  (try /, $, @)"}
+            placeholder={disabled ? "Connecting to Pi…" : "Ask Pi anything..."}
             resources={resources}
             onChange={handleChange}
             onSelect={handleSelect}
@@ -3437,6 +3904,37 @@ function Composer({
             ? <button className="send stop" onClick={onAbort} title="Abort"><IconStop /></button>
             : <button className="send" onClick={() => submit()} title="Send" disabled={disabled || (!value.trim() && attachments.length === 0)}><IconArrowUpSlim size={16} /></button>}
         </div>
+        <div className="composerControls">
+          <button className="add" title="Attach" disabled={disabled} onClick={() => fileInputRef.current?.click()}>
+            <IconPlusSlim size={16} />
+          </button>
+          <select
+            className="composerControls-model"
+            value={currentModelKey}
+            onChange={(event) => {
+              const [provider, modelId] = event.target.value.split("::");
+              if (provider && modelId) onSetModel(provider, modelId);
+            }}
+            disabled={modelOptions.length === 0}
+            title="Switch model"
+            style={{ ["--label-len" as string]: currentModelLabel.length } as React.CSSProperties}
+          >
+            {modelOptions.length === 0 && <option value="">No model</option>}
+            {modelOptions.map((model) => (
+              <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
+                {model.name ?? model.id}
+              </option>
+            ))}
+          </select>
+          <button
+            className="composerControls-thinking"
+            onClick={cycleThinking}
+            title={`Reasoning effort: ${currentThinking} (click to cycle)`}
+          >
+            {currentThinking}
+          </button>
+          <div className="composerControls-spacer" />
+        </div>
         {mention && suggestions.length > 0 && (
           <MentionPopover
             trigger={mention.trigger}
@@ -3447,40 +3945,24 @@ function Composer({
           />
         )}
       </div>
-      {state?.isStreaming && (
-        <div className="queueActions">
-          <button onClick={() => submit("steer")}>Steer now</button>
-          <button onClick={() => submit("followUp")}>Queue after</button>
-          <span>{state.pending.steering.length} steering · {state.pending.followUp.length} follow-up</span>
-        </div>
-      )}
       <div className="metaBar">
-        <span className={`status ${connection}`}>{connection}</span>
-        <select
-          className="metaBar-model"
-          value={currentModelKey}
-          onChange={(event) => {
-            const [provider, modelId] = event.target.value.split("::");
-            if (provider && modelId) onSetModel(provider, modelId);
-          }}
-          disabled={modelOptions.length === 0}
-          title="Switch model"
-          style={{ ["--label-len" as string]: currentModelLabel.length } as React.CSSProperties}
-        >
-          {modelOptions.length === 0 && <option value="">No model</option>}
-          {modelOptions.map((model) => (
-            <option key={`${model.provider}::${model.id}`} value={`${model.provider}::${model.id}`}>
-              {model.name ?? model.id}
-            </option>
-          ))}
-        </select>
-        <button
-          className="metaBar-thinking"
-          onClick={cycleThinking}
-          title={`Reasoning effort: ${currentThinking} (click to cycle)`}
-        >
-          {currentThinking}
-        </button>
+        {/* Only call out connection state when something's wrong — "open" is
+            the boring default and doesn't deserve a chip. */}
+        {connection !== "open" && <span className={`status ${connection}`}>{connection}</span>}
+        {/* Steer / queue live in the meta row so they share the baseline with
+            branch and context wheel. Only relevant while Pi is generating AND
+            the user has drafted something to actually act on — otherwise the
+            buttons are noise. */}
+        {state?.isStreaming && value.trim().length > 0 && (
+          <div className="queueActions">
+            <button onClick={() => submit("steer")}>Steer now</button>
+            <button onClick={() => submit("followUp")}>Queue after</button>
+          </div>
+        )}
+        {state?.isStreaming && (state.pending.steering.length > 0 || state.pending.followUp.length > 0) && (
+          <span className="queueCount">{state.pending.steering.length} steering · {state.pending.followUp.length} follow-up</span>
+        )}
+        <div className="metaBar-spacer" />
         {git?.isRepo && git.branch && (
           <span className="gitBranch" title={git.upstream ? `${git.branch} → ${git.upstream}` : `Git branch: ${git.branch}`}>
             <IconBranch size={12} />
@@ -3489,9 +3971,7 @@ function Composer({
             {git.behind ? <span className="gitBranch-trail">↓{git.behind}</span> : null}
           </span>
         )}
-        <span className="ctx" title={state?.usage?.tokens != null && state?.usage?.contextWindow ? `${state.usage.tokens.toLocaleString()} / ${state.usage.contextWindow.toLocaleString()} tokens used in the model's context window` : "Context usage will appear after the first turn"}>
-          <span style={{ width: `${pct}%` }} />{pct || 0}%
-        </span>
+        <ContextWheel pct={pct} usage={state?.usage} />
       </div>
     </footer>
   );
@@ -3810,11 +4290,10 @@ function LeftSidebar({
 }) {
   const [query, setQuery] = useState("");
 
-  useEffect(() => {
-    if (!activeWorkspaceId) return;
-    if (openWorkspaceIds.has(activeWorkspaceId)) return;
-    onOpenWorkspaceIdsChange(new Set(openWorkspaceIds).add(activeWorkspaceId));
-  }, [activeWorkspaceId, openWorkspaceIds]);
+  // Workspaces stay collapsed by default — the user expands explicitly with
+  // the chevron. We used to auto-open the active workspace here, but that
+  // forced the session list open on every workspace switch, which made the
+  // sidebar noisy when only the active workspace's name was needed.
   function confirmDelete(workspaceId: string, session: PiSessionInfo) {
     const label = session.name || session.firstMessage || "Untitled";
     toast(`Delete "${label}"?`, {
@@ -3871,9 +4350,8 @@ function LeftSidebar({
     <aside className={`sidebar left ${open ? "open" : "closed"}`}>
       <div className="sideInner">
         <div className="sideHead">
-          <span className="brand">
-            <span className="dot" />
-            <span>piui</span>
+          <span className="brand" title="piui">
+            <PiLogo className="brand-logo" />
           </span>
           <button className="sideHead-btn" onClick={onToggle} title="Hide sidebar">
             <IconSidebarLeft size={14} />

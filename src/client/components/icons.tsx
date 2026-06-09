@@ -121,6 +121,21 @@ export const IconBranch = ({ size = 14, className, title }: SlimProps) => (
   </svg>
 );
 
+export const IconCopy = ({ size = 14, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </svg>
+);
+
+export const IconEdit = ({ size = 14, className, title }: SlimProps) => (
+  <svg {...slimSvgProps(size, className, title)}>
+    {title ? <title>{title}</title> : null}
+    <path d="M14.5 4.5l5 5M4 20l4-1 11-11-4-4L4 15v5z" />
+  </svg>
+);
+
 // Aliases — preferred for places that want to be explicit about the slim look.
 export const IconPlusSlim = IconPlus;
 export const IconCloseSlim = IconClose;

@@ -359,6 +359,135 @@ body.dark {
   justify-content: flex-end;
   margin-bottom: 32px;
 }
+.msgUserCol {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  max-width: 75%;
+  min-width: 0;
+}
+.msgUserCol .bubble {
+  max-width: 100%;
+}
+/* Hover-revealed copy/edit row. Sits below the user bubble (right-aligned)
+   or below the assistant answer (left-aligned). Stays out of the way until
+   the user hovers the message — the row reserves its own height so the
+   layout doesn't reflow on hover. */
+.msgActions {
+  display: flex;
+  gap: 2px;
+  height: 22px;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+.msg:hover .msgActions,
+.msgActions:focus-within {
+  opacity: 1;
+}
+.msgAction {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.msgAction:hover {
+  background: var(--paper);
+  border-color: var(--hairline);
+  color: var(--ink);
+}
+.msgAction:focus-visible {
+  outline: none;
+  border-color: var(--hairline-strong);
+  color: var(--ink);
+}
+.msgAction.copied {
+  color: var(--accent, var(--ink));
+}
+/* Inline editor that replaces a user bubble when Edit is clicked. Sized like
+   the bubble so re-flow on toggle is minimal. The footer hint + Cancel/Send
+   buttons mirror the main composer's contract so the keystrokes feel the
+   same. Sending from here forks the session at this message and resubmits. */
+.msgEditor {
+  width: min(75%, 720px);
+  border: 1px solid var(--hairline-strong, var(--hairline));
+  border-radius: 14px;
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+}
+.msgEditorTextarea {
+  resize: none;
+  width: 100%;
+  min-height: 22px;
+  max-height: 360px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 0;
+}
+.msgEditorControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.msgEditorHint {
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+}
+.msgEditorButtons {
+  display: flex;
+  gap: 6px;
+}
+.msgEditorButton {
+  appearance: none;
+  border: 1px solid var(--hairline);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.msgEditorButton.ghost {
+  background: transparent;
+  color: var(--muted);
+}
+.msgEditorButton.ghost:hover {
+  color: var(--ink);
+  border-color: var(--hairline-strong, var(--hairline));
+}
+.msgEditorButton.primary {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.msgEditorButton.primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.msgEditorButton:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .bubble {
   background: var(--paper);
   border: 1px solid var(--hairline);
@@ -1630,64 +1759,76 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 .send.stop { color: var(--ink); }
 .send.stop:hover { background: oklch(from var(--ink) l c h / 0.08); }
 
-.metaBar {
+/* Controls row inside the composer card — sits below the textarea and groups
+   the actionable inputs (attach, model, reasoning, send). Anything passive
+   (connection, branch, ctx %) lives in the quieter .metaBar below the card. */
+.composerControls {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 6px 0;
-  color: var(--faint);
-  font: 10.5px var(--mono);
-  letter-spacing: 0.02em;
+  gap: 4px;
+  padding: 0 2px;
 }
-.metaBar button, .metaBar select {
+.composerControls-spacer { flex: 1 1 auto; }
+.composerControls > select,
+.composerControls > .composerControls-thinking {
   border: 0;
   background: transparent;
-  color: var(--muted);
-  border-radius: 6px;
-  padding: 3px 7px;
-  cursor: pointer;
-  font: 10.5px var(--mono);
-  letter-spacing: 0.02em;
-}
-.metaBar button:hover, .metaBar select:hover {
-  background: oklch(from var(--ink) l c h / 0.045);
   color: var(--ink-soft);
+  border-radius: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font: 12px var(--mono);
+  letter-spacing: -0.01em;
+  height: 26px;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.composerControls > select:hover,
+.composerControls > .composerControls-thinking:hover {
+  background: oklch(from var(--ink) l c h / 0.05);
+  color: var(--ink);
 }
 /* Model picker shrink-wraps to whatever the *currently selected* option's
-   label is. The element receives `--label-len` inline (set in JSX from the
-   selected option's text length); we convert that to a width in `ch` units
-   plus a fixed allowance for the chevron + horizontal padding. Without this,
-   native <select> sizes to the widest option in the list, leaving an awkward
-   gap before the next pill when the active model has a short name. */
-.metaBar-model {
+   label is — same trick as before. `--label-len` is set inline from the
+   selected option's text length. */
+.composerControls-model {
   width: calc((var(--label-len, 12) + 1) * 1ch + 22px);
-  min-width: 56px;
+  min-width: 64px;
   max-width: 220px;
   text-overflow: ellipsis;
   -webkit-appearance: none;
   appearance: none;
-  padding-right: 14px;
+  padding-right: 16px !important;
   background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 8px) 50%, calc(100% - 4px) 50%;
+  background-position: calc(100% - 9px) 55%, calc(100% - 5px) 55%;
   background-size: 4px 4px, 4px 4px;
   background-repeat: no-repeat;
 }
-/* The reasoning pill cycles on click — give it a subtle pill outline so
-   it reads as a button rather than a label. */
-.metaBar-thinking {
-  border: 1px solid var(--hairline) !important;
+.composerControls-thinking {
+  text-transform: lowercase;
 }
-.metaBar-thinking:hover { border-color: var(--hairline-strong) !important; }
+
+/* Demoted utility strip below the composer card — connection, branch, ctx %.
+   Everything else used to live here too; that made the bar shout for
+   attention despite being passive telemetry. Now it sits right-aligned,
+   smaller, fainter, and only chimes in when something deserves it. */
+.metaBar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px 0;
+  color: var(--faint);
+  font: 10px var(--mono);
+  letter-spacing: 0.04em;
+}
+.metaBar-spacer { flex: 1 1 auto; }
 .gitBranch {
-  /* Sits inline with the other metaBar tokens (model name, thinking level,
-     ctx %). No pill border — just an icon + name + optional ahead/behind. */
   display: inline-flex;
   align-items: center;
   gap: 5px;
   max-width: 160px;
   min-width: 0;
-  color: var(--muted);
-  padding: 0 2px;
+  color: var(--faint);
+  padding: 0;
 }
 .gitBranch svg { color: var(--faint); flex-shrink: 0; }
 .gitBranch-name {
@@ -1697,7 +1838,7 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   min-width: 0;
 }
 .gitBranch-trail { color: var(--faint); flex-shrink: 0; }
-.status { display: inline-flex; align-items: center; gap: 6px; }
+.status { display: inline-flex; align-items: center; gap: 6px; text-transform: uppercase; }
 .status::before {
   content: '';
   width: 5px; height: 5px;
@@ -1706,24 +1847,46 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
 }
 .status.open::before { background: var(--ok); }
 .status.closed::before { background: var(--bad); }
-.ctx {
-  position: relative;
-  margin-left: auto;
-  width: 110px;
-  height: 16px;
-  border-radius: 999px;
-  background: oklch(from var(--ink) l c h / 0.05);
-  overflow: hidden;
+/* Context-window indicator as a small circular ring. The number lives in
+   the tooltip; the ring is the at-a-glance signal — color tone shifts as
+   it fills so you catch a near-full window without reading. */
+.ctxWheel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+.ctxWheel svg { display: block; overflow: visible; }
+.ctxWheel-track {
+  stroke: oklch(from var(--ink) l c h / 0.10);
+}
+.ctxWheel-fill {
+  stroke: var(--ctxWheel-color, var(--accent));
+  transition: stroke 0.25s var(--ease), stroke-dasharray 0.4s var(--ease);
+}
+.ctxWheel.tone-ok { --ctxWheel-color: oklch(from var(--accent) l c h / 0.7); }
+.ctxWheel.tone-warn { --ctxWheel-color: var(--warn); }
+.ctxWheel.tone-danger { --ctxWheel-color: var(--bad); }
+
+.ctxWheelPanel.hoverPanel { padding: 8px 10px; }
+.ctxWheelPanelInner {
+  display: grid;
+  gap: 2px;
   text-align: center;
-  line-height: 16px;
-  font-size: 10px;
+  justify-items: center;
 }
-.ctx span {
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  background: oklch(from var(--accent) l c h / 0.2);
-  z-index: 0;
+.ctxWheelPanelPct {
+  font: 600 15px var(--mono);
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  line-height: 1.1;
 }
+.ctxWheelPanelRatio {
+  font: 11px var(--mono);
+  color: var(--faint);
+  letter-spacing: 0;
+}
+.ctxWheelPanelRatio.empty { color: var(--faint); }
 /* =========================================================
    SIDEBARS
    ========================================================= */
@@ -1798,6 +1961,12 @@ body.dark .tool.locked .toolHead { background: oklch(0.26 0.006 270); }
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 2.5px oklch(from var(--accent) l c h / 0.18);
+}
+.sideHead .brand-logo {
+  width: 16px;
+  height: 16px;
+  color: var(--ink);
+  display: block;
 }
 .sideHead-tabs {
   display: inline-flex;
@@ -3095,7 +3264,7 @@ body.dark .settingsNav-item.active { background: oklch(0.26 0.006 270); }
   }
   .sidebar.left.closed { width: 0; }
   .bubble { max-width: 92%; }
-  .ctx { display: none; }
+  .ctxWheel { display: none; }
   .settingsShell {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
